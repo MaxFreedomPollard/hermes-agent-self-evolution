@@ -1,9 +1,48 @@
 """Configuration and hermes-agent repo discovery."""
 
+from __future__ import annotations
+
 import os
-from pathlib import Path
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
+
+
+def _default_api_base() -> Optional[str]:
+    """Return the configured OpenAI-compatible API base, if any."""
+
+    return (
+        os.getenv("OPENROUTER_BASE_URL")
+        or os.getenv("DSPY_API_BASE")
+        or os.getenv("OPENAI_API_BASE")
+    )
+
+
+def _default_lm_max_tokens() -> Optional[int]:
+    """Return an optional LM max_tokens cap from the environment."""
+
+    raw = os.getenv("HERMES_EVOLUTION_MAX_TOKENS")
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError("HERMES_EVOLUTION_MAX_TOKENS must be an integer") from None
+    if value <= 0:
+        raise ValueError("HERMES_EVOLUTION_MAX_TOKENS must be positive")
+    return value
+
+
+def _default_tblite_baseline_score() -> Optional[float]:
+    """Return an optional precomputed TBLite baseline score from the environment."""
+
+    raw = os.getenv("HERMES_TBLITE_BASELINE_SCORE")
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        raise ValueError("HERMES_TBLITE_BASELINE_SCORE must be a number") from None
 
 
 @dataclass
@@ -22,14 +61,20 @@ class EvolutionConfig:
 
     # LLM configuration
     optimizer_model: str = "openai/gpt-4.1"  # Model for GEPA reflections
-    eval_model: str = "openai/gpt-4.1-mini"  # Model for LLM-as-judge scoring
-    judge_model: str = "openai/gpt-4.1"  # Model for dataset generation
+    eval_model: str = "openai/gpt-4.1-mini"  # Student/eval model
+    judge_model: str = "openai/gpt-4.1"  # LLM-as-judge + dataset generation model
+    api_base: Optional[str] = field(default_factory=_default_api_base)
+    lm_max_tokens: Optional[int] = field(default_factory=_default_lm_max_tokens)
 
     # Constraints
-    max_skill_size: int = 15_000  # 15KB default
+    max_skill_size: int = 15_000  # Default cap; evolve_skill raises this to baseline+growth when needed.
     max_tool_desc_size: int = 500  # chars
     max_param_desc_size: int = 200  # chars
     max_prompt_growth: float = 0.2  # 20% max growth over baseline
+
+    # Promotion gates
+    min_skill_improvement: float = 0.10  # Phase-1 gate: >=10% relative score lift
+    allow_heuristic_fallback: bool = False  # LLM-judge failures should fail closed by default
 
     # Eval dataset
     eval_dataset_size: int = 20  # Total examples to generate
@@ -40,7 +85,9 @@ class EvolutionConfig:
     # Benchmark gating
     run_pytest: bool = True
     run_tblite: bool = False  # Expensive — opt-in
-    tblite_regression_threshold: float = 0.02  # Max 2% regression allowed
+    tblite_regression_threshold: float = 0.02  # Max 2% absolute regression allowed
+    tblite_command: Optional[str] = field(default_factory=lambda: os.getenv("HERMES_TBLITE_COMMAND"))
+    tblite_baseline_score: Optional[float] = field(default_factory=_default_tblite_baseline_score)
 
     # Output
     output_dir: Path = field(default_factory=lambda: Path("./output"))
@@ -50,10 +97,11 @@ class EvolutionConfig:
 def _discover_hermes_agent_path() -> Optional[Path]:
     """Best-effort hermes-agent repo discovery that never raises.
 
-    Returns the discovered path, or None when no repo can be found. Used as
-    the EvolutionConfig default so construction never crashes; callers that
-    truly require the repo should use get_hermes_agent_path().
+    Returns the discovered path, or None when no repo can be found. Used as the
+    EvolutionConfig default so construction never crashes; callers that truly
+    require the repo should use get_hermes_agent_path().
     """
+
     try:
         return get_hermes_agent_path()
     except FileNotFoundError:
@@ -68,19 +116,20 @@ def get_hermes_agent_path() -> Path:
     2. ~/.hermes/hermes-agent (standard install location)
     3. ../hermes-agent (sibling directory)
     """
+
     env_path = os.getenv("HERMES_AGENT_REPO")
     if env_path:
         p = Path(env_path).expanduser()
         if p.exists():
-            return p
+            return p.resolve()
 
     home_path = Path.home() / ".hermes" / "hermes-agent"
     if home_path.exists():
-        return home_path
+        return home_path.resolve()
 
     sibling_path = Path(__file__).parent.parent.parent / "hermes-agent"
     if sibling_path.exists():
-        return sibling_path
+        return sibling_path.resolve()
 
     raise FileNotFoundError(
         "Cannot find hermes-agent repo. Set HERMES_AGENT_REPO env var "
@@ -94,9 +143,11 @@ def resolve_hermes_agent_path(hermes_repo: Optional[str] = None) -> Path:
     An explicit path (for example from ``--hermes-repo``) is expanded and used
     as-is, taking precedence over auto-discovery. This lets callers point at a
     repo in a non-default location without the tool crashing just because
-    ``~/.hermes/hermes-agent`` happens to be absent. When no override is given,
-    falls back to :func:`get_hermes_agent_path`.
+    ``~/.hermes/hermes-agent`` happens to be absent.
+
+    When no override is given, falls back to :func:`get_hermes_agent_path`.
     """
+
     if hermes_repo:
         return Path(hermes_repo).expanduser()
     return get_hermes_agent_path()
