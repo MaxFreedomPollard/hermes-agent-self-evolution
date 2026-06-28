@@ -23,6 +23,7 @@ from evolution.core.dataset_builder import SyntheticDatasetBuilder, EvalDataset,
 from evolution.core.external_importers import build_dataset_from_external
 from evolution.core.fitness import skill_fitness_metric, LLMJudge, FitnessScore
 from evolution.core.constraints import ConstraintValidator
+from evolution.core.pr import emit_pr
 from evolution.skills.skill_module import (
     SkillModule,
     load_skill,
@@ -43,6 +44,9 @@ def evolve(
     hermes_repo: Optional[str] = None,
     run_tests: bool = False,
     dry_run: bool = False,
+    no_pr: bool = False,
+    open_pr: bool = False,
+    base: str = "main",
 ):
     """Main evolution function — orchestrates the full optimization loop."""
 
@@ -73,7 +77,12 @@ def evolve(
         console.print(f"\n[bold green]DRY RUN — setup validated successfully.[/bold green]")
         console.print(f"  Would generate eval dataset (source: {eval_source})")
         console.print(f"  Would run GEPA optimization ({iterations} iterations)")
-        console.print(f"  Would validate constraints and create PR")
+        if no_pr:
+            console.print(f"  Would validate constraints (PR preparation disabled via --no-pr)")
+        elif open_pr:
+            console.print(f"  Would validate constraints, prepare a branch, and open a PR (base: {base})")
+        else:
+            console.print(f"  Would validate constraints and prepare a PR branch against base '{base}'")
         return
 
     # ── 2. Build or load evaluation dataset ─────────────────────────────
@@ -269,6 +278,7 @@ def evolve(
         "iterations": iterations,
         "optimizer_model": optimizer_model,
         "eval_model": eval_model,
+        "eval_source": eval_source,
         "baseline_score": avg_baseline,
         "evolved_score": avg_evolved,
         "improvement": improvement,
@@ -287,6 +297,34 @@ def evolve(
     if improvement > 0:
         console.print(f"\n[bold green]✓ Evolution improved skill by {improvement:+.3f} ({improvement/max(0.001, avg_baseline)*100:+.1f}%)[/bold green]")
         console.print(f"  Review the diff: diff {output_dir}/baseline_skill.md {output_dir}/evolved_skill.md")
+
+        # ── 11. Prepare a pull request against hermes-agent ─────────────
+        if no_pr or not config.create_pr:
+            console.print("\n[dim]PR preparation skipped (--no-pr or create_pr disabled).[/dim]")
+        else:
+            console.print(f"\n[bold]Preparing pull request[/bold]")
+            skill_rel_path = str(skill_path.relative_to(config.hermes_agent_path))
+            pr_result = emit_pr(
+                hermes_repo=config.hermes_agent_path,
+                skill_rel_path=skill_rel_path,
+                evolved_full=evolved_full,
+                metrics=metrics,
+                constraint_results=evolved_constraints,
+                base=base,
+                open_remote=open_pr,
+                timestamp=timestamp,
+            )
+            for msg in pr_result.messages:
+                console.print(f"  {msg}")
+            if pr_result.pr_url:
+                console.print(f"\n[bold green]✓ Pull request opened: {pr_result.pr_url}[/bold green]")
+            elif pr_result.prepared:
+                console.print(f"  Commit: {pr_result.commit_sha}")
+                console.print("  Finish by running:")
+                for cmd in pr_result.follow_up_commands:
+                    console.print(f"    {cmd}")
+                if not open_pr:
+                    console.print("  Or re-run with --open-pr to push and open it automatically.")
     else:
         console.print(f"\n[yellow]⚠ Evolution did not improve skill (change: {improvement:+.3f})[/yellow]")
         console.print("  Try: more iterations, better eval dataset, or different optimizer model")
@@ -303,7 +341,10 @@ def evolve(
 @click.option("--hermes-repo", default=None, help="Path to hermes-agent repo")
 @click.option("--run-tests", is_flag=True, help="Run full pytest suite as constraint gate")
 @click.option("--dry-run", is_flag=True, help="Validate setup without running optimization")
-def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run):
+@click.option("--no-pr", is_flag=True, help="Skip preparing the pull request branch")
+@click.option("--open-pr", is_flag=True, help="Push the branch and open the PR via gh (off by default)")
+@click.option("--base", default="main", help="Base branch for the pull request")
+def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run, no_pr, open_pr, base):
     """Evolve a Hermes Agent skill using DSPy + GEPA optimization."""
     evolve(
         skill_name=skill,
@@ -315,6 +356,9 @@ def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_mod
         hermes_repo=hermes_repo,
         run_tests=run_tests,
         dry_run=dry_run,
+        no_pr=no_pr,
+        open_pr=open_pr,
+        base=base,
     )
 
 

@@ -49,6 +49,17 @@ python -m evolution.skills.evolve_skill \
     --eval-source sessiondb
 ```
 
+When a run produces a skill that beats the baseline and passes every constraint,
+it prepares a pull request against your hermes-agent repo: it writes the evolved
+skill in place, creates an `evolve/<skill>-<timestamp>` branch, and commits just
+that one file with a summary of the before/after scores. The branch is local by
+default so you can review the diff first. Add `--open-pr` to also push and open
+the PR with `gh`, or `--no-pr` to skip this step.
+
+```bash
+python -m evolution.skills.evolve_skill --skill github-code-review --open-pr
+```
+
 ## What It Optimizes
 
 | Phase | Target | Engine | Status |
