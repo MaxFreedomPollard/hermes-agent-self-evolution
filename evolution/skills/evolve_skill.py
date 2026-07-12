@@ -23,6 +23,7 @@ from evolution.core.dataset_builder import SyntheticDatasetBuilder, EvalDataset,
 from evolution.core.external_importers import build_dataset_from_external
 from evolution.core.fitness import skill_fitness_metric, LLMJudge, FitnessScore
 from evolution.core.constraints import ConstraintValidator
+from evolution.core.manifest import RunManifest, UsageTracker
 from evolution.skills.skill_module import (
     SkillModule,
     load_skill,
@@ -75,6 +76,11 @@ def evolve(
         console.print(f"  Would run GEPA optimization ({iterations} iterations)")
         console.print(f"  Would validate constraints and create PR")
         return
+
+    # Track LLM usage and cost for the whole run (dataset generation,
+    # optimization, and holdout scoring) so the manifest can report it.
+    usage_tracker = UsageTracker().start()
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # ── 2. Build or load evaluation dataset ─────────────────────────────
     console.print(f"\n[bold]Building evaluation dataset[/bold] (source: {eval_source})")
@@ -201,6 +207,23 @@ def evolve(
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(evolved_full)
         console.print(f"  Saved failed variant to {output_path}")
+        # Record the rejection: caught violations are part of the audit trail
+        manifest = RunManifest.build(
+            run_id=f"{skill_name}-{run_timestamp}",
+            skill_name=skill_name,
+            skill_path=skill_path,
+            config=config,
+            dataset=dataset,
+            baseline_text=skill["body"],
+            evolved_text=evolved_body,
+            constraint_results=evolved_constraints,
+            scores=None,
+            deployed=False,
+            elapsed_seconds=elapsed,
+            usage=usage_tracker.finish(),
+        )
+        manifest_path = manifest.save(output_path.parent / "manifest_FAILED.json")
+        console.print(f"  Manifest: {manifest_path}")
         return
 
     # ── 8. Evaluate on holdout set ──────────────────────────────────────
@@ -225,6 +248,8 @@ def evolve(
     avg_evolved = sum(evolved_scores) / max(1, len(evolved_scores))
     improvement = avg_evolved - avg_baseline
 
+    usage = usage_tracker.finish()
+
     # ── 9. Report results ───────────────────────────────────────────────
     table = Table(title="Evolution Results")
     table.add_column("Metric", style="bold")
@@ -247,12 +272,18 @@ def evolve(
     )
     table.add_row("Time", "", f"{elapsed:.1f}s", "")
     table.add_row("Iterations", "", str(iterations), "")
+    if usage.calls:
+        table.add_row("LLM Calls", "", f"{usage.calls} ({usage.total_tokens:,} tokens)", "")
+        cost_text = f"${usage.cost_usd:.4f}" if usage.cost_usd is not None else "unknown"
+        if usage.calls_with_unknown_cost and usage.cost_usd is not None:
+            cost_text += f" (+{usage.calls_with_unknown_cost} unpriced calls)"
+        table.add_row("LLM Cost", "", cost_text, "")
 
     console.print()
     console.print(table)
 
     # ── 10. Save output ─────────────────────────────────────────────────
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = run_timestamp
     output_dir = Path("output") / skill_name / timestamp
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -282,7 +313,32 @@ def evolve(
     }
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
 
+    # Full evidence record: config, dataset fingerprint, digests,
+    # constraint results, per-example scores, and LLM cost
+    manifest = RunManifest.build(
+        run_id=f"{skill_name}-{timestamp}",
+        skill_name=skill_name,
+        skill_path=skill_path,
+        config=config,
+        dataset=dataset,
+        baseline_text=skill["body"],
+        evolved_text=evolved_body,
+        constraint_results=evolved_constraints,
+        scores={
+            "baseline_holdout": avg_baseline,
+            "evolved_holdout": avg_evolved,
+            "improvement": improvement,
+            "baseline_scores": baseline_scores,
+            "evolved_scores": evolved_scores,
+        },
+        deployed=True,
+        elapsed_seconds=elapsed,
+        usage=usage,
+    )
+    manifest.save(output_dir / "manifest.json")
+
     console.print(f"\n  Output saved to {output_dir}/")
+    console.print(f"  Manifest: {output_dir}/manifest.json")
 
     if improvement > 0:
         console.print(f"\n[bold green]✓ Evolution improved skill by {improvement:+.3f} ({improvement/max(0.001, avg_baseline)*100:+.1f}%)[/bold green]")
