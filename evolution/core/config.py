@@ -30,12 +30,23 @@ class EvolutionConfig:
     max_tool_desc_size: int = 500  # chars
     max_param_desc_size: int = 200  # chars
     max_prompt_growth: float = 0.2  # 20% max growth over baseline
+    # Minimum content-term cosine similarity between baseline and evolved
+    # text (PLAN.md constraint 4, semantic preservation). Calibrated on
+    # real hermes-agent skills: same-skill rewrites score 0.84+, pairs of
+    # unrelated skills below 0.16. Set to 0 to disable.
+    min_semantic_similarity: float = 0.4
 
     # Eval dataset
     eval_dataset_size: int = 20  # Total examples to generate
     train_ratio: float = 0.5
     val_ratio: float = 0.25
     holdout_ratio: float = 0.25
+    # Holdout integrity: near-duplicate tasks are removed before the
+    # train/val/holdout split so memorized train examples cannot leak
+    # into the holdout set, and the split itself is seeded so a dataset
+    # always splits the same way.
+    dedup_jaccard: float = 0.9  # Token-set Jaccard above this = duplicate
+    dataset_split_seed: int = 13
 
     # Benchmark gating
     run_pytest: bool = True

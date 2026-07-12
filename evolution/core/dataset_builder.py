@@ -8,6 +8,7 @@ C) Golden sets — hand-curated JSONL files
 
 import json
 import random
+import re
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
@@ -15,6 +16,68 @@ from typing import Optional
 import dspy
 
 from evolution.core.config import EvolutionConfig
+
+
+def _dedup_key(text: str) -> str:
+    """Normalize a task for duplicate detection: casefold, strip punctuation,
+    collapse whitespace."""
+    return " ".join(re.sub(r"[^a-z0-9\s]", " ", text.lower()).split())
+
+
+def _token_jaccard(a: str, b: str) -> float:
+    """Jaccard similarity between the token sets of two normalized tasks."""
+    tokens_a = set(_dedup_key(a).split())
+    tokens_b = set(_dedup_key(b).split())
+    if not tokens_a or not tokens_b:
+        return 1.0 if tokens_a == tokens_b else 0.0
+    return len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
+
+
+def dedupe_examples(examples: list["EvalExample"], jaccard_threshold: float = 0.9) -> list["EvalExample"]:
+    """Drop duplicate and near-duplicate tasks, keeping the first occurrence.
+
+    LLM generation and mined session history both produce repeats. If two
+    copies of the same task land on opposite sides of the train/holdout
+    split, the holdout is contaminated and "improvement" can be pure
+    memorization. Exact duplicates are matched on the normalized task text;
+    near-duplicates on token-set Jaccard similarity.
+    """
+    kept: list["EvalExample"] = []
+    seen_keys: set[str] = set()
+    for example in examples:
+        key = _dedup_key(example.task_input)
+        if key in seen_keys:
+            continue
+        if any(_token_jaccard(example.task_input, k.task_input) >= jaccard_threshold for k in kept):
+            continue
+        seen_keys.add(key)
+        kept.append(example)
+    return kept
+
+
+def split_examples(
+    examples: list["EvalExample"],
+    train_ratio: float = 0.5,
+    val_ratio: float = 0.25,
+    seed: int = 13,
+) -> "EvalDataset":
+    """Deterministic shuffled train/val/holdout split.
+
+    Seeded so the same examples always split the same way: re-running a
+    build cannot silently move an example from holdout into train.
+    """
+    shuffled = list(examples)
+    random.Random(seed).shuffle(shuffled)
+    n = len(shuffled)
+    if n == 0:
+        return EvalDataset()
+    n_train = max(1, int(n * train_ratio))
+    n_val = max(1, int(n * val_ratio))
+    return EvalDataset(
+        train=shuffled[:n_train],
+        val=shuffled[n_train:n_train + n_val],
+        holdout=shuffled[n_train + n_val:],
+    )
 
 
 @dataclass
@@ -156,16 +219,14 @@ class SyntheticDatasetBuilder:
             if c.get("task_input") and c.get("expected_behavior")
         ]
 
-        # Shuffle and split
-        random.shuffle(examples)
-        n_total = len(examples)
-        n_train = max(1, int(n_total * self.config.train_ratio))
-        n_val = max(1, int(n_total * self.config.val_ratio))
-
-        return EvalDataset(
-            train=examples[:n_train],
-            val=examples[n_train:n_train + n_val],
-            holdout=examples[n_train + n_val:],
+        # Dedupe (LLMs generate near-identical cases) and split with a
+        # fixed seed so holdout membership is stable across runs.
+        examples = dedupe_examples(examples, self.config.dedup_jaccard)
+        return split_examples(
+            examples,
+            train_ratio=self.config.train_ratio,
+            val_ratio=self.config.val_ratio,
+            seed=self.config.dataset_split_seed,
         )
 
 
@@ -189,13 +250,4 @@ class GoldenDatasetLoader:
                 if line.strip():
                     examples.append(EvalExample.from_dict(json.loads(line)))
 
-        random.shuffle(examples)
-        n = len(examples)
-        n_train = max(1, int(n * 0.5))
-        n_val = max(1, int(n * 0.25))
-
-        return EvalDataset(
-            train=examples[:n_train],
-            val=examples[n_train:n_train + n_val],
-            holdout=examples[n_train + n_val:],
-        )
+        return split_examples(dedupe_examples(examples))

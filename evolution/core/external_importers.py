@@ -33,7 +33,7 @@ import dspy
 from rich.console import Console
 from rich.progress import Progress
 
-from evolution.core.dataset_builder import EvalExample, EvalDataset
+from evolution.core.dataset_builder import EvalExample, EvalDataset, dedupe_examples, split_examples
 
 console = Console()
 
@@ -668,17 +668,15 @@ def build_dataset_from_external(
             f"recommended for meaningful train/val/holdout split)[/yellow]"
         )
 
-    # Split into train/val/holdout (50/25/25)
-    random.shuffle(examples)
-    n = len(examples)
-    n_train = max(1, int(n * 0.5))
-    n_val = max(1, int(n * 0.25))
+    # Dedupe before splitting: session history repeats the same prompts,
+    # and a task present in both train and holdout contaminates the eval.
+    before = len(examples)
+    examples = dedupe_examples(examples)
+    if len(examples) < before:
+        console.print(f"  Removed {before - len(examples)} duplicate/near-duplicate tasks")
 
-    dataset = EvalDataset(
-        train=examples[:n_train],
-        val=examples[n_train:n_train + n_val],
-        holdout=examples[n_train + n_val:],
-    )
+    # Seeded split into train/val/holdout (50/25/25)
+    dataset = split_examples(examples)
 
     dataset.save(output_path)
     console.print(f"\n[bold]Saved to {output_path}/[/bold]")
