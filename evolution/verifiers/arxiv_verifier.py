@@ -187,7 +187,13 @@ def grade_arxiv_id(expected: str, output: str) -> tuple[float, float, str]:
 def grade_title(expected: str, output: str) -> tuple[float, float, str]:
     norm_expected = _normalize(expected)
     norm_output = _normalize(output)
-    if norm_expected and norm_expected in norm_output:
+    # The spaceless comparison accepts fused spelling variants such as
+    # "Pretraining" for "Pre-training" while still requiring the exact
+    # letter sequence of the full title.
+    contains = norm_expected in norm_output or (
+        norm_expected.replace(" ", "") in norm_output.replace(" ", "")
+    )
+    if norm_expected and contains:
         return 1.0, 1.0, f"Correct title: {expected!r}."
     tokens = [t for t in norm_expected.split() if len(t) > 2]
     if tokens:

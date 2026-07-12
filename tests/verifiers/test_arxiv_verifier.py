@@ -113,6 +113,13 @@ class TestTitleGrading:
         fitness = verifier.score(task, 'The title is "Attention Is All You Need".')
         assert fitness.correctness == pytest.approx(1.0)
 
+    def test_fused_spelling_variant_still_scores_full(self):
+        correctness, _, _ = grade_title(
+            "LoRA: Low-Rank Adaptation of Large Language Models",
+            "The title is LoRA: LowRank Adaptation of Large Language Models.",
+        )
+        assert correctness == pytest.approx(1.0)
+
     def test_partial_title_gets_partial_credit(self):
         correctness, well_formed, _ = grade_title(
             "Attention Is All You Need", "It is about attention, and you need it."

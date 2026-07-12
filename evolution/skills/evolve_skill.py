@@ -95,6 +95,12 @@ def evolve(
     if verifier is not None:
         # Verifier tasks carry their own ground truth, so the dataset and
         # the fitness function must come from the same place.
+        if dataset_path or eval_source != "synthetic":
+            console.print(
+                "[yellow]  Note: the objective verifier supplies its own dataset; "
+                "--eval-source/--dataset-path are ignored. "
+                "Use --fitness keyword to evolve against a custom dataset.[/yellow]"
+            )
         dataset = verifier.build_dataset()
         save_path = Path("datasets") / "skills" / f"{skill_name}-verifier"
         dataset.save(save_path)
