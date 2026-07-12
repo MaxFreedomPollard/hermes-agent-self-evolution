@@ -23,6 +23,7 @@ from evolution.core.dataset_builder import SyntheticDatasetBuilder, EvalDataset,
 from evolution.core.external_importers import build_dataset_from_external
 from evolution.core.fitness import skill_fitness_metric, LLMJudge, FitnessScore
 from evolution.core.constraints import ConstraintValidator
+from evolution.core.verifier import get_verifier, verifier_metric
 from evolution.skills.skill_module import (
     SkillModule,
     load_skill,
@@ -43,6 +44,7 @@ def evolve(
     hermes_repo: Optional[str] = None,
     run_tests: bool = False,
     dry_run: bool = False,
+    fitness: str = "auto",
 ):
     """Main evolution function — orchestrates the full optimization loop."""
 
@@ -69,17 +71,36 @@ def evolve(
     console.print(f"  Size: {len(skill['raw']):,} chars")
     console.print(f"  Description: {skill['description'][:80]}...")
 
+    # Resolve the fitness signal. An objective verifier grades outputs
+    # against checkable ground truth; keyword overlap is the fallback.
+    verifier = None
+    if fitness in ("auto", "verifier"):
+        verifier = get_verifier(skill_name) or get_verifier(skill["name"])
+        if fitness == "verifier" and verifier is None:
+            console.print(f"[red]✗ No verifier registered for skill '{skill_name}'[/red]")
+            sys.exit(1)
+    metric_fn = verifier_metric(verifier) if verifier else skill_fitness_metric
+    fitness_label = "objective verifier" if verifier else "keyword overlap"
+
     if dry_run:
         console.print(f"\n[bold green]DRY RUN — setup validated successfully.[/bold green]")
-        console.print(f"  Would generate eval dataset (source: {eval_source})")
-        console.print(f"  Would run GEPA optimization ({iterations} iterations)")
+        console.print(f"  Would generate eval dataset (source: {'verifier' if verifier else eval_source})")
+        console.print(f"  Would run GEPA optimization ({iterations} iterations, fitness: {fitness_label})")
         console.print(f"  Would validate constraints and create PR")
         return
 
     # ── 2. Build or load evaluation dataset ─────────────────────────────
-    console.print(f"\n[bold]Building evaluation dataset[/bold] (source: {eval_source})")
+    console.print(f"\n[bold]Building evaluation dataset[/bold] (source: {'verifier' if verifier else eval_source})")
 
-    if eval_source == "golden" and dataset_path:
+    if verifier is not None:
+        # Verifier tasks carry their own ground truth, so the dataset and
+        # the fitness function must come from the same place.
+        dataset = verifier.build_dataset()
+        save_path = Path("datasets") / "skills" / f"{skill_name}-verifier"
+        dataset.save(save_path)
+        console.print(f"  Built {len(dataset.all_examples)} verified examples (objective ground truth)")
+        console.print(f"  Saved to {save_path}/")
+    elif eval_source == "golden" and dataset_path:
         dataset = GoldenDatasetLoader.load(Path(dataset_path))
         console.print(f"  Loaded golden dataset: {len(dataset.all_examples)} examples")
     elif eval_source == "sessiondb":
@@ -135,6 +156,7 @@ def evolve(
     console.print(f"  Optimizer: GEPA ({iterations} iterations)")
     console.print(f"  Optimizer model: {optimizer_model}")
     console.print(f"  Eval model: {eval_model}")
+    console.print(f"  Fitness: {fitness_label}")
 
     # Configure DSPy
     lm = dspy.LM(eval_model)
@@ -154,7 +176,7 @@ def evolve(
 
     try:
         optimizer = dspy.GEPA(
-            metric=skill_fitness_metric,
+            metric=metric_fn,
             max_steps=iterations,
         )
 
@@ -167,7 +189,7 @@ def evolve(
         # Fall back to MIPROv2 if GEPA isn't available in this DSPy version
         console.print(f"[yellow]GEPA not available ({e}), falling back to MIPROv2[/yellow]")
         optimizer = dspy.MIPROv2(
-            metric=skill_fitness_metric,
+            metric=metric_fn,
             auto="light",
         )
         optimized_module = optimizer.compile(
@@ -214,11 +236,11 @@ def evolve(
         # Score baseline
         with dspy.context(lm=lm):
             baseline_pred = baseline_module(task_input=ex.task_input)
-            baseline_score = skill_fitness_metric(ex, baseline_pred)
+            baseline_score = metric_fn(ex, baseline_pred)
             baseline_scores.append(baseline_score)
 
             evolved_pred = optimized_module(task_input=ex.task_input)
-            evolved_score = skill_fitness_metric(ex, evolved_pred)
+            evolved_score = metric_fn(ex, evolved_pred)
             evolved_scores.append(evolved_score)
 
     avg_baseline = sum(baseline_scores) / max(1, len(baseline_scores))
@@ -279,6 +301,7 @@ def evolve(
         "holdout_examples": len(dataset.holdout),
         "elapsed_seconds": elapsed,
         "constraints_passed": all_pass,
+        "fitness": fitness_label,
     }
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
 
@@ -303,7 +326,10 @@ def evolve(
 @click.option("--hermes-repo", default=None, help="Path to hermes-agent repo")
 @click.option("--run-tests", is_flag=True, help="Run full pytest suite as constraint gate")
 @click.option("--dry-run", is_flag=True, help="Validate setup without running optimization")
-def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run):
+@click.option("--fitness", default="auto", type=click.Choice(["auto", "verifier", "keyword"]),
+              help="Fitness signal: auto uses an objective verifier when one is registered "
+                   "for the skill, verifier requires one, keyword forces the overlap heuristic")
+def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run, fitness):
     """Evolve a Hermes Agent skill using DSPy + GEPA optimization."""
     evolve(
         skill_name=skill,
@@ -315,6 +341,7 @@ def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_mod
         hermes_repo=hermes_repo,
         run_tests=run_tests,
         dry_run=dry_run,
+        fitness=fitness,
     )
 
 
