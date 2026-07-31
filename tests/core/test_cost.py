@@ -126,3 +126,61 @@ class TestUsageTracker:
         tracker.__enter__()
         history.append(entry())
         assert tracker.stop().n_calls == 1
+
+
+class TestEvictedHistory:
+    """DSPy caps its log at MAX_HISTORY_SIZE and pops from the front.
+
+    The length therefore stops growing, so a length comparison alone can never
+    notice that a long run made more calls than the log can hold. The report
+    used to come back complete and confident while silently missing most of the
+    spend, in a PR body whose whole selling point is that it never rounds an
+    unknown down.
+    """
+
+    @pytest.fixture
+    def capped(self, monkeypatch):
+        log: list = []
+        monkeypatch.setattr("evolution.core.cost._history", lambda: log)
+        monkeypatch.setattr("evolution.core.cost._max_history_size", lambda: 10)
+        return log
+
+    def _flood(self, log, n):
+        for i in range(n):
+            log.append({"uuid": f"call-{i}", "usage": {"prompt_tokens": 10},
+                        "cost": 1.0})
+            if len(log) > 10:
+                del log[0]
+
+    def test_a_run_that_overflows_the_log_is_reported_as_a_lower_bound(self, capped):
+        capped.extend({"uuid": f"pre-{i}", "usage": {}, "cost": 0.0} for i in range(3))
+        with UsageTracker() as usage:
+            self._flood(capped, 25)
+        assert usage.report.truncated
+        assert not usage.report.complete
+        assert "lower bound" in usage.report.describe()
+
+    def test_the_reported_total_is_still_what_survived(self, capped):
+        with UsageTracker() as usage:
+            self._flood(capped, 25)
+        assert usage.report.n_calls == 10
+        assert usage.report.known_cost == pytest.approx(10.0)
+
+    def test_a_short_run_is_not_flagged(self, capped):
+        capped.append({"uuid": "pre", "usage": {}, "cost": 0.0})
+        with UsageTracker() as usage:
+            capped.append({"uuid": "a", "usage": {"prompt_tokens": 5}, "cost": 0.5})
+            capped.append({"uuid": "b", "usage": {"prompt_tokens": 5}, "cost": 0.5})
+        assert usage.report.n_calls == 2
+        assert not usage.report.truncated
+        assert usage.report.complete
+
+    def test_entries_from_before_the_block_are_still_excluded(self, capped):
+        capped.extend(
+            {"uuid": f"pre-{i}", "usage": {"prompt_tokens": 99}, "cost": 9.0}
+            for i in range(4)
+        )
+        with UsageTracker() as usage:
+            capped.append({"uuid": "mine", "usage": {"prompt_tokens": 1}, "cost": 0.25})
+        assert usage.report.n_calls == 1
+        assert usage.report.known_cost == pytest.approx(0.25)

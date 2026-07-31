@@ -196,3 +196,33 @@ class TestGateChain:
         assert blob["passed"] is True
         assert blob["results"][0]["name"] == "a"
         assert blob["results"][0]["status"] == "passed"
+
+
+class TestEmptySelectionIsNotAFailure:
+    """pytest exit code 5 means "nothing collected", not "tests failed".
+
+    Treating it as FAILED turned a too-narrow -k expression into a red suite
+    that blocked every candidate, while telling the operator their tests were
+    broken. An empty selection verifies nothing, so it is UNAVAILABLE.
+    """
+
+    def test_a_selection_matching_nothing_is_unavailable(self, passing_repo):
+        result = run_pytest_gate(
+            passing_repo, subset=["tests/", "-k", "matches_nothing_at_all"],
+            python=sys.executable,
+        )
+        assert result.status is GateStatus.UNAVAILABLE
+        assert not result.passed
+        assert not result.blocking
+        assert "no tests matched" in result.message
+
+    def test_it_still_is_not_a_pass(self, passing_repo):
+        result = run_pytest_gate(
+            passing_repo, subset=["tests/", "-k", "nope"], python=sys.executable
+        )
+        assert GateChain(strict=False).run(lambda: result).passed
+        assert not GateChain(strict=True).run(lambda: result).passed
+
+    def test_a_real_failure_is_still_a_failure(self, failing_repo):
+        result = run_pytest_gate(failing_repo, python=sys.executable)
+        assert result.status is GateStatus.FAILED

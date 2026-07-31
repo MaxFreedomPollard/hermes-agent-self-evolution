@@ -16,6 +16,7 @@ from evolution.core.pr_builder import (
     ScoreLine,
     build_pull_request,
     render_body,
+    require_clean_worktree,
 )
 
 
@@ -200,3 +201,79 @@ class TestNothingIsPublished:
         plan = build(evolved)
         with pytest.raises(GitError, match="gh is not installed"):
             plan.open()
+
+
+class TestTheOperatorsWorkIsSafe:
+    """A deployment step that eats uncommitted work is worse than no deployment.
+
+    `git checkout -b` carries uncommitted edits onto the new branch, the commit
+    absorbs them, and restoring the original ref leaves them only on a branch
+    the operator never made. From the working tree it looks like deletion.
+    """
+
+    def test_a_dirty_target_file_is_refused_before_anything_happens(self, repo):
+        (repo / "tool.py").write_text("DESCRIPTION = 'my uncommitted work'\n")
+        with pytest.raises(GitError, match="uncommitted changes"):
+            require_clean_worktree(repo, ["tool.py"])
+
+    def test_allow_dirty_is_an_explicit_opt_in(self, repo):
+        (repo / "tool.py").write_text("DESCRIPTION = 'my uncommitted work'\n")
+        require_clean_worktree(repo, ["tool.py"], allow_dirty=True)
+
+    def test_a_clean_target_passes(self, repo):
+        require_clean_worktree(repo, ["tool.py"])
+
+    def test_untracked_files_are_not_dirt(self, repo):
+        (repo / "scratch.txt").write_text("notes\n")
+        require_clean_worktree(repo, ["tool.py"])
+
+    def test_unrelated_dirty_files_do_not_block(self, repo):
+        (repo / "other.py").write_text("x = 1\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "other")
+        (repo / "other.py").write_text("x = 2\n")
+        require_clean_worktree(repo, ["tool.py"])
+
+
+class TestAHalfBuiltBranchIsAbandoned:
+    """A failure between `checkout -b` and the commit used to strand the caller.
+
+    build_pull_request only returns a plan at the very end, so a caller that
+    handles GitError had no object to call restore() on and was left standing on
+    a branch it never asked for.
+    """
+
+    def _head(self, repo):
+        return subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(repo), capture_output=True, text=True,
+        ).stdout.strip()
+
+    def test_a_failing_stage_puts_the_checkout_back(self, evolved):
+        before = self._head(evolved)
+        with pytest.raises(GitError):
+            build(evolved, files=["does_not_exist.py"])
+        assert self._head(evolved) == before
+
+    def test_and_leaves_no_dead_branch_behind(self, evolved):
+        with pytest.raises(GitError):
+            build(evolved, files=["does_not_exist.py"])
+        branches = subprocess.run(
+            ["git", "branch"], cwd=str(evolved), capture_output=True, text=True
+        ).stdout
+        assert "evolve/" not in branches
+
+    def test_discard_removes_the_branch_a_caller_no_longer_wants(self, evolved):
+        before = self._head(evolved)
+        plan = build(evolved)
+        plan.discard()
+        assert self._head(evolved) == before
+        branches = subprocess.run(
+            ["git", "branch"], cwd=str(evolved), capture_output=True, text=True
+        ).stdout
+        assert plan.branch not in branches
+
+    def test_discard_is_safe_to_call_twice(self, evolved):
+        plan = build(evolved)
+        plan.discard()
+        plan.discard()
