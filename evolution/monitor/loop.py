@@ -119,6 +119,12 @@ class PhaseEntry:
     module: str
     flag: str
     label: str
+    # Phases 2 and 3 measure and report by default and write nothing. Dispatching
+    # them without --write meant the loop could never produce the branch PLAN.md's
+    # Phase 5 "Done when" requires ("detect problem -> optimize -> PR"), while
+    # still reporting the cycle as proposed. Phase 1 has no write path at all and
+    # Phase 4 always produces a branch, so neither takes the flag.
+    write_flag: str = ""
 
 
 # The dispatch table PLAN.md Phase 5 implies: skills to Phase 1, tools to
@@ -136,12 +142,14 @@ PHASE_DISPATCH: dict[TargetType, PhaseEntry] = {
         module="evolution.tools.evolve_tool_descriptions",
         flag="--tool",
         label="tool description evolution",
+        write_flag="--write",
     ),
     TargetType.PROMPT: PhaseEntry(
         phase=3,
         module="evolution.prompts.evolve_prompt_section",
         flag="--section",
         label="prompt section evolution",
+        write_flag="--write",
     ),
     TargetType.CODE: PhaseEntry(
         phase=4,
@@ -173,6 +181,11 @@ class CycleStatus(str, Enum):
 
 class DispatchStatus(str, Enum):
     PROPOSED = "proposed"
+    # A phase can exit 0 having decided nothing was deployable: the guard
+    # rejected the candidate, the gates blocked it, or the rewrite came back
+    # identical. Reading exit 0 as "proposed" told the operator a human had a PR
+    # to review when no branch existed anywhere.
+    NO_CHANGE = "no_change"
     SKIPPED = "skipped"
     FAILED = "failed"
     DRY_RUN = "dry_run"
@@ -399,7 +412,30 @@ def build_command(
     command = [python or sys.executable, "-m", entry.module, entry.flag, target]
     if iterations is not None:
         command += ["--iterations", str(iterations)]
+    if entry.write_flag:
+        command.append(entry.write_flag)
     return command
+
+
+def _evolve_branches(repo: Optional[Path]) -> set[str]:
+    """The ``evolve/`` branches present in *repo* right now, or an empty set.
+
+    Never raises: a checkout that is not a git repository, or a git that is not
+    installed, simply yields nothing to compare and the dispatch falls back to
+    reporting no change rather than crashing a scheduled run.
+    """
+    if repo is None:
+        return set()
+    try:
+        proc = subprocess.run(
+            ["git", "branch", "--list", "evolve/*", "--format=%(refname:short)"],
+            cwd=str(repo), capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    if proc.returncode != 0:
+        return set()
+    return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
 
 
 def _subprocess_runner(
@@ -582,14 +618,15 @@ def run_cycle(
     benchmark_runner: Callable[..., GateResult] = run_benchmark_gate,
     dispatcher: Callable[[Sequence[str], dict, int], ProcessResult] = _subprocess_runner,
     module_available: Callable[[str], bool] = phase_module_available,
+    branch_lister: Callable[[Optional[Path]], set] = _evolve_branches,
     env: Optional[dict] = None,
     out: Optional[Console] = None,
 ) -> CycleReport:
     """Run one full cycle and return what happened.
 
     Every side effect is behind an injectable callable - *benchmark_runner*,
-    *dispatcher*, *module_available* - so the whole cycle can be exercised
-    offline without spawning an optimizer or touching a model.
+    *dispatcher*, *module_available*, *branch_lister* - so the whole cycle can
+    be exercised offline without spawning an optimizer or touching a model.
     """
     out = out or console
     started = time.time()
@@ -669,6 +706,7 @@ def run_cycle(
                 dry_run=dry_run,
                 dispatcher=dispatcher,
                 module_available=module_available,
+                branch_lister=branch_lister,
                 environment=environment,
                 out=out,
             )
@@ -700,6 +738,7 @@ def _dispatch_one(
     dry_run: bool,
     dispatcher: Callable[[Sequence[str], dict, int], ProcessResult],
     module_available: Callable[[str], bool],
+    branch_lister: Callable[[Optional[Path]], set],
     environment: dict,
     out: Console,
 ) -> Dispatch:
@@ -767,13 +806,23 @@ def _dispatch_one(
     )
     out.print(f"    {' '.join(shlex.quote(part) for part in command)}")
 
+    branches_before = branch_lister(config.hermes_repo)
+
     started = time.time()
     result = dispatcher(command, child_env, config.dispatch_timeout)
     elapsed = time.time() - started
 
-    status = (
-        DispatchStatus.PROPOSED if result.returncode == 0 else DispatchStatus.FAILED
-    )
+    # "Proposed" has to mean a branch a human can actually review. Exit code 0
+    # only means the phase ran to completion, which it does just as happily when
+    # the guard rejected the candidate or the rewrite came back identical.
+    # Comparing the evolve/ refs before and after is the observable difference.
+    new_branches = sorted(branch_lister(config.hermes_repo) - branches_before)
+    if result.returncode != 0:
+        status = DispatchStatus.FAILED
+    elif new_branches:
+        status = DispatchStatus.PROPOSED
+    else:
+        status = DispatchStatus.NO_CHANGE
     dispatch = Dispatch(
         target=entry.target,
         target_type=entry.target_type,
@@ -781,7 +830,13 @@ def _dispatch_one(
         module=module,
         command=command,
         status=status,
-        reason="" if status is DispatchStatus.PROPOSED else f"exit code {result.returncode}",
+        reason=(
+            f"branch {new_branches[0]}"
+            if status is DispatchStatus.PROPOSED
+            else "ran cleanly but produced no branch: nothing was deployable"
+            if status is DispatchStatus.NO_CHANGE
+            else f"exit code {result.returncode}"
+        ),
         returncode=result.returncode,
         duration_s=elapsed,
         output_tail=result.output,
@@ -894,8 +949,14 @@ def cron_line(
         command += ["--hermes-repo", str(hermes_repo)]
 
     quoted = " ".join(shlex.quote(part) for part in command)
+    # mkdir -p before the redirect. The log defaults under the output directory,
+    # which does not exist until a run creates it, and a cron job whose very
+    # first action is a redirect into a missing directory fails before it starts
+    # and leaves nothing behind to explain why.
+    log_dir = shlex.quote(str(log.parent))
     return (
         f"{' '.join(fields)} cd {shlex.quote(str(working_dir))} && "
+        f"mkdir -p {log_dir} && "
         f"{quoted} >> {shlex.quote(str(log))} 2>&1"
     )
 

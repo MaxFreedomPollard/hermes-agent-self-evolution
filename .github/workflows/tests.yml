@@ -46,6 +46,7 @@ jobs:
       - name: Check the CLI loads without a hermes-agent checkout
         run: |
           hermes-evolve --help
+          python -m evolution.skills.evolve_skill --help
           python -m evolution.tools.evolve_tool_descriptions --help
           python -m evolution.prompts.evolve_prompt_section --help
           python -m evolution.code.evolve_tool_code --help

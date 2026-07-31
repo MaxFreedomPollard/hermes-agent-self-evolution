@@ -290,8 +290,10 @@ def discover_prompt_sections(
 ) -> list[PromptSection]:
     """Find the evolvable system-prompt constants in ``agent/prompt_builder.py``.
 
-    Only string-valued constants are returned. ``PLATFORM_HINTS`` is a dict and
-    is handled per-platform by the Phase 3 caller, not here.
+    Only string-valued constants are returned. ``PLATFORM_HINTS`` is a dict of
+    per-platform strings rather than one string, so it has no single span to
+    rewrite and is never returned. Phase 3 reports it as present but out of
+    scope through ``sections.StructuredSection``; nothing evolves it today.
     """
     path = Path(hermes_repo) / "agent" / "prompt_builder.py"
     if not path.is_file():

@@ -1559,7 +1559,6 @@ persuasive text.
 | Description char budgets and the growth ceiling | `constraints.ConstraintValidator` via `evolve_tool_descriptions.enforce_constraints`, which reverts the offending description |
 | A description may not claim a call interface the schema does not have | `accuracy.FactualAccuracyChecker` structural checks, wired into `enforce_constraints`; a finding reverts the description exactly like a budget failure |
 | Prompt growth ceiling at +20 percent | `sections.EvolvableSection.check_growth` |
-| Identity traits survive | `sections.EvolvableSection.check_identity_traits` against the `IDENTITY_TRAITS` table |
 | Caching budget | `sections.SectionInventory.check_caching_boundary`, error at the budget, warning at a block crossing |
 | An unavailable gate is not a pass | `gates.GateStatus.UNAVAILABLE` plus `GateChain._is_blocking` under `strict` |
 | pytest is a hard gate for code | `fitness_code.CodeFitnessEvaluator.evaluate` returns `total=0.0`, no partial credit |

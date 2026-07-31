@@ -1500,6 +1500,10 @@ def evolve_tool_code(
               help="Push the evolution branch to the remote. Off unless asked for")
 @click.option("--open-pr/--no-open-pr", default=False,
               help="Open the pull request with gh. Off unless asked for; never merges")
+@click.option("--remote", default="origin", show_default=True,
+              help="Remote to push the evolution branch to")
+@click.option("--pr-base", "base", default="main", show_default=True,
+              help="Base branch for the pull request")
 def main(
     tool,
     bug_issue,
@@ -1517,6 +1521,8 @@ def main(
     write_pr,
     push,
     open_pr,
+    remote,
+    base,
 ):
     """Evolve hermes-agent tool code with Darwinian Evolver, under guardrails."""
     code = evolve_tool_code(
@@ -1536,6 +1542,8 @@ def main(
         write_pr=write_pr,
         push=push,
         open_pr=open_pr,
+        remote=remote,
+        base=base,
     )
     sys.exit(code)
 

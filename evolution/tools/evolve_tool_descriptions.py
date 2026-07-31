@@ -54,7 +54,12 @@ from rich.table import Table
 from evolution.core.config import EvolutionConfig, resolve_hermes_agent_path
 from evolution.core.constraints import ConstraintValidator
 from evolution.core.cost import UsageTracker
-from evolution.core.gates import GateChain, run_benchmark_gate, run_pytest_gate
+from evolution.core.gates import (
+    GateChain,
+    GateStatus,
+    run_benchmark_gate,
+    run_pytest_gate,
+)
 from evolution.core.pr_builder import (
     GitError,
     require_clean_worktree,
@@ -877,11 +882,26 @@ def evolve_tool_descriptions(
         gates = [lambda: verdict.to_gate_result()]
         if run_tests:
             gates.append(lambda: run_pytest_gate(repo))
+
+        # Measure the benchmark BEFORE the write-back so the post-write score has
+        # something to be compared against. Passing baseline=None made the gate
+        # structurally incapable of detecting a regression: gates.py returns
+        # PASSED with "no baseline to compare" for any score at all, so
+        # tblite_regression_threshold was read and then unreachable, and PLAN.md's
+        # "Benchmarks hold (TBLite within 2%)" was not enforceable. Phase 3
+        # already measures a baseline this way.
+        tblite_baseline = run_benchmark_gate(repo, "tblite", fast=True)
+        if tblite_baseline.status is GateStatus.PASSED and tblite_baseline.score is not None:
+            console.print(
+                f"  tblite baseline: {tblite_baseline.score:.1%} "
+                f"(candidates must hold within "
+                f"{config.tblite_regression_threshold:.1%})"
+            )
         gates.append(
             lambda: run_benchmark_gate(
                 repo,
                 "tblite",
-                baseline=None,
+                baseline=tblite_baseline.score,
                 regression_threshold=config.tblite_regression_threshold,
                 fast=True,
             )
@@ -921,11 +941,11 @@ def evolve_tool_descriptions(
     table.add_column("Evolved", justify="right")
     table.add_column("Change", justify="right")
 
-    def _row(label: str, before: float, after: float) -> None:
+    def _row(label: str, before: float, after: float, note: str = "") -> None:
         delta = after - before
         colour = "green" if delta > 0 else ("red" if delta < 0 else "white")
         table.add_row(
-            label,
+            label if not note else f"{label}\n[dim]{note}[/dim]",
             f"{before:.1%}",
             f"{after:.1%}",
             f"[{colour}]{delta:+.1%}[/{colour}]",
@@ -948,7 +968,16 @@ def evolve_tool_descriptions(
         f"{candidate_report.chance_accuracy:.1%}",
         "",
     )
-    _row("Parameter correctness (val)", baseline_val.param_accuracy, candidate_val.param_accuracy)
+    _row(
+        "Parameter correctness (val)",
+        baseline_val.param_accuracy,
+        candidate_val.param_accuracy,
+        note=(
+            f"over {sum(1 for o in baseline_val.outcomes if o.tool_correct)} "
+            f"then {sum(1 for o in candidate_val.outcomes if o.tool_correct)} "
+            f"correctly selected"
+        ),
+    )
     if baseline_holdout is not None and candidate_holdout is not None:
         _row("Selection accuracy (holdout)", baseline_holdout.tool_accuracy, candidate_holdout.tool_accuracy)
     table.add_row(
@@ -1060,8 +1089,16 @@ def evolve_tool_descriptions(
         "eval_model": eval_model,
         "baseline_accuracy": baseline_report.overall_accuracy,
         "candidate_accuracy": candidate_report.overall_accuracy,
+        # Both figures average only over the examples whose tool was chosen
+        # correctly, so the denominator moves between baseline and candidate. A
+        # candidate that selects fewer tools correctly but gets the arguments
+        # right on the ones it did can show a parameter-accuracy "improvement"
+        # that is purely a denominator artifact. The counts ship alongside the
+        # rates so a reader can see the shift instead of inferring it.
         "baseline_param_accuracy": baseline_val.param_accuracy,
         "candidate_param_accuracy": candidate_val.param_accuracy,
+        "baseline_param_accuracy_n": sum(1 for o in baseline_val.outcomes if o.tool_correct),
+        "candidate_param_accuracy_n": sum(1 for o in candidate_val.outcomes if o.tool_correct),
         "holdout_baseline_accuracy": baseline_holdout.tool_accuracy if baseline_holdout else None,
         "holdout_candidate_accuracy": candidate_holdout.tool_accuracy if candidate_holdout else None,
         "baseline_accuracy_ci": baseline_report.accuracy_interval().to_dict(),

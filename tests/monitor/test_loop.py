@@ -95,6 +95,27 @@ class FakeDispatcher:
         return ProcessResult(returncode=self.returncode, output=self.output)
 
 
+class FakeBranches:
+    """Stands in for reading evolve/ refs out of the hermes-agent checkout.
+
+    ``produces`` is the branch a successful dispatch is pretended to create, so
+    a test can distinguish a phase that proposed something from one that ran
+    cleanly and decided nothing was deployable.
+    """
+
+    def __init__(self, produces="evolve/target-20260731_000000"):
+        self.produces = produces
+        self._seen = False
+
+    def __call__(self, repo):
+        if not self.produces:
+            return set()
+        if self._seen:
+            return {self.produces}
+        self._seen = True
+        return set()
+
+
 class FakeBenchmarks:
     """Returns a score for known benchmarks and UNAVAILABLE for the rest."""
 
@@ -137,6 +158,7 @@ def cycle(store, hermes_repo=None, **kwargs):
     )
     kwargs.setdefault("benchmark_runner", FakeBenchmarks())
     kwargs.setdefault("dispatcher", FakeDispatcher())
+    kwargs.setdefault("branch_lister", FakeBranches())
     kwargs.setdefault("module_available", lambda module: True)
     kwargs.setdefault("env", dict(KEYED_ENV))
     kwargs.setdefault("now", T0)
@@ -187,7 +209,16 @@ class TestDispatchTable:
         command = build_command(
             PHASE_DISPATCH[TargetType.PROMPT], "MEMORY_GUIDANCE", iterations=5
         )
-        assert command[-3:] == ["MEMORY_GUIDANCE", "--iterations", "5"]
+        assert command[-4:] == ["MEMORY_GUIDANCE", "--iterations", "5", "--write"]
+
+    def test_the_writing_phases_are_dispatched_with_write(self):
+        """Without it the loop can never produce the PR its report claims."""
+        for target_type in (TargetType.TOOL, TargetType.PROMPT):
+            assert build_command(PHASE_DISPATCH[target_type], "x")[-1] == "--write"
+
+    def test_phases_with_no_write_path_do_not_get_the_flag(self):
+        for target_type in (TargetType.SKILL, TargetType.CODE):
+            assert "--write" not in build_command(PHASE_DISPATCH[target_type], "x")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -298,6 +329,7 @@ class TestCycle:
             "evolution.tools.evolve_tool_descriptions",
             "--tool",
             "search_files",
+            "--write",
         ]
 
     def test_a_prompt_target_goes_to_phase_three(self, store, hermes_repo, out):
@@ -322,6 +354,7 @@ class TestCycle:
             "evolution.prompts.evolve_prompt_section",
             "--section",
             "MEMORY_GUIDANCE",
+            "--write",
         ]
 
     def test_a_code_target_goes_to_phase_four(self, store, hermes_repo, out):
@@ -807,3 +840,63 @@ class TestCli:
             "--history-path",
         ):
             assert flag in result.output
+
+
+class TestProposedMeansABranchExists:
+    """Exit code 0 is not a proposal.
+
+    A phase exits 0 just as happily when the cross-tool guard rejected the
+    candidate, a gate blocked it, or the rewrite came back identical. Reading
+    that as PROPOSED told the operator a human had a PR waiting when no branch
+    existed anywhere, and wrote a 1.0 into the metric history to match.
+    """
+
+    def _tool_store(self, store):
+        store.extend([point(TOOL_SELECTION_ACCURACY, "search_files", 0.4, samples=80)])
+        return store
+
+    def test_a_branch_appearing_is_a_proposal(self, store, hermes_repo, out):
+        self._tool_store(store)
+        report = cycle(
+            store, hermes_repo, out=out,
+            branch_lister=FakeBranches("evolve/search_files-20260731_010203"),
+        )
+        dispatch = report.dispatches[0]
+        assert dispatch.status is DispatchStatus.PROPOSED
+        assert "evolve/search_files-20260731_010203" in dispatch.reason
+
+    def test_a_clean_run_that_produced_nothing_is_not_a_proposal(self, store, hermes_repo, out):
+        self._tool_store(store)
+        report = cycle(
+            store, hermes_repo, out=out,
+            dispatcher=FakeDispatcher(returncode=0),
+            branch_lister=FakeBranches(produces=""),
+        )
+        dispatch = report.dispatches[0]
+        assert dispatch.returncode == 0
+        assert dispatch.status is DispatchStatus.NO_CHANGE
+        assert "no branch" in dispatch.reason
+        assert report.proposed == []
+
+    def test_a_failure_is_still_a_failure(self, store, hermes_repo, out):
+        self._tool_store(store)
+        report = cycle(
+            store, hermes_repo, out=out,
+            dispatcher=FakeDispatcher(returncode=1),
+            branch_lister=FakeBranches(produces=""),
+        )
+        assert report.dispatches[0].status is DispatchStatus.FAILED
+
+    def test_a_pre_existing_branch_is_not_mistaken_for_a_new_one(self, store, hermes_repo, out):
+        self._tool_store(store)
+        stale = {"evolve/something-old"}
+        report = cycle(
+            store, hermes_repo, out=out, branch_lister=lambda repo: set(stale)
+        )
+        assert report.dispatches[0].status is DispatchStatus.NO_CHANGE
+
+    def test_a_non_git_checkout_does_not_crash_the_cycle(self, store, tmp_path, out):
+        self._tool_store(store)
+        from evolution.monitor.loop import _evolve_branches
+        assert _evolve_branches(tmp_path) == set()
+        assert _evolve_branches(None) == set()
