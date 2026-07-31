@@ -65,6 +65,7 @@ from evolution.core.gates import GateChain, run_benchmark_gate, run_pytest_gate
 from evolution.core.stats import (
     PairedContinuous,
     compare_paired_continuous,
+    holm_adjust,
     min_detectable_paired_shift,
     wilcoxon_signed_rank,
 )
@@ -96,6 +97,12 @@ console = Console()
 # strict comparison rejected an exactly-10% lift against a 10% bar and printed
 # "+10.0% is under the 10% threshold". Compare with a hair of slack instead.
 _FLOAT_SLACK = 1e-9
+
+# How much of a holdout suite may go unmeasured before the run is refused
+# rather than compared on what is left. A few dropped scenarios shrink the
+# sample; a third of them means the harness, not the prompt, decided the
+# result.
+MAX_UNMEASURED_FRACTION = 0.2
 
 ZERO_REGRESSION_TOLERANCE = 0.0
 
@@ -178,6 +185,14 @@ def align_holdout_scores(
     already aligned. This checks that invariant rather than trusting it: a
     silent misalignment still produces a number, and the number looks fine.
 
+    A scenario the harness failed to produce a transcript for is **dropped from
+    both sides**, not scored as a behavioural failure. An unmeasured run is
+    missing data: giving it 0.0 on the side that timed out and a real score on
+    the side that completed fabricates a difference out of a flake, and six
+    baseline timeouts against a clean candidate run read as a significant +32%
+    improvement. Losing more than ``MAX_UNMEASURED_FRACTION`` of the suite that
+    way means the run cannot be trusted at all and is refused outright.
+
     Returns ``(scenario_ids, categories, baseline_scores, candidate_scores)``.
     """
     base_ids = tuple(o.scenario_id for o in baseline.outcomes)
@@ -196,11 +211,26 @@ def align_holdout_scores(
         raise UnpairedHoldout(
             "holdout runs are not in the same scenario order (" + "; ".join(drift[:3]) + ")"
         )
+
+    kept = [
+        (b, c)
+        for b, c in zip(baseline.outcomes, candidate.outcomes)
+        if getattr(b, "measured", True) and getattr(c, "measured", True)
+    ]
+    total = len(base_ids)
+    dropped = total - len(kept)
+    if total and dropped / total > MAX_UNMEASURED_FRACTION:
+        raise UnpairedHoldout(
+            f"{dropped} of {total} holdout scenarios produced no transcript on one "
+            f"side or the other; over the {MAX_UNMEASURED_FRACTION:.0%} limit, so "
+            "this run measured too little to compare"
+        )
+
     return (
-        base_ids,
-        tuple(o.category for o in baseline.outcomes),
-        tuple(o.score for o in baseline.outcomes),
-        tuple(o.score for o in candidate.outcomes),
+        tuple(b.scenario_id for b, _ in kept),
+        tuple(b.category for b, _ in kept),
+        tuple(b.score for b, _ in kept),
+        tuple(c.score for _, c in kept),
     )
 
 
@@ -500,6 +530,9 @@ class SectionOutcome:
     validation: Optional[SectionValidation] = None
     accepted: bool = False
     reason: str = ""
+    # Set only when several sections were tested against one baseline in the
+    # same run; None for a single-section run, where no correction applies.
+    adjusted_p: Optional[float] = None
     elapsed_s: float = 0.0
     optimizer: str = ""
 
@@ -1053,6 +1086,43 @@ def evolve(
                 outcome.accepted = False
                 outcome.reason = comparison.reason
                 console.print(f"    [yellow]○ not deployable: {comparison.reason}[/yellow]")
+
+    # ── 8b. Correct for testing several sections against one baseline ────
+    #
+    # Each section above was tested at alpha on its own. Deploying every section
+    # that clears is a disjunction - "any of these worked" - and selecting the
+    # best of k inflates the family-wise error: four sections at 0.05 give
+    # 1 - 0.95**4 = 18.6%, not 5%. Holm-adjust the surviving p-values and drop
+    # any that no longer clear.
+    #
+    # This is the opposite call from the per-category guard a few lines above,
+    # deliberately. That one is a conjunction - accepting means every category
+    # held - which is an intersection-union test and is already valid at alpha.
+    # Correcting a conjunction would loosen the gate as the catalogue grows.
+    if len(deployable) > 1:
+        raw = [o.holdout.overall.wilcoxon_p for o in deployable]
+        adjusted = holm_adjust(raw)
+        survivors = []
+        for outcome, raw_p, adj_p in zip(list(deployable), raw, adjusted):
+            outcome.adjusted_p = adj_p
+            if adj_p < HOLDOUT_ALPHA:
+                survivors.append(outcome)
+                continue
+            outcome.accepted = False
+            outcome.reason = (
+                f"p={raw_p:.3f} alone, but {adj_p:.3f} after correcting for "
+                f"{len(raw)} sections tested against one baseline"
+            )
+            console.print(
+                f"  [yellow]○ {outcome.name}: dropped by the "
+                f"multiple-comparison correction ({outcome.reason})[/yellow]"
+            )
+        if len(survivors) != len(deployable):
+            console.print(
+                f"  [dim]Holm correction over {len(raw)} sections: "
+                f"{len(survivors)} of {len(raw)} survive at alpha={HOLDOUT_ALPHA}[/dim]"
+            )
+        deployable = survivors
 
     # ── 9. Results ───────────────────────────────────────────────────────
     table = Table(title="Phase 3 - System Prompt Evolution")

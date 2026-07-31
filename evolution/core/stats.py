@@ -61,6 +61,7 @@ __all__ = [
     "cohens_h",
     "cohens_d",
     "chance_accuracy",
+    "holm_adjust",
     "mann_kendall",
     "student_t_sf",
     "binomial_sf",
@@ -980,6 +981,37 @@ def cohens_d(baseline: Sequence[float], candidate: Sequence[float]) -> float:
     if sd == 0:
         return 0.0 if mean == 0 else math.copysign(math.inf, mean)
     return mean / sd
+
+
+def holm_adjust(p_values: Sequence[float]) -> list[float]:
+    """Holm-Bonferroni step-down adjustment. Returns adjusted p-values in order.
+
+    Use this for a **disjunction**: several candidates tested against one
+    baseline where any that clears alpha gets deployed. Selecting the best of k
+    inflates the family-wise error rate, and four independent sections tested at
+    0.05 give ``1 - 0.95**4`` = 18.6%, not 5%.
+
+    Do not use it for the per-tool and per-category conjunctions elsewhere in
+    this codebase. Those are intersection-union tests, where accepting means
+    *every* claim holds; a conjunction of alpha-level claims is already valid at
+    alpha, and adjusting would make the gate looser as the catalogue grows. The
+    distinction is which way the quantifier runs: "any of these succeeded" needs
+    correcting, "all of these held" does not.
+
+    Holm rather than plain Bonferroni because it is uniformly more powerful and
+    just as valid without assuming independence.
+    """
+    n = len(p_values)
+    if n == 0:
+        return []
+    order = sorted(range(n), key=lambda i: p_values[i])
+    adjusted = [0.0] * n
+    running = 0.0
+    for rank, index in enumerate(order):
+        scaled = min(1.0, (n - rank) * p_values[index])
+        running = max(running, scaled)  # enforce monotonicity down the ladder
+        adjusted[index] = running
+    return adjusted
 
 
 def chance_accuracy(num_options: int) -> float:

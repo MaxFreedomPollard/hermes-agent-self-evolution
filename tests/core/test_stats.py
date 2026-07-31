@@ -17,6 +17,7 @@ from evolution.core.stats import (
     chance_accuracy,
     cohens_d,
     cohens_h,
+    holm_adjust,
     compare_paired_binary,
     compare_paired_continuous,
     mcnemar_exact,
@@ -349,3 +350,48 @@ class TestInterval:
         interval = Interval(0.1, 0.05, 0.15)
         assert "%" in interval.describe(as_percent=True)
         assert "0.100" in interval.describe(as_percent=False)
+
+
+class TestHolmAdjust:
+    """Correcting a disjunction, and only a disjunction.
+
+    Testing k candidates against one baseline and deploying any that clears is
+    selection of the best of k. Four sections at alpha = 0.05 give a family-wise
+    error of 1 - 0.95**4 = 18.6%, not 5%.
+    """
+
+    def test_matches_hand_computation(self):
+        # Sorted p is [0.01, 0.03, 0.04, 0.20]; multipliers are 4, 3, 2, 1
+        # with the running maximum enforced down the ladder.
+        assert holm_adjust([0.01, 0.04, 0.03, 0.20]) == pytest.approx(
+            [0.04, 0.09, 0.09, 0.20]
+        )
+
+    def test_a_single_test_is_left_alone(self):
+        assert holm_adjust([0.03]) == pytest.approx([0.03])
+
+    def test_empty_input(self):
+        assert holm_adjust([]) == []
+
+    def test_it_can_only_make_p_values_larger(self):
+        raw = [0.001, 0.02, 0.049, 0.3]
+        assert all(a >= r for r, a in zip(raw, holm_adjust(raw)))
+
+    def test_it_is_monotone_in_the_raw_ordering(self):
+        raw = [0.001, 0.02, 0.049, 0.3]
+        adjusted = holm_adjust(raw)
+        by_raw = [a for _, a in sorted(zip(raw, adjusted))]
+        assert by_raw == sorted(by_raw)
+
+    def test_borderline_results_stop_surviving(self):
+        raw = [0.01, 0.04, 0.03, 0.20]
+        assert sum(p < 0.05 for p in raw) == 3
+        assert sum(p < 0.05 for p in holm_adjust(raw)) == 1
+
+    def test_it_never_exceeds_one(self):
+        assert all(a <= 1.0 for a in holm_adjust([0.6, 0.7, 0.9]))
+
+    def test_it_is_more_powerful_than_plain_bonferroni(self):
+        raw = [0.01, 0.02, 0.03]
+        bonferroni = [min(1.0, len(raw) * p) for p in raw]
+        assert holm_adjust(raw)[0] <= bonferroni[0]

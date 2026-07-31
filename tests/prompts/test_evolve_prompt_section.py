@@ -1286,3 +1286,61 @@ class TestFullRunHoldout:
         )
         assert code == 0
         assert builder.read_text(encoding="utf-8") == before
+
+
+class TestUnmeasuredScenariosAreNotFailures:
+    """A transcript the harness never produced is missing data, not a zero.
+
+    Audit finding: scoring an absent run 0.0 on one side of a paired comparison
+    and a real score on the other manufactures a difference out of a timeout.
+    Six baseline scenarios timing out against a clean candidate run read as a
+    significant +32% improvement and deployed.
+    """
+
+    def _outcome(self, i, score, measured=True, category="memory_guidance"):
+        return BehavioralOutcome(
+            scenario_id=f"s{i:02d}",
+            category=category,
+            section="MEMORY_GUIDANCE",
+            score=score,
+            passed=score >= 0.5,
+            measured=measured,
+        )
+
+    def _report(self, outcomes):
+        return BehavioralReport(outcomes=outcomes)
+
+    def test_a_harness_flake_cannot_manufacture_an_improvement(self):
+        baseline = self._report(
+            [self._outcome(i, 0.0, measured=False) for i in range(6)]
+            + [self._outcome(i, 0.8) for i in range(6, 15)]
+        )
+        candidate = self._report([self._outcome(i, 0.8) for i in range(15)])
+        with pytest.raises(ep.UnpairedHoldout, match="no transcript"):
+            ep.compare_holdout(baseline, candidate)
+
+    def test_a_few_dropped_scenarios_shrink_the_sample_not_the_scores(self):
+        baseline = self._report(
+            [self._outcome(0, 0.0, measured=False)]
+            + [self._outcome(i, 0.5) for i in range(1, 15)]
+        )
+        candidate = self._report([self._outcome(i, 0.5) for i in range(15)])
+        comparison = ep.compare_holdout(baseline, candidate)
+        assert comparison.n == 14
+        assert comparison.delta == pytest.approx(0.0)
+        assert not comparison.accepted
+
+    def test_an_unmeasured_candidate_scenario_drops_the_pair_too(self):
+        baseline = self._report([self._outcome(i, 0.5) for i in range(15)])
+        candidate = self._report(
+            [self._outcome(0, 0.0, measured=False)]
+            + [self._outcome(i, 0.9) for i in range(1, 15)]
+        )
+        comparison = ep.compare_holdout(baseline, candidate)
+        assert comparison.n == 14
+        assert comparison.delta == pytest.approx(0.4)
+
+    def test_everything_measured_keeps_the_whole_suite(self):
+        baseline = self._report([self._outcome(i, 0.5) for i in range(15)])
+        candidate = self._report([self._outcome(i, 0.7) for i in range(15)])
+        assert ep.compare_holdout(baseline, candidate).n == 15

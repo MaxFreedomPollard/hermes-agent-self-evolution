@@ -767,6 +767,12 @@ class BehavioralOutcome:
     score: float
     passed: bool
     feedback: str = ""
+    # False when the harness produced nothing for this scenario. A run that
+    # never happened is unmeasured, not a behavioural failure: scoring it 0.0
+    # on one side of a paired comparison and a real score on the other
+    # manufactures a difference out of a timeout. Six baseline scenarios timing
+    # out while the candidate completes reads as a significant +32% lift.
+    measured: bool = True
     judge: str = "heuristic"
 
     def to_dict(self) -> dict:
@@ -1008,6 +1014,7 @@ class BehavioralJudge:
                         score=0.0,
                         passed=False,
                         feedback="no transcript produced for this scenario",
+                        measured=False,
                     )
                 )
                 continue
