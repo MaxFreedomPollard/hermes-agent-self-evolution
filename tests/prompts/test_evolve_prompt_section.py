@@ -1,9 +1,15 @@
-"""Tests for the Phase 3 entry point: gate ladder, CLI, and write-back.
+"""Tests for the Phase 3 entry point: gate ladder, holdout statistics, CLI, write-back.
 
 Offline throughout. The optimizer, the harness, and the benchmark runners are
 all replaced with stubs, which is the only way to exercise the accept/reject
 logic that matters here - the decision about whether a prompt change is allowed
 to reach disk is the product, and it has to be testable without an LM.
+
+The holdout tests below are built from hand-chosen score pairs rather than
+random data, because the interesting cases are the ones where the point
+estimate and the evidence disagree: a +12% lift the test cannot separate from
+noise, a category that falls off a cliff behind an improving aggregate, and a
+suite too small to say anything at all.
 """
 
 import json
@@ -11,10 +17,12 @@ import json
 import dspy
 import pytest
 from click.testing import CliRunner
+from rich.console import Console
 
 from evolution.core.gates import GateChain, GateResult, GateStatus
 from evolution.prompts import evolve_prompt_section as ep
 from evolution.prompts.behavioral_eval import (
+    CATEGORY_SECTIONS,
     BehavioralOutcome,
     BehavioralReport,
     BehavioralSuite,
@@ -94,6 +102,46 @@ def gate(name, status, message="", score=None, baseline=None):
 def flat(output: str) -> str:
     """Collapse rich's console wrapping so assertions can span line breaks."""
     return " ".join(output.split())
+
+
+def holdout_reports(categories, baseline_scores, candidate_scores):
+    """Two reports over the same scenarios in the same order.
+
+    Scenario ids come from the position, which is what the paired comparison
+    checks: index i has to mean the same scenario on both sides.
+    """
+    ids = [f"s{i:02d}" for i in range(len(categories))]
+
+    def build(scores):
+        return BehavioralReport(
+            outcomes=[
+                BehavioralOutcome(
+                    scenario_id=scenario_id,
+                    category=category,
+                    section=CATEGORY_SECTIONS.get(category, ""),
+                    score=score,
+                    passed=score >= 0.6,
+                )
+                for scenario_id, category, score in zip(ids, categories, scores)
+            ]
+        )
+
+    return build(baseline_scores), build(candidate_scores)
+
+
+def uniform_holdout(spec, base=0.40):
+    """Reports where every scenario in a category moves by the same amount.
+
+    *spec* maps category name to the delta applied to that category's scenarios,
+    with the count taken from a ``(delta, count)`` pair.
+    """
+    categories, baseline, candidate = [], [], []
+    for category, (delta, count) in spec.items():
+        for _ in range(count):
+            categories.append(category)
+            baseline.append(base)
+            candidate.append(base + delta)
+    return holdout_reports(categories, baseline, candidate)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -285,6 +333,24 @@ class TestCli:
             ["--all-sections", "--hermes-repo", str(repo), "--dry-run"],
         )
         assert "0% regression tolerance" in flat(result.output)
+
+    def test_dry_run_states_the_acceptance_rule_and_the_power(self, repo):
+        result = CliRunner().invoke(
+            ep.main, ["--all-sections", "--hermes-repo", str(repo), "--dry-run"]
+        )
+        output = flat(result.output)
+        assert "significant paired improvement of at least 10%" in output
+        assert "no category regression past 5%" in output
+        assert "Holdout power:" in output
+
+    def test_dry_run_warns_when_the_holdout_is_too_small_to_test(self, repo, monkeypatch):
+        monkeypatch.setattr(
+            BehavioralSuite, "split", lambda self, **kwargs: ([], [], self.scenarios[:2])
+        )
+        result = CliRunner().invoke(
+            ep.main, ["--section", "MEMORY_GUIDANCE", "--hermes-repo", str(repo), "--dry-run"]
+        )
+        assert "Underpowered" in flat(result.output)
 
     def test_dry_run_states_the_next_session_rule(self, repo):
         result = CliRunner().invoke(
@@ -597,3 +663,579 @@ class TestFullRun:
         )
         assert seen["strict"] is True
         assert set(seen["updates"]) == {"MEMORY_GUIDANCE"}
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Pairing
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestHoldoutPairing:
+    def test_aligned_runs_return_index_matched_scores(self):
+        base, cand = holdout_reports(
+            ["memory_guidance", "identity_tone"], [0.4, 0.5], [0.9, 0.3]
+        )
+        ids, categories, baseline, candidate = ep.align_holdout_scores(base, cand)
+        assert ids == ("s00", "s01")
+        assert categories == ("memory_guidance", "identity_tone")
+        assert baseline == (0.4, 0.5)
+        assert candidate == (0.9, 0.3)
+
+    def test_a_different_length_is_a_bug_not_a_fallback(self):
+        base, _ = holdout_reports(["memory_guidance"] * 3, [0.4] * 3, [0.9] * 3)
+        _, short = holdout_reports(["memory_guidance"] * 2, [0.4] * 2, [0.9] * 2)
+        with pytest.raises(ep.UnpairedHoldout) as excinfo:
+            ep.align_holdout_scores(base, short)
+        assert "3 and 2" in str(excinfo.value)
+
+    def test_a_reordered_run_is_refused(self):
+        base, cand = holdout_reports(
+            ["memory_guidance"] * 3, [0.4, 0.5, 0.6], [0.9, 0.8, 0.7]
+        )
+        cand.outcomes.reverse()
+        with pytest.raises(ep.UnpairedHoldout) as excinfo:
+            ep.align_holdout_scores(base, cand)
+        assert "same scenario order" in str(excinfo.value)
+
+    def test_compare_holdout_propagates_the_pairing_error(self):
+        base, _ = holdout_reports(["memory_guidance"] * 3, [0.4] * 3, [0.9] * 3)
+        _, short = holdout_reports(["memory_guidance"] * 2, [0.4] * 2, [0.9] * 2)
+        with pytest.raises(ep.UnpairedHoldout):
+            ep.compare_holdout(base, short)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Power
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestPower:
+    def test_four_scenarios_is_the_floor_at_alpha_five_percent(self):
+        """The floor assumes the friendliest possible data: every scenario
+        moving the same way by the same amount, which is where the tie
+        correction takes the variance as low as it goes."""
+        assert ep.min_scenarios_for_significance(0.05) == 4
+
+    def test_a_stricter_alpha_needs_a_bigger_suite(self):
+        assert ep.min_scenarios_for_significance(0.01) > ep.min_scenarios_for_significance(0.05)
+
+    def test_a_perfect_lift_on_three_scenarios_cannot_be_significant(self):
+        """The floor is a fact about the test, not about the candidate."""
+        base, cand = uniform_holdout({"memory_guidance": (0.60, 3)})
+        comparison = ep.compare_holdout(base, cand)
+        assert comparison.delta == pytest.approx(0.60)
+        assert not comparison.overall.significant_improvement
+        assert comparison.underpowered
+        assert not comparison.accepted
+
+    def test_unequal_movement_needs_more_than_the_floor(self):
+        """Real judge scores do not move by identical amounts, and the floor
+        is not reachable without that."""
+        base, cand = holdout_reports(
+            ["memory_guidance"] * 4, [0.10, 0.20, 0.30, 0.40], [0.20, 0.50, 0.80, 1.00]
+        )
+        comparison = ep.compare_holdout(base, cand)
+        assert comparison.n == ep.min_scenarios_for_significance(0.05)
+        assert not comparison.overall.significant_improvement
+
+    def test_an_underpowered_run_says_how_many_more_scenarios_it_needs(self):
+        base, cand = uniform_holdout({"memory_guidance": (0.60, 3)})
+        comparison = ep.compare_holdout(base, cand)
+        assert comparison.scenarios_needed == 1
+        assert "1 more holdout scenario" in comparison.reason
+        assert "sample size talking" in comparison.power_note
+
+    def test_a_powered_run_is_not_flagged_underpowered(self):
+        base, cand = uniform_holdout({"memory_guidance": (0.30, 8)})
+        comparison = ep.compare_holdout(base, cand)
+        assert not comparison.underpowered
+        assert comparison.scenarios_needed == 0
+
+    def test_the_smallest_detectable_shift_shrinks_as_the_suite_grows(self):
+        small, _ = uniform_holdout({"memory_guidance": (0.0, 6)})
+        big, _ = uniform_holdout({"memory_guidance": (0.0, 30)})
+        smaller = ep.compare_holdout(small, small).min_detectable_shift
+        bigger = ep.compare_holdout(big, big).min_detectable_shift
+        assert smaller == pytest.approx(5 / 6)
+        assert bigger == pytest.approx(5 / 30)
+
+    def test_fifteen_scenarios_can_only_detect_a_third_of_the_suite_moving(self):
+        base, cand = uniform_holdout({"memory_guidance": (0.20, 15)})
+        comparison = ep.compare_holdout(base, cand)
+        assert comparison.n == 15
+        assert comparison.min_detectable_shift == pytest.approx(1 / 3)
+        assert "33%" in comparison.power_note
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Aggregate verdict
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestAggregateVerdict:
+    def test_a_consistent_lift_clears_both_bars(self):
+        base, cand = uniform_holdout({"memory_guidance": (0.30, 10)})
+        comparison = ep.compare_holdout(base, cand, targeted_category="memory_guidance")
+        assert comparison.overall.significant_improvement
+        assert comparison.delta == pytest.approx(0.30)
+        assert comparison.accepted
+        assert comparison.headline == "accepted"
+
+    def test_a_twelve_percent_lift_that_is_noise_is_not_written_back(self):
+        """The case the audit was about: a big-looking delta with no evidence."""
+        categories = ["memory_guidance"] * 15
+        baseline = [0.40] * 15
+        candidate = [0.90] * 8 + [0.40 - 2.2 / 7] * 7
+        base, cand = holdout_reports(categories, baseline, candidate)
+        comparison = ep.compare_holdout(base, cand, targeted_category="memory_guidance")
+
+        assert comparison.delta == pytest.approx(0.12, abs=1e-9)
+        assert comparison.overall.wilcoxon_p > 0.05
+        assert not comparison.overall.significant_improvement
+        assert not comparison.accepted
+        assert "inconclusive" in comparison.reason
+        assert "+12.0%" in comparison.reason
+
+    def test_an_inconclusive_result_with_enough_scenarios_blames_the_direction(self):
+        categories = ["memory_guidance"] * 15
+        candidate = [0.90] * 8 + [0.40 - 2.2 / 7] * 7
+        base, cand = holdout_reports(categories, [0.40] * 15, candidate)
+        comparison = ep.compare_holdout(base, cand)
+        assert comparison.scenarios_needed == 0
+        assert "8 improved / 7 regressed" in comparison.reason
+
+    def test_a_significant_but_tiny_lift_is_refused(self):
+        base, cand = uniform_holdout({"memory_guidance": (0.02, 15)})
+        comparison = ep.compare_holdout(base, cand, targeted_category="memory_guidance")
+        assert comparison.overall.significant_improvement
+        assert not comparison.accepted
+        assert "under the 10% practical threshold" in comparison.reason
+        assert comparison.headline == "under the 10% bar"
+
+    def test_a_significant_regression_is_never_accepted(self):
+        base, cand = uniform_holdout({"memory_guidance": (-0.30, 10)})
+        comparison = ep.compare_holdout(base, cand, targeted_category="memory_guidance")
+        assert comparison.overall.significant_regression
+        assert not comparison.accepted
+
+    def test_a_flat_targeted_category_blocks_an_aggregate_win(self):
+        """PLAN.md asks for >=10% on the section being evolved, not somewhere else."""
+        base, cand = uniform_holdout(
+            {"memory_guidance": (0.02, 5), "platform_formatting": (0.50, 10)}
+        )
+        comparison = ep.compare_holdout(base, cand, targeted_category="memory_guidance")
+        assert comparison.overall.significant_improvement
+        assert comparison.delta > ep.PRACTICAL_IMPROVEMENT
+        assert not comparison.accepted
+        assert "targeted category memory_guidance" in comparison.reason
+
+    def test_an_empty_holdout_is_not_evidence(self):
+        base, cand = holdout_reports([], [], [])
+        comparison = ep.compare_holdout(base, cand)
+        assert comparison.n == 0
+        assert not comparison.accepted
+        assert comparison.reason == "no holdout evidence"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Per-category guard
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestCategoryGuard:
+    def test_one_wrecked_category_sinks_an_improving_aggregate(self):
+        base, cand = uniform_holdout(
+            {"memory_guidance": (0.50, 10), "platform_formatting": (-0.20, 5)}
+        )
+        comparison = ep.compare_holdout(base, cand, targeted_category="memory_guidance")
+
+        assert comparison.overall.significant_improvement
+        assert comparison.delta > ep.PRACTICAL_IMPROVEMENT
+        assert comparison.by_category["platform_formatting"].significant_regression
+        assert comparison.regressed_categories == ("platform_formatting",)
+        assert not comparison.accepted
+        assert "category regression" in comparison.reason
+        assert comparison.headline == "regressed: platform_formatting"
+
+    def test_a_point_estimate_breach_is_refused_without_significance(self):
+        """Conservative gate: either kind of evidence is enough to reject."""
+        base, cand = uniform_holdout(
+            {"memory_guidance": (0.50, 12), "platform_formatting": (-0.30, 3)}
+        )
+        comparison = ep.compare_holdout(base, cand, targeted_category="memory_guidance")
+        platform = comparison.by_category["platform_formatting"]
+
+        assert not platform.significant_regression  # 3 scenarios cannot prove it
+        assert platform.delta <= -ep.CATEGORY_REGRESSION_TOLERANCE
+        assert comparison.regressed_categories == ("platform_formatting",)
+        assert not comparison.accepted
+
+    def test_a_small_significant_drop_is_refused_too(self):
+        base, cand = uniform_holdout(
+            {"memory_guidance": (0.50, 12), "identity_tone": (-0.06, 8)}
+        )
+        comparison = ep.compare_holdout(base, cand, targeted_category="memory_guidance")
+        identity = comparison.by_category["identity_tone"]
+
+        assert identity.significant_regression
+        assert comparison.regressed_categories == ("identity_tone",)
+
+    def test_drift_inside_the_tolerance_is_allowed(self):
+        base, cand = uniform_holdout(
+            {"memory_guidance": (0.50, 12), "platform_formatting": (-0.02, 3)}
+        )
+        comparison = ep.compare_holdout(base, cand, targeted_category="memory_guidance")
+        assert comparison.regressed_categories == ()
+        assert comparison.accepted
+
+    def test_a_category_is_measured_only_against_its_own_scenarios(self):
+        base, cand = uniform_holdout(
+            {"memory_guidance": (0.50, 6), "skills_guidance": (0.10, 6)}
+        )
+        comparison = ep.compare_holdout(base, cand)
+        assert comparison.by_category["memory_guidance"].n == 6
+        assert comparison.by_category["memory_guidance"].delta == pytest.approx(0.50)
+        assert comparison.by_category["skills_guidance"].delta == pytest.approx(0.10)
+
+    def test_no_multiplicity_correction_as_the_category_count_grows(self):
+        """Intersection-union: the per-category bar does not move with tool count.
+
+        A Bonferroni-style correction would divide alpha by the number of
+        categories, so the same wrecked category would look less and less
+        significant the more categories a run covered. That is backwards for a
+        safety gate, and this pins the behaviour.
+        """
+        offender = {"platform_formatting": (-0.20, 6)}
+        two = ep.compare_holdout(
+            *uniform_holdout({"memory_guidance": (0.50, 6), **offender}),
+            targeted_category="memory_guidance",
+        )
+        five = ep.compare_holdout(
+            *uniform_holdout(
+                {
+                    "memory_guidance": (0.50, 6),
+                    "skills_guidance": (0.50, 6),
+                    "session_search": (0.50, 6),
+                    "identity_tone": (0.50, 6),
+                    **offender,
+                }
+            ),
+            targeted_category="memory_guidance",
+        )
+
+        assert two.by_category["platform_formatting"].wilcoxon_p == pytest.approx(
+            five.by_category["platform_formatting"].wilcoxon_p
+        )
+        assert two.regressed_categories == five.regressed_categories
+        assert not two.accepted and not five.accepted
+
+    def test_underpowered_categories_are_named(self):
+        base, cand = uniform_holdout(
+            {"memory_guidance": (0.50, 10), "platform_formatting": (0.01, 3)}
+        )
+        comparison = ep.compare_holdout(base, cand, targeted_category="memory_guidance")
+        assert comparison.underpowered_categories == ("platform_formatting",)
+        assert not comparison.underpowered  # the aggregate is big enough
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Serialisation
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestHoldoutSerialisation:
+    def test_to_dict_carries_the_whole_comparison(self):
+        base, cand = uniform_holdout(
+            {"memory_guidance": (0.50, 10), "platform_formatting": (-0.20, 5)}
+        )
+        data = ep.compare_holdout(
+            base, cand, targeted_category="memory_guidance"
+        ).to_dict()
+
+        json.dumps(data)
+        assert data["n"] == 15
+        assert data["overall"]["wilcoxon_p"] >= 0
+        assert data["overall"]["delta_ci"]["confidence"] == 0.95
+        assert set(data["by_category"]) == {"memory_guidance", "platform_formatting"}
+        assert data["targeted"]["delta"] == pytest.approx(0.50)
+        assert data["regressed_categories"] == ["platform_formatting"]
+        assert data["min_scenarios_for_significance"] == 4
+        assert data["movement"] == {"improved": 10, "regressed": 5, "unchanged": 0}
+        assert data["accepted"] is False
+
+    def test_the_bootstrap_is_reproducible(self):
+        base, cand = uniform_holdout(
+            {"memory_guidance": (0.50, 6), "platform_formatting": (-0.10, 6)}
+        )
+        first = ep.compare_holdout(base, cand).to_dict()
+        second = ep.compare_holdout(base, cand).to_dict()
+        assert first == second
+
+    def test_section_outcome_carries_the_comparison(self):
+        base, cand = uniform_holdout({"memory_guidance": (0.30, 10)})
+        outcome = ep.SectionOutcome(
+            name="MEMORY_GUIDANCE",
+            baseline_text="a",
+            evolved_text="b",
+            holdout=ep.compare_holdout(base, cand, targeted_category="memory_guidance"),
+        )
+        data = outcome.to_dict()
+        json.dumps(data)
+        assert data["holdout"]["accepted"] is True
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# The holdout inside a full run
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def scoring_stub(deltas_by_category, base=0.40):
+    """A BehavioralSuite.evaluate replacement with per-category deltas."""
+
+    def _evaluate(
+        self, system_prompt, harness, judge=None, section_name="", run_name="", scenarios=None
+    ):
+        targets = list(scenarios if scenarios is not None else self.scenarios)
+        evolved = EVOLVED_MARKER in system_prompt
+        outcomes = []
+        for scenario in targets:
+            delta = deltas_by_category.get(scenario.category, 0.0) if evolved else 0.0
+            score = base + delta
+            outcomes.append(
+                BehavioralOutcome(
+                    scenario_id=scenario.scenario_id,
+                    category=scenario.category,
+                    section=scenario.section_under_test,
+                    score=score,
+                    passed=score >= 0.6,
+                )
+            )
+        return BehavioralReport(outcomes=outcomes, harness="stub")
+
+    return _evaluate
+
+
+def alternating_stub(deltas, base=0.40):
+    """Per-position deltas, cycling, so a run can be made deliberately noisy."""
+
+    def _evaluate(
+        self, system_prompt, harness, judge=None, section_name="", run_name="", scenarios=None
+    ):
+        targets = list(scenarios if scenarios is not None else self.scenarios)
+        evolved = EVOLVED_MARKER in system_prompt
+        outcomes = []
+        for index, scenario in enumerate(targets):
+            score = base + (deltas[index % len(deltas)] if evolved else 0.0)
+            outcomes.append(
+                BehavioralOutcome(
+                    scenario_id=scenario.scenario_id,
+                    category=scenario.category,
+                    section=scenario.section_under_test,
+                    score=score,
+                    passed=score >= 0.6,
+                )
+            )
+        return BehavioralReport(outcomes=outcomes, harness="stub")
+
+    return _evaluate
+
+
+def latest_metrics(tmp_path):
+    runs = sorted((tmp_path / "output" / "prompts").iterdir())
+    return json.loads((runs[-1] / "metrics.json").read_text(encoding="utf-8"))
+
+
+@pytest.fixture
+def wide_console(monkeypatch):
+    """Stop rich wrapping table headers mid-word at the default 80 columns.
+
+    Only the assertions need this. The run itself does not care how wide the
+    terminal is.
+    """
+    monkeypatch.setattr(ep, "console", Console(width=200))
+
+
+def same_length_optimize(
+    section_name, baseline_text, trainset, valset, iterations, optimizer_model
+):
+    """An optimizer stub that marks a section without growing it.
+
+    The default stub appends to the baseline, which pushes a short section past
+    the +20% growth ceiling and quietly drops it before the holdout ever runs.
+    """
+    keep = max(0, len(baseline_text) - len(EVOLVED_MARKER))
+    return baseline_text[:keep] + EVOLVED_MARKER, "stub"
+
+
+class TestFullRunHoldout:
+    def test_metrics_record_the_full_comparison(self, repo, stubbed, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        ep.evolve(section_names=["MEMORY_GUIDANCE"], hermes_repo=str(repo))
+        holdout = latest_metrics(tmp_path)["sections"][0]["holdout"]
+
+        assert holdout["n"] > 0
+        assert "wilcoxon_p" in holdout["overall"]
+        assert "delta_ci" in holdout["overall"]
+        assert holdout["by_category"]
+        assert holdout["targeted_category"] == "memory_guidance"
+        assert holdout["accepted"] is True
+
+    def test_metrics_record_the_test_configuration(self, repo, stubbed, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        ep.evolve(section_names=["MEMORY_GUIDANCE"], hermes_repo=str(repo))
+        config = latest_metrics(tmp_path)["holdout_test"]
+
+        assert config["alpha"] == 0.05
+        assert config["practical_threshold"] == 0.10
+        assert config["bootstrap_seed"] == ep.HOLDOUT_BOOTSTRAP_SEED
+        assert "intersection-union" in config["multiplicity_correction"]
+
+    def test_an_inconclusive_holdout_prevents_the_write(
+        self, repo, builder, stubbed, tmp_path, monkeypatch
+    ):
+        # +12% on the mean, with the direction flipping scenario to scenario.
+        monkeypatch.setattr(
+            BehavioralSuite, "evaluate", alternating_stub([0.60, -0.36])
+        )
+        monkeypatch.chdir(tmp_path)
+        before = builder.read_text(encoding="utf-8")
+        code = ep.evolve(
+            section_names=["MEMORY_GUIDANCE"], hermes_repo=str(repo), write=True
+        )
+
+        assert code == 0
+        assert builder.read_text(encoding="utf-8") == before
+        holdout = latest_metrics(tmp_path)["sections"][0]["holdout"]
+        assert holdout["overall"]["delta"] == pytest.approx(0.12)
+        assert holdout["accepted"] is False
+        assert "inconclusive" in holdout["reason"]
+
+    def test_the_inconclusive_verdict_reaches_the_console(
+        self, repo, stubbed, wide_console, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(
+            BehavioralSuite, "evaluate", alternating_stub([0.60, -0.36])
+        )
+        monkeypatch.chdir(tmp_path)
+        ep.evolve(section_names=["MEMORY_GUIDANCE"], hermes_repo=str(repo))
+        output = flat(capsys.readouterr().out)
+
+        assert "inconclusive" in output
+        assert "not distinguishable from noise" in output
+
+    def test_a_wrecked_category_prevents_the_write(
+        self, repo, builder, stubbed, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            BehavioralSuite,
+            "evaluate",
+            scoring_stub({"memory_guidance": 0.50, "platform_formatting": -0.30}),
+        )
+        monkeypatch.chdir(tmp_path)
+        before = builder.read_text(encoding="utf-8")
+        code = ep.evolve(
+            section_names=["MEMORY_GUIDANCE"], hermes_repo=str(repo), write=True
+        )
+
+        assert code == 0
+        assert builder.read_text(encoding="utf-8") == before
+        holdout = latest_metrics(tmp_path)["sections"][0]["holdout"]
+        assert holdout["regressed_categories"] == ["platform_formatting"]
+        assert holdout["by_category"]["memory_guidance"]["delta"] == pytest.approx(0.50)
+
+    def test_the_results_table_reports_the_interval_and_the_p_value(
+        self, repo, stubbed, wide_console, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.chdir(tmp_path)
+        ep.evolve(section_names=["MEMORY_GUIDANCE"], hermes_repo=str(repo))
+        output = flat(capsys.readouterr().out)
+
+        assert "Δ (95% CI)" in output
+        assert "Holdout by category" in output
+        assert "targeted" in output
+
+    def test_power_is_stated_even_on_a_clean_run(
+        self, repo, stubbed, wide_console, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.chdir(tmp_path)
+        ep.evolve(section_names=["MEMORY_GUIDANCE"], hermes_repo=str(repo))
+        output = flat(capsys.readouterr().out)
+
+        assert "Power:" in output
+        assert "smallest shift an exact paired test could call significant" in output
+
+    def test_the_holdout_covers_categories_the_section_was_not_aimed_at(
+        self, repo, stubbed, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        ep.evolve(section_names=["MEMORY_GUIDANCE"], hermes_repo=str(repo))
+        holdout = latest_metrics(tmp_path)["sections"][0]["holdout"]
+        assert set(holdout["by_category"]) == {"memory_guidance", "platform_formatting"}
+
+    def test_one_baseline_run_is_shared_by_every_candidate(
+        self, repo, stubbed, tmp_path, monkeypatch
+    ):
+        """Two candidates, one baseline. Re-measuring it per section would give
+        each candidate a differently sampled baseline and break the pairing."""
+        runs: list[str] = []
+        original = BehavioralSuite.evaluate
+
+        def spy(self, system_prompt, harness, judge=None, section_name="", run_name="", scenarios=None):
+            runs.append(run_name)
+            return original(
+                self,
+                system_prompt,
+                harness,
+                judge=judge,
+                section_name=section_name,
+                run_name=run_name,
+                scenarios=scenarios,
+            )
+
+        monkeypatch.setattr(BehavioralSuite, "evaluate", spy)
+        monkeypatch.setattr(ep, "_optimize_section", same_length_optimize)
+        monkeypatch.chdir(tmp_path)
+        ep.evolve(
+            section_names=["MEMORY_GUIDANCE", "SKILLS_GUIDANCE"], hermes_repo=str(repo)
+        )
+
+        assert len([r for r in runs if r.startswith("hase-holdout-base")]) == 1
+        assert len([r for r in runs if r.startswith("hase-holdout-evolved")]) == 2
+
+    def test_both_sides_of_the_pair_get_the_same_section_label(
+        self, repo, stubbed, tmp_path, monkeypatch
+    ):
+        """The label reaches the direct harness's scaffold, so it must not vary."""
+        labels: list[str] = []
+        original = BehavioralSuite.evaluate
+
+        def spy(self, system_prompt, harness, judge=None, section_name="", run_name="", scenarios=None):
+            if run_name.startswith("hase-holdout"):
+                labels.append(section_name)
+            return original(
+                self,
+                system_prompt,
+                harness,
+                judge=judge,
+                section_name=section_name,
+                run_name=run_name,
+                scenarios=scenarios,
+            )
+
+        monkeypatch.setattr(BehavioralSuite, "evaluate", spy)
+        monkeypatch.chdir(tmp_path)
+        ep.evolve(section_names=["MEMORY_GUIDANCE"], hermes_repo=str(repo))
+
+        assert labels == [ep.HOLDOUT_SECTION_LABEL, ep.HOLDOUT_SECTION_LABEL]
+
+    def test_a_flat_holdout_is_not_deployable(
+        self, repo, builder, stubbed, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(BehavioralSuite, "evaluate", scoring_stub({}))
+        monkeypatch.chdir(tmp_path)
+        before = builder.read_text(encoding="utf-8")
+        code = ep.evolve(
+            section_names=["MEMORY_GUIDANCE"], hermes_repo=str(repo), write=True
+        )
+        assert code == 0
+        assert builder.read_text(encoding="utf-8") == before

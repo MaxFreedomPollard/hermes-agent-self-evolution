@@ -12,6 +12,7 @@ from click.testing import CliRunner
 from evolution.core.config import EvolutionConfig
 from evolution.core.constraints import ConstraintValidator
 from evolution.tools.evolve_tool_descriptions import (
+    build_accuracy_checker,
     enforce_constraints,
     evolve_tool_descriptions,
     freeze_unselected,
@@ -485,3 +486,215 @@ class TestFullRun:
         metrics = self.run(hermes_repo, tmp_path, write=True, strict_gates=True)
         assert metrics["gates_passed"] is False
         assert metrics["written"] is False
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# PLAN.md's last Phase 2 constraint: descriptions must stay factually true.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestFactualAccuracyConstraint:
+    def checker(self, hermes_repo):
+        # entailment=False keeps this offline and deterministic; the LLM tier
+        # has its own tests in test_accuracy.py.
+        return build_accuracy_checker(load_catalog(hermes_repo), entailment=False)
+
+    def enforce(self, hermes_repo, candidate, baseline):
+        return enforce_constraints(
+            candidate,
+            baseline,
+            ConstraintValidator(NO_GROWTH_LIMIT),
+            accuracy=self.checker(hermes_repo),
+        )
+
+    def test_a_rewrite_that_invents_a_parameter_is_reverted(self, hermes_repo):
+        baseline = bundle(read_file=("Read a text file.",))
+        candidate = bundle(read_file=("Read a text file. Pass `recursive` to descend.",))
+        kept, outcomes = self.enforce(hermes_repo, candidate, baseline)
+        assert kept["read_file"].description == "Read a text file."
+        assert outcomes[0].reverted and not outcomes[0].passed
+
+    def test_the_messages_say_what_was_wrong(self, hermes_repo):
+        baseline = bundle(read_file=("Read a text file.",))
+        candidate = bundle(read_file=("Read a text file. Pass `recursive` to descend.",))
+        _, outcomes = self.enforce(hermes_repo, candidate, baseline)
+        assert any(
+            m.startswith("factual_accuracy:") and "recursive" in m
+            for m in outcomes[0].messages
+        )
+
+    def test_the_budget_messages_are_still_there(self, hermes_repo):
+        baseline = bundle(read_file=("Read a text file.",))
+        candidate = bundle(read_file=("Read a text file. Pass `recursive` to descend.",))
+        _, outcomes = self.enforce(hermes_repo, candidate, baseline)
+        assert any(m.startswith("size_limit:") for m in outcomes[0].messages)
+
+    def test_an_accurate_rewrite_survives(self, hermes_repo):
+        baseline = bundle(read_file=("Read a text file.",))
+        candidate = bundle(read_file=("Read a text file. Use offset and limit for big files.",))
+        kept, outcomes = self.enforce(hermes_repo, candidate, baseline)
+        assert kept["read_file"].description.endswith("for big files.")
+        assert outcomes[0].passed and not outcomes[0].reverted
+
+    def test_a_value_outside_an_enum_is_reverted(self, hermes_repo):
+        baseline = bundle(search_files=("Search file contents.",))
+        candidate = bundle(search_files=("Search with target='both' for names and text.",))
+        kept, _ = self.enforce(hermes_repo, candidate, baseline)
+        assert kept["search_files"].description == "Search file contents."
+
+    def test_an_inaccurate_parameter_description_is_reverted(self, hermes_repo):
+        baseline = bundle(read_file=("Read a text file.", {"limit": "How many lines."}))
+        candidate = bundle(read_file=("Read a text file.", {"limit": "How many; see `stride`."}))
+        kept, outcomes = self.enforce(hermes_repo, candidate, baseline)
+        assert kept["read_file"].params["limit"] == "How many lines."
+        assert outcomes[0].target == "read_file.limit" and outcomes[0].reverted
+
+    def test_one_inaccurate_rewrite_does_not_cost_the_others(self, hermes_repo):
+        baseline = bundle(read_file=("Read a text file.",), terminal=("Run a command.",))
+        candidate = bundle(
+            read_file=("Read a file. Pass `recursive`.",),
+            terminal=("Run a shell command in a persistent session.",),
+        )
+        kept, _ = self.enforce(hermes_repo, candidate, baseline)
+        assert kept["read_file"].description == "Read a text file."
+        assert kept["terminal"].description == "Run a shell command in a persistent session."
+
+    def test_without_a_checker_the_old_behaviour_is_unchanged(self, hermes_repo):
+        baseline = bundle(read_file=("Read a text file.",))
+        candidate = bundle(read_file=("Read a text file. Pass `recursive` to descend.",))
+        kept, outcomes = enforce_constraints(
+            candidate, baseline, ConstraintValidator(NO_GROWTH_LIMIT)
+        )
+        assert kept["read_file"].description.endswith("to descend.")
+        assert outcomes[0].passed
+
+    def test_an_unselected_tool_is_never_factually_checked(self, hermes_repo):
+        baseline = bundle(read_file=("Read a text file.",), terminal=("Run a command.",))
+        candidate = bundle(
+            read_file=("Read a text file.",), terminal=("Run it. Pass `recursive`.",)
+        )
+        kept, outcomes = enforce_constraints(
+            candidate,
+            baseline,
+            ConstraintValidator(NO_GROWTH_LIMIT),
+            allowed=["read_file"],
+            accuracy=self.checker(hermes_repo),
+        )
+        assert kept["terminal"].description == "Run a command."
+        assert outcomes == []
+
+
+class TestAccuracyCheckerWiring:
+    def test_the_checker_knows_every_tool_in_the_catalogue(self, hermes_repo):
+        checker = build_accuracy_checker(load_catalog(hermes_repo), entailment=False)
+        assert set(checker.facts) == {
+            "read_file",
+            "search_files",
+            "write_file",
+            "terminal",
+            "vision_analyze",
+        }
+
+    def test_entailment_false_means_no_predictor(self, hermes_repo):
+        checker = build_accuracy_checker(load_catalog(hermes_repo), entailment=False)
+        assert checker.entailment is None
+
+    def test_a_predictor_can_be_injected(self, hermes_repo):
+        stub = object()
+        checker = build_accuracy_checker(load_catalog(hermes_repo), entailment=stub)
+        assert checker.entailment is stub
+
+    def test_the_default_builds_one_but_does_not_call_it(self, hermes_repo):
+        checker = build_accuracy_checker(load_catalog(hermes_repo))
+        assert checker.entailment is not None
+        with dspy.context(lm=None):
+            assert checker.check_tool("read_file", "Read a file.", "Read a text file.") == []
+        assert checker.entailment_ran is False
+
+
+def overclaiming(bundle):
+    """A rewrite that wins examples by promising something the schema forbids."""
+    bundle["read_file"].description = (
+        "Read a text file with line numbers. Pass `recursive` to walk directories."
+    )
+
+
+class TestFullRunStatistics:
+    def run(self, repo, tmp_path, **kwargs):
+        return evolve_tool_descriptions(
+            hermes_repo=str(repo),
+            dataset_path=str(build_dataset(tmp_path / "ds")),
+            iterations=2,
+            output_root=tmp_path / "out",
+            **kwargs,
+        )
+
+    def test_metrics_carry_per_tool_statistics(self, hermes_repo, tmp_path, stubbed):
+        stubbed.setattr(dspy, "GEPA", stub_optimizer(tidy))
+        metrics = self.run(hermes_repo, tmp_path, write=True)
+        rows = {row["tool"]: row for row in metrics["per_tool"]}
+        assert set(rows) == {"read_file", "search_files", "terminal", NO_TOOL}
+        for row in rows.values():
+            assert set(row) >= {
+                "baseline_rate",
+                "candidate_rate",
+                "delta",
+                "delta_ci",
+                "p_worse",
+                "underpowered",
+                "min_detectable_shift",
+            }
+
+    def test_metrics_carry_the_chance_baseline_and_the_interval(
+        self, hermes_repo, tmp_path, stubbed
+    ):
+        stubbed.setattr(dspy, "GEPA", stub_optimizer(tidy))
+        metrics = self.run(hermes_repo, tmp_path, write=True)
+        assert metrics["num_options"] == 6  # five tools plus 'none'
+        assert metrics["chance_accuracy"] == pytest.approx(1 / 6)
+        assert metrics["baseline_accuracy_ci"]["low"] <= metrics["baseline_accuracy"]
+        assert metrics["candidate_accuracy_ci"]["high"] >= metrics["candidate_accuracy"]
+
+    def test_a_tolerance_the_val_split_cannot_detect_is_reported(
+        self, hermes_repo, tmp_path, stubbed
+    ):
+        stubbed.setattr(dspy, "GEPA", stub_optimizer(tidy))
+        metrics = self.run(hermes_repo, tmp_path, write=True, regression_tolerance=0.05)
+        assert metrics["regression_tolerance"] == 0.05
+        assert metrics["underpowered_tools"]
+        assert metrics["cross_tool_accepted"] is True
+
+    def test_a_zero_tolerance_reports_nobody_as_underpowered(
+        self, hermes_repo, tmp_path, stubbed
+    ):
+        stubbed.setattr(dspy, "GEPA", stub_optimizer(tidy))
+        metrics = self.run(hermes_repo, tmp_path, write=True)
+        assert metrics["underpowered_tools"] == []
+
+    def test_the_saved_report_carries_the_comparisons(self, hermes_repo, tmp_path, stubbed):
+        import json
+
+        stubbed.setattr(dspy, "GEPA", stub_optimizer(tidy))
+        self.run(hermes_repo, tmp_path, write=True)
+        run_dir = next((tmp_path / "out" / "tools").iterdir())
+        blob = json.loads((run_dir / "cross_tool_report.json").read_text())
+        assert blob["verdict"]["comparisons"]
+        assert blob["baseline"]["chance_accuracy"] == pytest.approx(1 / 6, abs=1e-4)
+        assert blob["baseline"]["rates"]["read_file"]["outcomes"]
+
+    def test_an_overclaiming_rewrite_is_reverted_and_never_written(
+        self, hermes_repo, tmp_path, stubbed
+    ):
+        stubbed.setattr(dspy, "GEPA", stub_optimizer(overclaiming))
+        before = (hermes_repo / "tools" / "file_tools.py").read_text()
+        metrics = self.run(hermes_repo, tmp_path, write=True)
+
+        assert metrics["factual_reverts"] == 1
+        assert metrics["descriptions_changed"] == 0
+        assert metrics["written"] is False
+        assert (hermes_repo / "tools" / "file_tools.py").read_text() == before
+
+    def test_the_entailment_tier_stays_offline(self, hermes_repo, tmp_path, stubbed):
+        stubbed.setattr(dspy, "GEPA", stub_optimizer(tidy))
+        metrics = self.run(hermes_repo, tmp_path, write=True)
+        assert metrics["entailment_ran"] is False

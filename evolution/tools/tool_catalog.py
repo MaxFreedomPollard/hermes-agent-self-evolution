@@ -261,6 +261,10 @@ class ToolEntry:
     required: tuple[str, ...] = ()
     max_tool_desc: int = DEFAULT_MAX_TOOL_DESC
     max_param_desc: int = DEFAULT_MAX_PARAM_DESC
+    # Allowed values per parameter, for parameters that constrain them. Frozen
+    # like the rest of the schema, and the only ground truth a factual-accuracy
+    # check has for "the description offers a mode the tool does not have".
+    param_enums: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     # Pass-throughs so callers do not reach into the descriptor for basics.
     @property
@@ -367,6 +371,7 @@ class ToolEntry:
             "param_sizes": self.param_sizes,
             "required": list(self.required),
             "param_types": dict(self.param_types),
+            "param_enums": {name: list(values) for name, values in self.param_enums.items()},
             "over_budget": [f.to_dict() for f in self.budget_findings()],
         }
 
@@ -509,6 +514,11 @@ def load_catalog(
             for name, shape in properties.items()
             if isinstance(shape, dict)
         }
+        param_enums = {
+            name: tuple(str(value) for value in shape["enum"])
+            for name, shape in properties.items()
+            if isinstance(shape, dict) and isinstance(shape.get("enum"), list)
+        }
         raw_required = skeleton.get("required")
         required = tuple(raw_required) if isinstance(raw_required, list) else ()
 
@@ -522,6 +532,7 @@ def load_catalog(
                 required=required,
                 max_tool_desc=max_tool,
                 max_param_desc=max_param,
+                param_enums=param_enums,
             )
         )
 

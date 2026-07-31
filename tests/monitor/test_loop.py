@@ -497,6 +497,59 @@ class TestCycle:
         assert blob["dispatches"][0]["target"] == "arxiv"
 
 
+class TestRankedTable:
+    """The table is what a human reads before approving a run, so the
+    uncertainty behind each rank has to be visible in it."""
+
+    def _series(self, target, values, samples=60):
+        return [
+            point(SKILL_SUCCESS_RATE, target, value, days_ago=30 - 5 * i, samples=samples)
+            for i, value in enumerate(values)
+        ]
+
+    def test_a_clean_decline_shows_its_p_value_and_r_squared(
+        self, store, hermes_repo, out
+    ):
+        store.extend(self._series("eroding", [0.91, 0.86, 0.78, 0.71, 0.62, 0.55]))
+        cycle(store, hermes_repo, out=out)
+        rendered = out.file.getvalue()
+        assert "R²" in rendered
+        assert "p=0.000" in rendered
+        assert "(ns)" not in rendered
+
+    def test_a_noisy_decline_is_marked_not_significant(self, store, hermes_repo, out):
+        store.extend(
+            self._series("noisy", [0.90, 0.35, 0.85, 0.30, 0.88, 0.33, 0.60])
+        )
+        cycle(store, hermes_repo, out=out)
+        rendered = out.file.getvalue()
+        assert "0.582" in rendered
+        assert "(ns)" in rendered
+
+    def test_an_explanation_is_printed_as_prose_not_markup(self, store, hermes_repo):
+        # Rich reads a lowercase bracketed phrase as a style tag and drops the
+        # whole bracket when the style is unknown, so both suffixes an
+        # explanation can carry have to be escaped. A console wide enough that
+        # nothing wraps, since a wrapped cell hides the phrase behind borders.
+        wide = Console(file=io.StringIO(), width=400)
+        store.extend([point(BENCHMARK_SCORE, "tblite", 0.4, samples=20)])
+        store.extend(self._series("noisy", [0.90, 0.35, 0.85, 0.30, 0.88, 0.33, 0.60]))
+        cycle(store, hermes_repo, out=wide)
+        rendered = wide.file.getvalue()
+        assert "advisory: no phase entry point for this target type" in rendered
+        assert "trend p=0.582, R²=0.06" in rendered
+
+    def test_a_target_with_no_fittable_trend_claims_nothing(
+        self, store, hermes_repo, out
+    ):
+        store.extend([point(SKILL_SUCCESS_RATE, "arxiv", 0.35, samples=40)])
+        cycle(store, hermes_repo, out=out)
+        rendered = out.file.getvalue()
+        assert "arxiv" in rendered
+        assert "p=" not in rendered
+        assert "(ns)" not in rendered
+
+
 class TestScheduledChecks:
     def test_a_scored_benchmark_lands_in_history(self, store, hermes_repo, out):
         benchmarks = FakeBenchmarks({"tblite": 0.62})

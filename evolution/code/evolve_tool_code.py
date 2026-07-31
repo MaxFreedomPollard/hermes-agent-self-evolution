@@ -14,7 +14,17 @@ The shape of the run reflects that.
     ask the evolver     Darwinian Evolver, as an external CLI subprocess
     guardrails first    safety.py, before anything expensive runs
     then fitness        pytest as a hard gate, then benchmark, bug, quality
+    rank honestly       the margin over the runner-up, and whether it means anything
     emit a branch       and a diff, and stop
+
+Every number this command prints carries what is behind it. A score appears
+with its evidence coverage, so a 0.85 from one heuristic never looks like a
+0.85 from tests plus a benchmark plus a reproduction. A reproduction verdict
+appears with its fix rate and interval, and ``--repro-runs`` is how a flaky
+repro gets caught instead of believed. A winner appears with its margin over
+the runner-up, and when that margin is inside what the score can resolve the
+report says the pick is arbitrary rather than dressing a coin flip as a
+result.
 
 Two hard constraints shape the code below.
 
@@ -59,9 +69,12 @@ from evolution.core.config import resolve_hermes_agent_path
 from evolution.core.gates import GateStatus
 from evolution.code.fitness_code import (
     BugReproduction,
+    CandidateRanking,
     CodeFitness,
     CodeFitnessEvaluator,
+    PerTestPytestRunner,
     ReproStatus,
+    rank_candidates,
 )
 from evolution.code.organism import (
     CodeOrganism,
@@ -563,6 +576,7 @@ def evolve_tool_code(
     allow_dirty: bool = False,
     output_root: Optional[Path] = None,
     evolver: Optional[ProposesCandidates] = None,
+    repro_runs: int = 1,
 ) -> int:
     """Run one code-evolution pass. Returns a process exit code.
 
@@ -570,6 +584,11 @@ def evolve_tool_code(
     drive a different mutation source, or a fake one in tests. Left as None,
     the Darwinian Evolver CLI is discovered and used, and its absence stops
     the run.
+
+    *repro_runs* is how many times the reproduction script runs per candidate.
+    One is a single Bernoulli trial and is enough for a deterministic repro;
+    raise it for anything that touches time, the filesystem or a subprocess,
+    where one clean pass and a fix are not the same thing.
     """
     console.print(
         "\n[bold cyan]🧬 Hermes Agent Self-Evolution[/bold cyan] - "
@@ -617,7 +636,12 @@ def evolve_tool_code(
             repro_source = repro.script.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             repro_source = None
-        console.print(f"  Repro:  {repro.script}")
+        console.print(f"  Repro:  {repro.script} ({repro_runs} run(s) per candidate)")
+        if repro_runs == 1:
+            console.print(
+                "[dim]          one run is one Bernoulli trial - use --repro-runs "
+                "to measure a fix rate instead[/dim]"
+            )
     else:
         console.print(
             "  Repro:  [yellow]none supplied - fitness cannot prove any bug was "
@@ -647,7 +671,7 @@ def evolve_tool_code(
         console.print(
             "  Would gate each candidate on: safety guardrails, pytest, "
             + (", ".join(benchmarks) if benchmarks else "no benchmarks")
-            + (", bug reproduction" if repro else "")
+            + (f", bug reproduction x{repro_runs}" if repro else "")
         )
         console.print("  Would emit a branch and a diff. Never a merge.")
         return 0
@@ -685,6 +709,11 @@ def evolve_tool_code(
             python=python,
             pytest_subset=pytest_subset,
             strict=strict_gates,
+            repro_runs=repro_runs,
+            # The per-test runner gates identically to the shared one - exit
+            # status decides - and additionally keeps each test's outcome, so
+            # the candidate suite can be paired against the baseline suite.
+            pytest_runner=PerTestPytestRunner(),
         )
 
         # ── 4. Baseline snapshot ────────────────────────────────────────
@@ -694,11 +723,18 @@ def evolve_tool_code(
             f"  {_gate_icon(baseline.pytest_result.status)} pytest: "
             f"{baseline.pytest_result.message}"
         )
+        if baseline.test_outcomes:
+            console.print(
+                f"  [green]✓[/green] per-test outcomes: "
+                f"{len(baseline.test_outcomes)} test(s) recorded for pairing"
+            )
         for bench in baseline.benchmark_results:
             console.print(f"  {_gate_icon(bench.status)} {bench.name}: {bench.message}")
         if baseline.repro:
             icon = "[green]✓[/green]" if baseline.bug_reproduces else "[yellow]![/yellow]"
             console.print(f"  {icon} repro: {baseline.repro.message}")
+            if baseline.repro_trials and baseline.repro_trials.n > 1:
+                console.print(f"    [dim]{baseline.repro_trials.describe()}[/dim]")
 
         if baseline.pytest_result.status is GateStatus.FAILED:
             console.print(
@@ -790,10 +826,20 @@ def evolve_tool_code(
                     f"    {_gate_icon(fitness.pytest_result.status)} pytest: "
                     f"{fitness.pytest_result.message}"
                 )
+            shown = ""
+            if fitness.suite:
+                shown = f"suite vs baseline: {fitness.suite.describe()}"
+                console.print(f"    suite: {fitness.suite.describe()}")
             if fitness.repro:
                 console.print(f"    repro: {fitness.repro.message}")
+            # Everything else the evaluator wanted on the record, including the
+            # power notes. A caveat kept out of the console is a caveat nobody
+            # reads.
+            for note in fitness.notes:
+                if note != shown:
+                    console.print(f"    [dim]{note}[/dim]")
             if fitness.accepted:
-                console.print(f"    [green]accepted[/green] score {fitness.total:.3f}")
+                console.print(f"    [green]accepted[/green] score {fitness.score_line()}")
             else:
                 console.print(f"    [red]rejected[/red] {fitness.rejection_reason}")
 
@@ -804,6 +850,12 @@ def evolve_tool_code(
 
         # ── 7. Pick a winner and re-apply it ────────────────────────────
         accepted = [o for o in outcomes if o.fitness.accepted]
+        # Same winner max() picks: rank_candidates sorts stably, so an exact
+        # tie keeps the order the candidates arrived in. What it adds is the
+        # margin and whether that margin is worth anything.
+        ranking: Optional[CandidateRanking] = rank_candidates(
+            [o.fitness for o in accepted]
+        )
         if accepted:
             winner = max(accepted, key=lambda o: o.fitness.total)
             final = organism.reapply(
@@ -826,6 +878,9 @@ def evolve_tool_code(
         table.add_column("Bug")
         table.add_column("Quality", justify="right")
         table.add_column("Score", justify="right")
+        # The score alone is not a result. This column is what was actually
+        # measured to produce it, and it sits beside the score on purpose.
+        table.add_column("Evidence", justify="right")
         table.add_column("Verdict")
 
         for outcome in outcomes:
@@ -842,6 +897,10 @@ def evolve_tool_code(
                     if fitness.repro.fixed
                     else f"[red]{fitness.repro.status.value}[/red]"
                 )
+            trials = fitness.repro_trials
+            if trials is not None and trials.n > 1 and trials.measured_runs:
+                colour = "green" if trials.fixed else "red"
+                bug_cell = f"[{colour}]{trials.fixes}/{trials.measured_runs}[/{colour}]"
             table.add_row(
                 outcome.candidate.label,
                 safety_cell,
@@ -849,11 +908,21 @@ def evolve_tool_code(
                 bug_cell,
                 f"{fitness.quality.score:.2f}",
                 f"{fitness.total:.3f}",
+                f"{fitness.evidence_coverage:.0%}" if fitness.accepted else "-",
                 "[green]accepted[/green]" if fitness.accepted else "[red]rejected[/red]",
             )
 
         console.print()
         console.print(table)
+
+        if ranking is not None:
+            icon = "[green]✓[/green]" if ranking.separated else "[yellow]![/yellow]"
+            console.print(f"\n  {icon} {ranking.describe()}")
+            if ranking.winner_coverage < 1.0:
+                console.print(
+                    f"    [dim]the winning score was measured on "
+                    f"{ranking.winner_coverage:.0%} of the intended weight[/dim]"
+                )
 
         # ── 9. Emit the branch and the diff ─────────────────────────────
         (out_dir / "baseline.py").write_text(baseline_source, encoding="utf-8")
@@ -870,6 +939,7 @@ def evolve_tool_code(
             "baseline_sha": organism.baseline_sha,
             "bug_issue": bug_issue,
             "repro_script": str(repro.script) if repro else None,
+            "repro_runs": repro_runs,
             "iterations": iterations,
             "strict_gates": strict_gates,
             "benchmarks": list(benchmarks),
@@ -877,6 +947,7 @@ def evolve_tool_code(
             "elapsed_seconds": round(elapsed, 2),
             "baseline": baseline.to_dict(),
             "candidates": [o.to_dict() for o in outcomes],
+            "ranking": ranking.to_dict() if ranking else None,
             "winner": winner.candidate.label if winner else None,
             "winner_sha": final.sha if final else None,
         }
@@ -885,12 +956,24 @@ def evolve_tool_code(
         if winner and winner_diff.strip():
             (out_dir / "winner.py").write_text(winner.candidate.source, encoding="utf-8")
             (out_dir / "winner.diff").write_text(winner_diff, encoding="utf-8")
+            extra_lines = ""
+            if ranking is not None and ranking.margin is not None:
+                extra_lines += f"Margin:  {ranking.margin:+.3f} over {ranking.runner_up}"
+                if ranking.within_noise:
+                    extra_lines += " - within noise, this pick is arbitrary"
+                extra_lines += "\n"
+            trials = winner.fitness.repro_trials
+            if trials is not None and trials.measured_runs:
+                extra_lines += f"Repro:   {trials.describe()}\n"
+            if winner.fitness.suite is not None:
+                extra_lines += f"Suite:   {winner.fitness.suite.describe()}\n"
             console.print(
                 Panel(
                     f"Branch:  [bold]{organism.branch}[/bold]\n"
                     f"Commit:  {final.short_sha if final else '-'}\n"
                     f"Diff:    {out_dir / 'winner.diff'}\n"
-                    f"Score:   {winner.fitness.total:.3f}\n\n"
+                    f"Score:   {winner.fitness.score_line()}\n"
+                    f"{extra_lines}\n"
                     "Nothing was merged. PLAN.md requires human review of every "
                     "line of evolved code:\n"
                     f"  git diff {organism.baseline_sha[:8] if organism.baseline_sha else 'HEAD'} "
@@ -941,6 +1024,9 @@ def evolve_tool_code(
 @click.option("--tool", required=True, help="Tool module to evolve (e.g. file_tools)")
 @click.option("--bug-issue", default=None, help="GitHub issue number this run targets")
 @click.option("--repro-script", default=None, help="Script that reproduces the bug")
+@click.option("--repro-runs", default=1, type=click.IntRange(min=1),
+              help="Times to run the reproduction per candidate (1 is one Bernoulli "
+                   "trial; more measures a fix rate with an interval)")
 @click.option("--iterations", default=10, help="Iterations to request from the evolver")
 @click.option("--hermes-repo", default=None, help="Path to hermes-agent repo")
 @click.option("--evolver-cmd", default=None, help="Path to the Darwinian Evolver CLI")
@@ -959,6 +1045,7 @@ def main(
     tool,
     bug_issue,
     repro_script,
+    repro_runs,
     iterations,
     hermes_repo,
     evolver_cmd,
@@ -983,6 +1070,7 @@ def main(
         python=python_bin,
         pytest_subset=tuple(pytest_subset) or None,
         allow_dirty=allow_dirty,
+        repro_runs=repro_runs,
     )
     sys.exit(code)
 

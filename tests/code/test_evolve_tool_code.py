@@ -83,6 +83,23 @@ print("BUG_PRESENT")
 sys.exit(1)
 '''
 
+# The same reproduction, made intermittent: it clears on every other run
+# whatever the code says. A patch cannot fix this, and one lucky run cannot
+# tell the difference.
+FLAKY_REPRO = '''import pathlib
+import sys
+
+counter = pathlib.Path(__file__).with_suffix(".count")
+count = (int(counter.read_text() or 0) if counter.exists() else 0) + 1
+counter.write_text(str(count))
+
+if count % 2:
+    print("BUG_PRESENT")
+    sys.exit(1)
+print("BUG_FIXED")
+sys.exit(0)
+'''
+
 
 def git(repo, *args):
     return subprocess.run(
@@ -117,6 +134,13 @@ def repo(tmp_path):
 def repro(tmp_path):
     path = tmp_path / "repro_issue_742.py"
     path.write_text(REPRO)
+    return path
+
+
+@pytest.fixture
+def flaky_repro(tmp_path):
+    path = tmp_path / "repro_flaky.py"
+    path.write_text(FLAKY_REPRO)
     return path
 
 
@@ -762,6 +786,134 @@ class TestEvolveToolCode:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Uncertainty in the run record
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@needs_git
+class TestMeasuredEvidence:
+    def run_once(self, repo, tmp_path, *sources, **kwargs):
+        out_root = tmp_path / "out"
+        code = evolve_tool_code(
+            tool="file_tools",
+            hermes_repo=str(repo),
+            python=sys.executable,
+            evolver=FakeEvolver(*sources),
+            output_root=out_root,
+            **kwargs,
+        )
+        metrics = json.loads(next(out_root.rglob("metrics.json")).read_text())
+        return code, metrics
+
+    def test_the_reproduction_runs_as_often_as_asked(self, repo, repro, tmp_path):
+        _, metrics = self.run_once(
+            repo, tmp_path, FIXED, repro_script=str(repro), repro_runs=3
+        )
+        trials = metrics["candidates"][0]["fitness"]["repro_trials"]
+
+        assert metrics["repro_runs"] == 3
+        assert trials["runs"] == 3
+        assert trials["fixes"] == 3
+        assert trials["fix_rate_ci"]["low"] < 1.0
+        assert metrics["baseline"]["repro_trials"]["runs"] == 3
+
+    def test_a_flaky_reproduction_is_not_accepted_as_a_fix(
+        self, repo, flaky_repro, tmp_path
+    ):
+        code, metrics = self.run_once(
+            repo, tmp_path, FIXED, repro_script=str(flaky_repro), repro_runs=4
+        )
+        fitness = metrics["candidates"][0]["fitness"]
+
+        assert code == 0
+        assert metrics["winner"] is None
+        assert fitness["accepted"] is False
+        assert "bug not fixed" in fitness["rejection_reason"]
+        assert fitness["repro_trials"]["flaky"] is True
+        assert fitness["repro_trials"]["fixes"] == 2
+
+    def test_a_single_run_would_have_believed_the_same_flake(
+        self, repo, flaky_repro, tmp_path
+    ):
+        # The point of --repro-runs: one run of this script clears the bug and
+        # the candidate ships. Four runs of it do not.
+        code, metrics = self.run_once(
+            repo, tmp_path, FIXED, repro_script=str(flaky_repro), repro_runs=1
+        )
+        assert code == 0
+        assert metrics["candidates"][0]["fitness"]["repro_trials"]["runs"] == 1
+        assert metrics["winner"] == "c01"
+
+    def test_the_test_suite_is_compared_test_by_test(self, repo, repro, tmp_path):
+        _, metrics = self.run_once(
+            repo, tmp_path, FIXED, repro_script=str(repro)
+        )
+        suite = metrics["candidates"][0]["fitness"]["suite"]
+
+        assert metrics["baseline"]["tests_measured"] == 1
+        assert suite is not None
+        assert suite["verdict"] == "identical outcomes"
+        assert suite["paired"]["n"] == 1
+        assert suite["newly_failing"] == []
+
+    def test_every_score_arrives_with_its_evidence_coverage(
+        self, repo, repro, tmp_path
+    ):
+        _, metrics = self.run_once(repo, tmp_path, FIXED, repro_script=str(repro))
+        fitness = metrics["candidates"][0]["fitness"]
+
+        # A reproduction and the quality heuristics ran; no benchmark did.
+        assert fitness["evidence_coverage"] == 0.7
+        assert fitness["missing_evidence"] == ["benchmark"]
+
+    def test_a_score_with_no_reproduction_says_how_little_it_measured(
+        self, repo, tmp_path
+    ):
+        _, metrics = self.run_once(repo, tmp_path, FIXED)
+        fitness = metrics["candidates"][0]["fitness"]
+
+        assert fitness["total"] == 1.0
+        assert fitness["evidence_coverage"] == 0.2
+        assert fitness["missing_evidence"] == ["bug_fix", "benchmark"]
+
+    def test_two_candidates_within_noise_are_reported_as_arbitrary(
+        self, repo, repro, tmp_path
+    ):
+        other_fix = FIXED.replace(
+            '    """Return up to *limit* lines from *path*."""',
+            '    """Return up to *limit* lines from *path*."""\n    # second variant',
+        )
+        _, metrics = self.run_once(
+            repo, tmp_path, FIXED, other_fix, repro_script=str(repro)
+        )
+        ranking = metrics["ranking"]
+
+        assert ranking["winner"] == metrics["winner"]
+        assert ranking["margin"] == 0.0
+        assert ranking["within_noise"] is True
+        assert ranking["tied"] == ["c01", "c02"]
+        assert "arbitrary" in ranking["summary"]
+
+    def test_a_sole_survivor_is_ranked_against_nothing(self, repo, repro, tmp_path):
+        _, metrics = self.run_once(
+            repo, tmp_path, FIXED, UNSAFE, repro_script=str(repro)
+        )
+        ranking = metrics["ranking"]
+
+        assert ranking["winner"] == "c01"
+        assert ranking["runner_up"] is None
+        assert ranking["margin"] is None
+        assert ranking["considered"] == 1
+
+    def test_no_survivor_leaves_no_ranking(self, repo, repro, tmp_path):
+        _, metrics = self.run_once(
+            repo, tmp_path, UNSAFE, repro_script=str(repro)
+        )
+        assert metrics["ranking"] is None
+        assert metrics["winner"] is None
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # CLI surface
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -807,3 +959,37 @@ class TestCli:
         result = CliRunner().invoke(main, [])
         assert result.exit_code != 0
         assert "--tool" in result.output
+
+    def test_repro_runs_reaches_the_plan(self, repo, repro, tmp_path):
+        stub = tmp_path / "stub-evolver"
+        stub.write_text("#!/bin/sh\n")
+        result = CliRunner().invoke(
+            main,
+            [
+                "--tool", "file_tools",
+                "--hermes-repo", str(repo),
+                "--repro-script", str(repro),
+                "--evolver-cmd", str(stub),
+                "--repro-runs", "5",
+                "--dry-run",
+            ],
+        )
+        # Rich wraps console output to the terminal width, so compare on the
+        # text rather than on where the line breaks landed.
+        assert result.exit_code == 0
+        assert "bug reproduction x5" in " ".join(result.output.split())
+
+    def test_a_run_count_below_one_is_refused(self, repo, tmp_path):
+        stub = tmp_path / "stub-evolver"
+        stub.write_text("#!/bin/sh\n")
+        result = CliRunner().invoke(
+            main,
+            [
+                "--tool", "file_tools",
+                "--hermes-repo", str(repo),
+                "--evolver-cmd", str(stub),
+                "--repro-runs", "0",
+                "--dry-run",
+            ],
+        )
+        assert result.exit_code != 0

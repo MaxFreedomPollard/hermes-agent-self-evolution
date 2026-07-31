@@ -6,6 +6,8 @@ approximate ordering, because the ranking is what decides where money gets
 spent on an optimizer run.
 """
 
+import math
+
 import pytest
 
 from evolution.monitor.metrics import (
@@ -62,7 +64,11 @@ class TestRankingOrder:
         )
         assert [e.target for e in entries] == ["busy", "quiet"]
         assert entries[0].score == pytest.approx(0.5)
-        assert entries[1].score == pytest.approx(0.05)
+        # Ten times the traffic is not ten times the priority. Linear
+        # normalization put the quiet target at 0.05, an order of magnitude
+        # down, for two targets that are equally broken.
+        assert entries[1].score == pytest.approx(0.5 * math.log1p(10) / math.log1p(100))
+        assert entries[1].score > 0.2
 
     def test_potential_improvement_breaks_a_tie_on_usage(self):
         entries = rank_points(
@@ -84,8 +90,13 @@ class TestRankingOrder:
         )
         ranked = by_target(entries)
         assert ranked["alpha"].potential_improvement == pytest.approx(0.4)
-        assert ranked["alpha"].usage_weight == pytest.approx(0.5)
-        assert ranked["alpha"].score == pytest.approx(0.4 * 0.5)
+        assert ranked["alpha"].usage_weight == pytest.approx(
+            math.log1p(50) / math.log1p(100)
+        )
+        assert ranked["alpha"].score == pytest.approx(
+            0.4 * ranked["alpha"].usage_weight
+        )
+        assert ranked["beta"].usage_weight == pytest.approx(1.0)
 
     def test_a_busy_healthy_target_loses_to_a_quiet_broken_one_only_if_the_gap_is_big(self):
         entries = rank_points(
@@ -97,7 +108,9 @@ class TestRankingOrder:
         )
         ranked = by_target(entries)
         assert ranked["busy_ok"].score == pytest.approx(0.05)
-        assert ranked["quiet_bad"].score == pytest.approx(0.09)
+        assert ranked["quiet_bad"].score == pytest.approx(
+            0.9 * math.log1p(100) / math.log1p(1000)
+        )
         assert entries[0].target == "quiet_bad"
 
     def test_ordering_is_deterministic_for_identical_scores(self):
@@ -203,6 +216,216 @@ class TestTrendPressure:
         assert not entry.trend.significant
 
 
+class TestUsageWeighting:
+    """Volume should count without deciding the answer on its own."""
+
+    def _falling(self, target, values, samples):
+        return [
+            point(SKILL_SUCCESS_RATE, target, value, days_ago=21 - 7 * i, samples=samples)
+            for i, value in enumerate(values)
+        ]
+
+    def _live_example(self):
+        """The ranking that exposed the defect.
+
+        ``collapsing`` lost 36 points of success rate, ``slipping`` lost 8, and
+        ``chatty`` is healthy but soaks up most of the traffic in the window.
+        Under linear normalization chatty's volume squashed both weights and
+        the milder decline came out on top.
+        """
+        return (
+            self._falling("collapsing", [0.91, 0.73, 0.55], samples=100)
+            + self._falling("slipping", [0.82, 0.78, 0.74], samples=200)
+            + [point(SKILL_SUCCESS_RATE, "chatty", 0.99, samples=10_000)]
+        )
+
+    def test_the_steeper_collapse_outranks_the_milder_decline(self):
+        entries = rank_points(self._live_example(), now=T0)
+        ranked = by_target(entries)
+        assert ranked["collapsing"].score > ranked["slipping"].score
+        assert entries[0].target == "collapsing"
+
+    def test_linear_normalization_is_what_got_this_backwards(self):
+        # Same points, compression switched off: the old arithmetic exactly.
+        entries = rank_points(
+            self._live_example(), TriageConfig(usage_compression=0.0), now=T0
+        )
+        ranked = by_target(entries)
+        assert ranked["slipping"].score > ranked["collapsing"].score
+        assert ranked["collapsing"].usage_weight == pytest.approx(300 / 10_000)
+
+    def test_volume_still_orders_equally_broken_targets(self):
+        entries = rank_points(
+            [
+                point(SKILL_SUCCESS_RATE, "busy", 0.5, samples=500),
+                point(SKILL_SUCCESS_RATE, "medium", 0.5, samples=50),
+                point(SKILL_SUCCESS_RATE, "quiet", 0.5, samples=5),
+            ],
+            now=T0,
+        )
+        assert [e.target for e in entries] == ["busy", "medium", "quiet"]
+
+    def test_the_busiest_target_still_weighs_one(self):
+        entries = rank_points(
+            [
+                point(SKILL_SUCCESS_RATE, "busy", 0.5, samples=900),
+                point(SKILL_SUCCESS_RATE, "quiet", 0.5, samples=9),
+            ],
+            now=T0,
+        )
+        assert by_target(entries)["busy"].usage_weight == pytest.approx(1.0)
+
+    def test_a_quiet_target_is_not_crushed_by_one_hot_neighbour(self):
+        entries = rank_points(
+            [
+                point(SKILL_SUCCESS_RATE, "hot", 0.9, samples=100_000),
+                point(SKILL_SUCCESS_RATE, "quiet", 0.9, samples=100),
+            ],
+            now=T0,
+        )
+        quiet = by_target(entries)["quiet"]
+        # Linear normalization left this at 0.001, three orders of magnitude
+        # down, which is how a real problem disappears off the bottom.
+        assert quiet.usage_weight == pytest.approx(
+            math.log1p(100) / math.log1p(100_000)
+        )
+        assert quiet.usage_weight > 0.3
+
+    def test_compression_is_configurable(self):
+        points = [
+            point(SKILL_SUCCESS_RATE, "busy", 0.5, samples=1000),
+            point(SKILL_SUCCESS_RATE, "quiet", 0.5, samples=10),
+        ]
+        weights = []
+        for compression in (0.0, 0.01, 1.0, 100.0):
+            entries = rank_points(
+                points, TriageConfig(usage_compression=compression), now=T0
+            )
+            weights.append(by_target(entries)["quiet"].usage_weight)
+        # Flatter curves lift the quiet target, and 0 is exactly linear.
+        assert weights[0] == pytest.approx(0.01)
+        assert weights == sorted(weights)
+        assert weights[-1] < 1.0
+
+    def test_correction_only_targets_use_the_same_curve(self):
+        entries = rank_points(
+            [point(SKILL_SUCCESS_RATE, "arxiv", 0.9, samples=1000)]
+            + corrections("web_search", 8),
+            now=T0,
+        )
+        entry = by_target(entries)["web_search"]
+        assert entry.usage_weight == pytest.approx(math.log1p(8) / math.log1p(1000))
+
+
+class TestFailureRateLabelling:
+    def test_headroom_and_failure_rate_agree_at_a_ceiling_of_one(self):
+        entry = rank_points(
+            [point(SKILL_SUCCESS_RATE, "arxiv", 0.62, samples=50)], now=T0
+        )[0]
+        assert entry.headroom == pytest.approx(0.38)
+        assert entry.failure_rate == pytest.approx(0.38)
+
+    def test_a_lower_ceiling_separates_the_two_numbers(self):
+        config = TriageConfig(ceiling=0.8, failure_threshold=0.3, min_samples=5)
+        entry = rank_points(
+            [point(SKILL_SUCCESS_RATE, "arxiv", 0.45, samples=50)], config, now=T0
+        )[0]
+        assert entry.headroom == pytest.approx(0.35)
+        assert entry.potential_improvement == pytest.approx(0.35)
+        # 45% success is a 55% failure rate. The old message called the 35%
+        # headroom a "failure rate" and understated it by twenty points.
+        assert entry.failure_rate == pytest.approx(0.55)
+
+    def test_the_trigger_message_describes_the_quantity_it_tested(self):
+        config = TriageConfig(ceiling=0.8, failure_threshold=0.3, min_samples=5)
+        entry = rank_points(
+            [point(SKILL_SUCCESS_RATE, "arxiv", 0.45, samples=50)], config, now=T0
+        )[0]
+        assert entry.triggered
+        # The condition is headroom >= threshold, so headroom is what the
+        # sentence leads with, and the real failure rate is named separately.
+        assert "headroom 35%" in entry.trigger_reason
+        assert "at or above threshold 30%" in entry.trigger_reason
+        assert "failure rate 55%" in entry.trigger_reason
+
+    def test_both_numbers_serialise(self):
+        config = TriageConfig(ceiling=0.8)
+        blob = rank_points(
+            [point(SKILL_SUCCESS_RATE, "arxiv", 0.45, samples=50)], config, now=T0
+        )[0].to_dict()
+        assert blob["headroom"] == pytest.approx(0.35)
+        assert blob["failure_rate"] == pytest.approx(0.55)
+        assert blob["potential_improvement"] == pytest.approx(0.35)
+
+    def test_a_correction_only_entry_has_no_failure_rate(self):
+        entry = rank_points(corrections("web_search", 6), now=T0)[0]
+        assert entry.current_value is None
+        assert entry.failure_rate is None
+        assert entry.headroom is None
+
+
+class TestRankingConfidence:
+    def _series(self, target, values, samples=60):
+        return [
+            point(SKILL_SUCCESS_RATE, target, value, days_ago=35 - 5 * i, samples=samples)
+            for i, value in enumerate(values)
+        ]
+
+    OSCILLATION = [0.90, 0.35, 0.85, 0.30, 0.88, 0.33, 0.60]
+    STEADY_EROSION = [0.91, 0.86, 0.78, 0.71, 0.62, 0.55]
+
+    def test_a_noisy_trend_is_visibly_uncertain(self):
+        config = TriageConfig(window_days=40)
+        entry = rank_points(self._series("noisy", self.OSCILLATION), config, now=T0)[0]
+        assert entry.trend_p_value == pytest.approx(0.582, abs=0.01)
+        assert entry.trend_r_squared == pytest.approx(0.06, abs=0.01)
+        assert not entry.trend.significant
+        assert "p=0.582" in entry.explain()
+
+    def test_a_clean_decline_is_visibly_certain(self):
+        config = TriageConfig(window_days=40)
+        entry = rank_points(self._series("eroding", self.STEADY_EROSION), config, now=T0)[0]
+        assert entry.trend_p_value < 0.05
+        assert entry.trend_r_squared > 0.95
+        assert "R²=" in entry.explain()
+
+    def test_the_noisy_target_does_not_get_the_decline_multiplier(self):
+        config = TriageConfig(window_days=40)
+        noisy = rank_points(self._series("noisy", self.OSCILLATION), config, now=T0)[0]
+        clean = rank_points(self._series("eroding", self.STEADY_EROSION), config, now=T0)[0]
+        assert "declining trend" not in [f.name for f in noisy.factors]
+        assert "declining trend" in [f.name for f in clean.factors]
+        # The noisy target still fires, but on its 40% headroom, which is
+        # measured. It must not fire on a trend that is not there.
+        assert "significant decline" not in noisy.trigger_reason
+        assert "at or above threshold" in noisy.trigger_reason
+        assert "significant decline" in clean.trigger_reason
+
+    def test_confidence_travels_in_the_serialised_entry(self):
+        config = TriageConfig(window_days=40)
+        blob = rank_points(self._series("noisy", self.OSCILLATION), config, now=T0)[
+            0
+        ].to_dict()
+        assert blob["trend_p_value"] == pytest.approx(0.582, abs=0.01)
+        assert blob["trend_r_squared"] == pytest.approx(0.06, abs=0.01)
+        assert blob["trend"]["statistically_significant"] is False
+
+    def test_a_single_reading_claims_no_confidence(self):
+        entry = rank_points(
+            [point(SKILL_SUCCESS_RATE, "arxiv", 0.5, samples=20)], now=T0
+        )[0]
+        assert entry.trend_p_value is None
+        assert entry.trend_r_squared is None
+        assert entry.confidence_note() == ""
+        assert "p=" not in entry.explain()
+
+    def test_a_correction_only_entry_claims_no_confidence(self):
+        entry = rank_points(corrections("web_search", 6), now=T0)[0]
+        assert entry.trend is None
+        assert entry.trend_p_value is None
+        assert entry.confidence_note() == ""
+
+
 class TestCorrections:
     def test_corrections_boost_a_measured_target(self):
         base = [point(TOOL_SELECTION_ACCURACY, "search_files", 0.8, samples=100)]
@@ -233,7 +456,7 @@ class TestCorrections:
         assert entry.metric == USER_CORRECTION
         assert entry.current_value is None
         assert entry.corrections == 6
-        assert entry.score == pytest.approx(0.6 * 0.06)
+        assert entry.score == pytest.approx(0.6 * math.log1p(6) / math.log1p(100))
 
     def test_enough_corrections_alone_fire_a_trigger(self):
         entry = rank_points(corrections("web_search", 5), now=T0)[0]
@@ -315,16 +538,22 @@ class TestFilteringAndScope:
         assert [e.target for e in entries] == ["busy"]
 
     def test_a_triggered_candidate_survives_the_score_floor(self):
+        config = TriageConfig(min_score=0.2)
         entries = rank_points(
             [
                 point(SKILL_SUCCESS_RATE, "busy", 0.99, samples=100_000),
                 point(SKILL_SUCCESS_RATE, "rare_but_broken", 0.05, samples=5),
             ],
+            config,
             now=T0,
         )
-        rare = by_target(entries)["rare_but_broken"]
-        assert rare.score < TriageConfig().min_score
+        ranked = by_target(entries)
+        rare = ranked["rare_but_broken"]
+        assert rare.score < config.min_score
         assert rare.triggered
+        # The healthy target scores below the floor too, and nothing triggered
+        # it, so it is the one that gets dropped.
+        assert "busy" not in ranked
 
     def test_limit_truncates_the_ranking(self, tmp_path):
         store = MetricStore(tmp_path / "m.jsonl", clock=lambda: T0)

@@ -42,10 +42,16 @@ from rich.table import Table
 from evolution.core.config import EvolutionConfig, resolve_hermes_agent_path
 from evolution.core.constraints import ConstraintValidator
 from evolution.core.gates import GateChain, run_benchmark_gate, run_pytest_gate
+from evolution.tools.accuracy import (
+    DescriptionEntailment,
+    FactualAccuracyChecker,
+    facts_from_catalog,
+)
 from evolution.tools.cross_tool import (
     DEFAULT_TOLERANCE,
     CrossToolGuard,
     CrossToolReport,
+    CrossToolVerdict,
 )
 from evolution.tools.selection_eval import (
     NO_TOOL,
@@ -73,6 +79,7 @@ console = Console()
 
 __all__ = [
     "ConstraintOutcome",
+    "build_accuracy_checker",
     "enforce_constraints",
     "freeze_unselected",
     "evolve_tool_descriptions",
@@ -132,18 +139,48 @@ class ConstraintOutcome:
         }
 
 
+def build_accuracy_checker(
+    catalog: ToolCatalog,
+    lm: object = None,
+    entailment: object = None,
+) -> FactualAccuracyChecker:
+    """A factual-accuracy checker for this catalogue.
+
+    The entailment predictor is built by default but only ever called when an
+    LM is configured, so this is safe to construct in an offline run. Pass
+    ``entailment`` to inject a stub, or ``entailment=False`` to run the
+    deterministic checks alone.
+    """
+    if entailment is False:
+        predictor = None
+    elif entailment is not None:
+        predictor = entailment
+    else:
+        predictor = dspy.ChainOfThought(DescriptionEntailment)
+    return FactualAccuracyChecker(
+        facts=facts_from_catalog(catalog), entailment=predictor, lm=lm
+    )
+
+
 def enforce_constraints(
     candidate: dict[str, ToolDescriptions],
     baseline: dict[str, ToolDescriptions],
     validator: ConstraintValidator,
     allowed: Optional[Sequence[str]] = None,
+    accuracy: Optional[FactualAccuracyChecker] = None,
 ) -> tuple[dict[str, ToolDescriptions], list[ConstraintOutcome]]:
-    """Revert any evolved description that busts its budget.
+    """Revert any evolved description that busts its budget or its schema.
 
     Checked against the 500 / 200 char budgets and the growth limit from
-    EvolutionConfig. A failure reverts that single description to baseline
-    rather than throwing away the whole candidate, so one greedy rewrite does
-    not cost the run every other improvement it found.
+    EvolutionConfig, and - when *accuracy* is supplied - against PLAN.md's
+    remaining Phase 2 constraint, that a description "must remain factually
+    accurate (can't claim a tool does something it doesn't)". A factual finding
+    reverts the description exactly like a budget failure does: an inaccurate
+    description is not a smaller problem than a long one, it is a larger one.
+
+    A failure reverts that single description to baseline rather than throwing
+    away the whole candidate, so one greedy rewrite does not cost the run every
+    other improvement it found.
 
     Unchanged text is not re-validated. hermes-agent's ``read_file``
     description is already 539 chars and its ``write_file.cross_profile``
@@ -167,15 +204,23 @@ def enforce_constraints(
                 kept.description, "tool_description", baseline_text=base.description
             )
             failures = [c for c in checks if not c.passed]
-            if failures:
+            messages = [f"{c.constraint_name}: {c.message}" for c in checks]
+            findings = (
+                accuracy.check_tool(tool_name, kept.description, base.description)
+                if accuracy
+                else []
+            )
+            messages.extend(f"factual_accuracy: {f.describe()}" for f in findings)
+            rejected = bool(failures or findings)
+            if rejected:
                 kept.description = base.description
             outcomes.append(
                 ConstraintOutcome(
                     target=tool_name,
                     kind="tool_description",
-                    passed=not failures,
-                    reverted=bool(failures),
-                    messages=[f"{c.constraint_name}: {c.message}" for c in checks],
+                    passed=not rejected,
+                    reverted=rejected,
+                    messages=messages,
                 )
             )
 
@@ -188,15 +233,23 @@ def enforce_constraints(
                 new_text, "param_description", baseline_text=base_text
             )
             failures = [c for c in checks if not c.passed]
-            if failures:
+            messages = [f"{c.constraint_name}: {c.message}" for c in checks]
+            findings = (
+                accuracy.check_param(tool_name, param, new_text, base_text)
+                if accuracy
+                else []
+            )
+            messages.extend(f"factual_accuracy: {f.describe()}" for f in findings)
+            rejected = bool(failures or findings)
+            if rejected:
                 kept.params[param] = base_text
             outcomes.append(
                 ConstraintOutcome(
                     target=f"{tool_name}.{param}",
                     kind="param_description",
-                    passed=not failures,
-                    reverted=bool(failures),
-                    messages=[f"{c.constraint_name}: {c.message}" for c in checks],
+                    passed=not rejected,
+                    reverted=rejected,
+                    messages=messages,
                 )
             )
 
@@ -241,13 +294,26 @@ def _catalogue_table(catalog: ToolCatalog, selected: ToolCatalog) -> Table:
     return table
 
 
-def _rates_table(baseline: CrossToolReport, candidate: CrossToolReport) -> Table:
+def _rates_table(
+    baseline: CrossToolReport,
+    candidate: CrossToolReport,
+    verdict: Optional[CrossToolVerdict] = None,
+) -> Table:
+    """Per-tool rates with the uncertainty that makes them readable.
+
+    A rate change with no interval, no p-value and no power marker invites the
+    reader to treat a one-example flip and a forty-example collapse as the same
+    finding. The last three columns are what stop that.
+    """
     table = Table(title="Per-tool selection rate")
     table.add_column("Tool", style="bold")
     table.add_column("Examples", justify="right")
     table.add_column("Baseline", justify="right")
     table.add_column("Evolved", justify="right")
     table.add_column("Change", justify="right")
+    table.add_column("95% CI on change", justify="right")
+    table.add_column("p(worse)", justify="right")
+    table.add_column("Power", justify="left")
 
     for tool in sorted(set(baseline.rates) | set(candidate.rates)):
         opportunities = baseline.opportunities(tool) or candidate.opportunities(tool)
@@ -257,12 +323,36 @@ def _rates_table(baseline: CrossToolReport, candidate: CrossToolReport) -> Table
         after = candidate.rate(tool)
         delta = after - before
         colour = "green" if delta > 0 else ("red" if delta < 0 else "white")
+
+        comparison = verdict.comparison(tool) if verdict else None
+        interval = comparison.delta_interval() if comparison else None
+        ci_text = (
+            f"[{interval.low:+.1%}, {interval.high:+.1%}]" if interval else "[dim]-[/dim]"
+        )
+        p_worse = comparison.p_worse if comparison else None
+        p_text = f"{p_worse:.3f}" if p_worse is not None else "[dim]-[/dim]"
+        if comparison is None or comparison.paired is None:
+            power = "[yellow]no pairing[/yellow]"
+        elif comparison.underpowered:
+            power = (
+                f"[yellow]⚠ needs {comparison.min_detectable_shift:.0%}[/yellow]"
+            )
+        elif comparison.significant_regression:
+            power = "[red]✗ significant[/red]"
+        elif comparison.significant_improvement:
+            power = "[green]✓ significant[/green]"
+        else:
+            power = "[green]✓[/green]"
+
         table.add_row(
             tool,
             str(opportunities),
             f"{before:.1%}",
             f"{after:.1%}",
             f"[{colour}]{delta:+.1%}[/{colour}]",
+            ci_text,
+            p_text,
+            power,
         )
     return table
 
@@ -354,6 +444,10 @@ def evolve_tool_descriptions(
         console.print(f"  Would run GEPA optimization ({iterations} iterations)")
         console.print("  Would check constraints, cross-tool regressions, and the gate ladder")
         console.print(
+            f"  Would reject any tool regressing past a {regression_tolerance:.1%} "
+            f"tolerance, or any regression significant at alpha=0.05"
+        )
+        console.print(
             "  Would " + ("write results back to the repo" if write else "leave the repo untouched")
         )
         return None
@@ -408,10 +502,7 @@ def evolve_tool_descriptions(
         baseline_val = evaluate_selection(dataset.val, selector_predict_fn(baseline_module))
     baseline_report = CrossToolReport.from_report(baseline_val, tools=all_tools)
 
-    console.print(
-        f"  Selection accuracy: {baseline_report.overall_accuracy:.1%} "
-        f"over {baseline_report.n} val example(s)"
-    )
+    console.print(f"  Selection accuracy: {baseline_report.describe_accuracy()}")
     console.print(f"  Parameter correctness: {baseline_val.param_accuracy:.1%}")
     _print_confusions(baseline_report)
 
@@ -459,8 +550,26 @@ def evolve_tool_descriptions(
     # ── 5. Constraints ──────────────────────────────────────────────────
     _banner("5. Constraint validation")
     validator = ConstraintValidator(config)
+    accuracy = build_accuracy_checker(catalog, lm=lm)
     candidate_bundle, constraint_outcomes = enforce_constraints(
-        candidate_bundle, baseline_bundle, validator, allowed=selected.names
+        candidate_bundle,
+        baseline_bundle,
+        validator,
+        allowed=selected.names,
+        accuracy=accuracy,
+    )
+    factual_reverts = sum(
+        1
+        for outcome in constraint_outcomes
+        if any(m.startswith("factual_accuracy:") for m in outcome.messages)
+    )
+    console.print(
+        "  Factual accuracy: schema-structural checks"
+        + (
+            " plus LLM entailment"
+            if accuracy.entailment_ran
+            else f" only ({accuracy.skipped_reason or 'entailment not run'})"
+        )
     )
 
     if not constraint_outcomes:
@@ -486,12 +595,15 @@ def evolve_tool_descriptions(
     guard = CrossToolGuard(tolerance=regression_tolerance)
     verdict = guard.compare(baseline_report, candidate_report)
 
-    console.print(_rates_table(baseline_report, candidate_report))
+    console.print(_rates_table(baseline_report, candidate_report, verdict))
+    console.print(f"  Overall: {candidate_report.describe_accuracy()}")
     icon = "✓" if verdict.accepted else "✗"
     colour = "green" if verdict.accepted else "red"
     console.print(f"  [{colour}]{icon} {verdict.summary()}[/{colour}]")
     for regression in verdict.regressions:
         console.print(f"    [red]{regression.describe()}[/red]")
+    if verdict.underpowered:
+        console.print(f"  [yellow]⚠ {verdict.power_note()}[/yellow]")
     _print_confusions(candidate_report)
 
     # ── 7. Gate ladder ──────────────────────────────────────────────────
@@ -553,6 +665,22 @@ def evolve_tool_descriptions(
         )
 
     _row("Selection accuracy (val)", baseline_report.overall_accuracy, candidate_report.overall_accuracy)
+    baseline_ci = baseline_report.accuracy_interval()
+    candidate_ci = candidate_report.accuracy_interval()
+    table.add_row(
+        "  95% CI on accuracy",
+        f"[{baseline_ci.low:.1%}, {baseline_ci.high:.1%}]",
+        f"[{candidate_ci.low:.1%}, {candidate_ci.high:.1%}]",
+        "",
+    )
+    # Raw accuracy is not interpretable on its own: 40% is poor against two
+    # tools and excellent against thirty.
+    table.add_row(
+        f"  Chance ({candidate_report.num_options} options)",
+        f"{baseline_report.chance_accuracy:.1%}",
+        f"{candidate_report.chance_accuracy:.1%}",
+        "",
+    )
     _row("Parameter correctness (val)", baseline_val.param_accuracy, candidate_val.param_accuracy)
     if baseline_holdout is not None and candidate_holdout is not None:
         _row("Selection accuracy (holdout)", baseline_holdout.tool_accuracy, candidate_holdout.tool_accuracy)
@@ -563,6 +691,13 @@ def evolve_tool_descriptions(
         f"{candidate_chars - baseline_chars:+,}",
     )
     table.add_row("Descriptions changed", "", str(len(changes)), "")
+    table.add_row("Factual reverts", "", str(factual_reverts), "")
+    table.add_row(
+        "Underpowered tools",
+        "",
+        str(len(verdict.underpowered)),
+        ", ".join(verdict.underpowered),
+    )
     table.add_row("Optimizer", "", optimizer_used, "")
     table.add_row("Time", "", f"{elapsed:.1f}s", "")
 
@@ -638,12 +773,26 @@ def evolve_tool_descriptions(
         "candidate_param_accuracy": candidate_val.param_accuracy,
         "holdout_baseline_accuracy": baseline_holdout.tool_accuracy if baseline_holdout else None,
         "holdout_candidate_accuracy": candidate_holdout.tool_accuracy if candidate_holdout else None,
+        "baseline_accuracy_ci": baseline_report.accuracy_interval().to_dict(),
+        "candidate_accuracy_ci": candidate_report.accuracy_interval().to_dict(),
+        "chance_accuracy": candidate_report.chance_accuracy,
+        "num_options": candidate_report.num_options,
         "cross_tool_accepted": verdict.accepted,
+        "regression_tolerance": regression_tolerance,
+        # Per tool: baseline rate, candidate rate, delta with its interval, the
+        # one-sided p-value, and whether this many examples could ever have
+        # detected the tolerance being enforced.
+        "per_tool": [comparison.to_dict() for comparison in verdict.comparisons],
+        "underpowered_tools": list(verdict.underpowered),
+        "unpaired_tools": list(verdict.unpaired),
+        "significant_regressions": [r.tool for r in verdict.significant_regressions],
         "gates_passed": chain.passed,
         "descriptions_changed": len(changes),
         "baseline_chars": baseline_chars,
         "candidate_chars": candidate_chars,
         "constraint_reverts": sum(1 for o in constraint_outcomes if o.reverted),
+        "factual_reverts": factual_reverts,
+        "entailment_ran": accuracy.entailment_ran,
         "train_examples": len(dataset.train),
         "val_examples": len(dataset.val),
         "holdout_examples": len(dataset.holdout),
@@ -685,6 +834,12 @@ def evolve_tool_descriptions(
 @click.option("--strict-gates", is_flag=True, help="Treat an unavailable gate as a failure")
 @click.option("--dry-run", is_flag=True, help="Validate setup without running optimization")
 @click.option("--write/--no-write", default=False, help="Write evolved descriptions into the repo")
+@click.option(
+    "--regression-tolerance",
+    default=DEFAULT_TOLERANCE,
+    type=float,
+    help="How far one tool's selection rate may fall before rejection (0 = not at all)",
+)
 def main(
     tools,
     toolset,
@@ -697,6 +852,7 @@ def main(
     strict_gates,
     dry_run,
     write,
+    regression_tolerance,
 ):
     """Evolve hermes-agent tool descriptions using DSPy + GEPA optimization."""
     evolve_tool_descriptions(
@@ -711,6 +867,7 @@ def main(
         strict_gates=strict_gates,
         dry_run=dry_run,
         write=write,
+        regression_tolerance=regression_tolerance,
     )
 
 

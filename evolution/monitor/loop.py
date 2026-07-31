@@ -52,6 +52,7 @@ from typing import Callable, Optional, Sequence
 
 import click
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from evolution.core.config import EvolutionConfig, resolve_hermes_agent_path
@@ -533,6 +534,10 @@ def _render_ranking(entries: Sequence[TriageEntry], out: Console) -> None:
     table.add_column("Now", justify="right")
     table.add_column("Uses", justify="right")
     table.add_column("Trend")
+    # A rank is only as trustworthy as the trend that lifted it, so the
+    # evidence rides in its own column instead of hiding inside the score.
+    table.add_column("p")
+    table.add_column("R²", justify="right")
     table.add_column("Why")
 
     for index, entry in enumerate(entries, start=1):
@@ -540,6 +545,15 @@ def _render_ranking(entries: Sequence[TriageEntry], out: Console) -> None:
         trend = entry.trend.direction.value if entry.trend else "-"
         if entry.trend is not None and entry.trend.is_deterioration:
             trend = f"[red]{trend}[/red]"
+        if entry.trend_p_value is None:
+            p_cell = "[dim]-[/dim]"
+        elif entry.trend_p_value < entry.trend.alpha:
+            p_cell = f"{entry.trend_p_value:.3f}"
+        else:
+            # Above alpha the movement is not distinguishable from noise, and
+            # the reader should see that before approving a run.
+            p_cell = f"[dim]{entry.trend_p_value:.3f} (ns)[/dim]"
+        r2_cell = "-" if entry.trend_r_squared is None else f"{entry.trend_r_squared:.2f}"
         target = entry.target if entry.actionable else f"{entry.target} [dim](advisory)[/dim]"
         table.add_row(
             str(index),
@@ -549,7 +563,12 @@ def _render_ranking(entries: Sequence[TriageEntry], out: Console) -> None:
             value,
             str(entry.usage_samples),
             trend,
-            entry.explain(),
+            p_cell,
+            r2_cell,
+            # Escaped, not interpolated: an explanation is prose, and rich
+            # reads a lowercase "[trend p=...]" or "[advisory: ...]" as a style
+            # tag and silently drops the whole bracket if the style is unknown.
+            escape(entry.explain()),
         )
     out.print(table)
 

@@ -21,7 +21,19 @@ Every entry carries its factors, so :meth:`TriageEntry.explain` can state the
 arithmetic that put it where it is. That matters because the output of this
 module becomes an unattended decision to spend money on an optimizer run, and a
 human reviewing the resulting PR needs to be able to reconstruct the reasoning
-without rerunning anything.
+without rerunning anything. Each entry also carries the p-value and R2 of its
+trend, so a target promoted by a clean decline is visibly more certain than one
+promoted by a noisy series that happened to end low.
+
+Usage frequency is compressed, not linear. Normalizing sample counts by simple
+division against the busiest target means one high-traffic target squashes
+everything else toward zero: in a real ranking, a target that fell 0.91 to 0.55
+placed *below* one that fell 0.82 to 0.74, purely because the second ran more
+often. Volume is real evidence and should count, but it is evidence about how
+much a fix is worth, not about how broken something is, and a linear weight
+lets it overwhelm severity. A log1p curve keeps the ordering by volume while
+flattening the gap between "busy" and "extremely busy" - see
+:func:`_usage_weight`.
 
 Honesty rule carried over from the gates: a benchmark score is a real signal but
 there is no phase entry point that optimizes "tblite", so benchmark candidates
@@ -34,6 +46,7 @@ model, no subprocesses.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Sequence
@@ -114,10 +127,22 @@ class TriageConfig:
     # allowed to trigger an optimization run.
     min_samples: int = 5
 
-    # Trend detection.
+    # Trend detection. ``significant_change`` is the practical floor a decline
+    # must clear; ``trend_alpha`` is the level the t-test on the slope is read
+    # at. A trend has to pass both before it counts as an actionable decline.
     min_points_for_trend: int = 3
     flat_tolerance: float = 0.02
     significant_change: float = 0.05
+    trend_alpha: float = 0.05
+    trend_confidence: float = 0.95
+
+    # How hard to compress usage frequency. The weight is
+    # ``log1p(k * samples) / log1p(k * busiest)``: as k approaches 0 the curve
+    # straightens back into the old ``samples / busiest``, and as it grows the
+    # curve flattens until volume barely separates targets at all. 1.0 keeps
+    # order by volume while stopping one hot target from zeroing the rest.
+    # Setting it to 0 restores exact linear normalization.
+    usage_compression: float = 1.0
 
     # The best a metric can be. Headroom is measured against this.
     ceiling: float = 1.0
@@ -173,6 +198,11 @@ class TriageEntry:
     triggered: bool = False
     trigger_reason: str = ""
     factors: list[ScoreFactor] = field(default_factory=list)
+    # Copied off the trend so the uncertainty survives serialization and shows
+    # up in the table next to the score it moved. ``None`` means there was no
+    # fittable series: a correction-only target, or too little history.
+    trend_p_value: Optional[float] = None
+    trend_r_squared: Optional[float] = None
 
     @property
     def actionable(self) -> bool:
@@ -180,13 +210,39 @@ class TriageEntry:
         return self.target_type in ACTIONABLE_TYPES
 
     @property
-    def failure_rate(self) -> Optional[float]:
+    def headroom(self) -> Optional[float]:
+        """Distance from the current value up to the configured ceiling.
+
+        This is what ``potential_improvement`` measures and what the ranking
+        multiplies by usage. It equals the failure rate only when the ceiling
+        is 1.0.
+        """
         return None if self.current_value is None else self.potential_improvement
+
+    @property
+    def failure_rate(self) -> Optional[float]:
+        """The share of observations that actually failed, ``1 - value``.
+
+        Deliberately not the same number as :attr:`headroom`. This used to
+        return headroom, which mislabelled a ceiling shortfall as a failure
+        rate and misstated it in the trigger message whenever the ceiling was
+        below 1.0.
+        """
+        if self.current_value is None:
+            return None
+        return max(0.0, min(1.0, 1.0 - self.current_value))
+
+    def confidence_note(self) -> str:
+        """Uncertainty of the trend behind this entry, or "" when there is none."""
+        return self.trend.confidence_note() if self.trend is not None else ""
 
     def explain(self) -> str:
         """One line stating why this entry ranked where it did."""
         terms = " x ".join(f"{f.value:.2f} {f.name}" for f in self.factors)
         line = f"score {self.score:.3f} = {terms}" if terms else f"score {self.score:.3f}"
+        confidence = self.confidence_note()
+        if confidence:
+            line += f" [trend {confidence}]"
         if self.triggered:
             line += f" [TRIGGERED: {self.trigger_reason}]"
         if not self.actionable:
@@ -204,12 +260,16 @@ class TriageEntry:
             "metric": self.metric,
             "score": self.score,
             "potential_improvement": self.potential_improvement,
+            "headroom": self.headroom,
+            "failure_rate": self.failure_rate,
             "usage_weight": self.usage_weight,
             "usage_samples": self.usage_samples,
             "current_value": self.current_value,
             "observations": self.observations,
             "corrections": self.corrections,
             "trend": self.trend.to_dict() if self.trend else None,
+            "trend_p_value": self.trend_p_value,
+            "trend_r_squared": self.trend_r_squared,
             "triggered": self.triggered,
             "trigger_reason": self.trigger_reason,
             "actionable": self.actionable,
@@ -288,6 +348,36 @@ def _resolve_target_type(
         return known_types[target]
 
     return metric_types.get(metric, TargetType.SKILL)
+
+
+def _usage_weight(samples: int, max_samples: int, config: TriageConfig) -> float:
+    """How much weight this target's traffic earns, on a 0-1 scale.
+
+    ``samples / busiest`` is the obvious answer and it is the wrong one. It is
+    linear against a single reference point, so a target running ten thousand
+    times a week drives every other target's weight toward zero, and the
+    ranking stops being "improvement x usage" and becomes "usage". The observed
+    failure was a target that fell 0.91 to 0.55 ranking below one that fell
+    0.82 to 0.74, on sample count alone.
+
+    ``log1p(k * samples) / log1p(k * busiest)`` fixes the compression without
+    discarding the signal. It is monotone, so more traffic still means more
+    weight and the busiest target still scores 1.0, but the curve is steep
+    where the counts are small (10 vs 100 uses is a real difference) and flat
+    where they are large (10,000 vs 100,000 uses barely changes what a fix is
+    worth). *k* is ``config.usage_compression``: as it approaches 0 the
+    expression converges on the old linear ratio, and 0 selects it exactly.
+    """
+    if max_samples <= 0:
+        return 0.0
+    samples = max(0, samples)
+    k = config.usage_compression
+    if k <= 0:
+        return min(1.0, samples / max_samples)
+    denominator = math.log1p(k * max_samples)
+    if denominator <= 0:
+        return 0.0
+    return min(1.0, math.log1p(k * samples) / denominator)
 
 
 def _correction_pressure(corrections: int, config: TriageConfig) -> float:
@@ -395,7 +485,8 @@ def _score_quality_series(
 ) -> TriageEntry:
     value = aggregate.weighted_mean
     headroom = max(0.0, min(1.0, config.ceiling - value))
-    usage_weight = (aggregate.samples / max_samples) if max_samples else 0.0
+    failure_rate = max(0.0, min(1.0, 1.0 - value))
+    usage_weight = _usage_weight(aggregate.samples, max_samples, config)
 
     factors = [
         ScoreFactor(
@@ -419,6 +510,8 @@ def _score_quality_series(
         min_points=config.min_points_for_trend,
         flat_tolerance=config.flat_tolerance,
         significant_change=config.significant_change,
+        alpha=config.trend_alpha,
+        confidence=config.trend_confidence,
     )
     if trend.significant:
         multiplier = 1.0 + config.decline_weight
@@ -441,9 +534,14 @@ def _score_quality_series(
     reason = ""
     if aggregate.samples >= config.min_samples and headroom >= config.failure_threshold:
         triggered = True
+        # The condition tests headroom, so the sentence says headroom. The two
+        # are the same number only at a ceiling of 1.0: against a 0.8 ceiling,
+        # calling the shortfall a "failure rate" understates the real one by
+        # twenty points. Both are reported, each under its own name.
         reason = (
-            f"failure rate {headroom:.0%} at or above threshold "
-            f"{config.failure_threshold:.0%} over {aggregate.samples} observations"
+            f"headroom {headroom:.0%} to the {config.ceiling:.2f} ceiling is at or "
+            f"above threshold {config.failure_threshold:.0%} over "
+            f"{aggregate.samples} observations (failure rate {failure_rate:.0%})"
         )
     elif trend.significant and aggregate.samples >= config.min_samples:
         triggered = True
@@ -466,6 +564,8 @@ def _score_quality_series(
         triggered=triggered,
         trigger_reason=reason,
         factors=factors,
+        trend_p_value=trend.p_value if trend.fitted else None,
+        trend_r_squared=trend.r_squared if trend.fitted else None,
     )
 
 
@@ -486,7 +586,7 @@ def _score_correction_only(
     success rate, which is why it saturates rather than scaling without bound.
     """
     pressure = _correction_pressure(corrections, config)
-    usage_weight = (corrections / max_samples) if max_samples else 0.0
+    usage_weight = _usage_weight(corrections, max_samples, config)
     score = pressure * usage_weight
 
     factors = [

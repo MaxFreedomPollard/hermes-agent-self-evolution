@@ -29,6 +29,18 @@ Two design rules the tests depend on:
    point at all rather than a zero. A zero would read as "the agent failed every
    task", which is a very different claim from "we did not run".
 
+**A trend is a claim about evidence, so it is tested like one.** This module
+used to call a decline "significant" whenever the modelled change exceeded a
+fixed magnitude. That is not a significance test, and it does not survive
+contact with a noisy series: the oscillation [0.90, 0.35, 0.85, 0.30, 0.88,
+0.33, 0.60] has no trend at all, yet a magnitude rule reports a significant
+decline and fires an optimization run on nothing. :func:`compute_trend` now
+fits the series with :func:`evolution.core.stats.ols_trend` and runs a real
+t-test on the slope, so the p-value, R2, standard error, and the confidence
+interval on the slope all travel with the answer. Direction stays
+magnitude-based, because direction is a description of the movement rather than
+a claim that the movement is real.
+
 Pure local I/O throughout: no network, no model, no hermes-agent checkout.
 """
 
@@ -42,6 +54,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence, Union
+
+from evolution.core.stats import Interval, ols_trend
 
 __all__ = [
     "SECONDS_PER_DAY",
@@ -213,13 +227,26 @@ class TrendDirection(str, Enum):
 
 @dataclass
 class Trend:
-    """Where a series is heading, and whether anyone should care.
+    """Where a series is heading, whether that is real, and whether it matters.
 
     ``direction`` describes the *value*: rising means the number went up, which
-    is good news for a success rate and bad news for a correction count.
-    ``significant`` folds that in - it is True only when the series has moved in
-    the bad direction by at least the significance threshold, which is the
-    condition triage treats as an actionable decline.
+    is good news for a success rate and bad news for a correction count. It is
+    magnitude-based on purpose. Direction is a description of the movement, not
+    a claim that the movement is distinguishable from noise.
+
+    ``significant`` is the claim, and it takes three things at once:
+
+    1. the fitted slope differs from zero at *alpha* - a t-test on the OLS
+       slope, carrying ``p_value``, ``stderr``, ``r_squared`` and ``slope_ci``,
+    2. the movement is a deterioration for this metric, and
+    3. the modelled ``change`` clears ``practical_threshold``.
+
+    Statistical and practical significance answer different questions, and a
+    monitor needs both answers. Firing on statistics alone chases a two-point
+    drift that happens to be tidy; firing on magnitude alone chases noise, which
+    is the defect this replaced. An optimization run costs money, so it takes
+    evidence that the decline is real *and* that it is big enough to be worth a
+    cycle.
     """
 
     metric: str
@@ -234,6 +261,17 @@ class Trend:
     higher_is_better: bool = True
     significant: bool = False
     note: str = ""
+    # Inference, from the least-squares fit. Defaults describe "no evidence":
+    # a p-value of 1.0 and no explained variance, which is the right answer for
+    # a series too short to fit.
+    p_value: float = 1.0
+    r_squared: float = 0.0
+    stderr: float = 0.0
+    slope_ci: Optional[Interval] = None
+    alpha: float = 0.05
+    # The practical floor the change must clear, i.e. the ``significant_change``
+    # argument :func:`compute_trend` was called with.
+    practical_threshold: float = 0.05
 
     @property
     def is_deterioration(self) -> bool:
@@ -243,13 +281,54 @@ class Trend:
             return not self.higher_is_better
         return False
 
+    @property
+    def statistically_significant(self) -> bool:
+        """True when the slope is distinguishable from zero at *alpha*.
+
+        Needs three points before it can be True at all: two points define a
+        line exactly, leaving no residual scatter to test the slope against.
+        """
+        return self.n >= 3 and self.p_value < self.alpha
+
+    @property
+    def practically_significant(self) -> bool:
+        """True when the modelled change is big enough to be worth acting on."""
+        return abs(self.change) >= self.practical_threshold
+
+    @property
+    def fitted(self) -> bool:
+        """True when there was enough history to fit a slope and test it.
+
+        Below three points, or with every reading at the same instant, the
+        p-value and R2 carry no information, so callers should show nothing
+        rather than show 1.00 and let a reader mistake it for a measurement.
+        """
+        return (
+            self.n >= 3
+            and self.direction is not TrendDirection.UNKNOWN
+            and self.slope_ci is not None
+        )
+
+    def confidence_note(self) -> str:
+        """The uncertainty in one short phrase, for tables and one-liners."""
+        if not self.fitted:
+            return ""
+        return f"p={self.p_value:.3f}, R²={self.r_squared:.2f}"
+
     def describe(self) -> str:
         if self.direction is TrendDirection.UNKNOWN:
             return self.note or f"not enough history ({self.n} points)"
-        return (
+        line = (
             f"{self.direction.value} {self.change:+.3f} over {self.span_days:.1f}d "
-            f"({self.slope_per_day:+.4f}/day, n={self.n})"
+            f"({self.slope_per_day:+.4f}/day, n={self.n}, "
+            f"R²={self.r_squared:.2f}, p={self.p_value:.3f})"
         )
+        if self.slope_ci is not None:
+            line += (
+                f" {self.slope_ci.confidence:.0%} CI on slope "
+                f"[{self.slope_ci.low:+.4f}, {self.slope_ci.high:+.4f}]/day"
+            )
+        return line
 
     def to_dict(self) -> dict:
         return {
@@ -265,6 +344,15 @@ class Trend:
             "higher_is_better": self.higher_is_better,
             "significant": self.significant,
             "note": self.note,
+            "p_value": round(self.p_value, 6),
+            "r_squared": round(self.r_squared, 6),
+            "stderr": round(self.stderr, 8),
+            "slope_ci": self.slope_ci.to_dict() if self.slope_ci else None,
+            "alpha": self.alpha,
+            "practical_threshold": self.practical_threshold,
+            "statistically_significant": self.statistically_significant,
+            "practically_significant": self.practically_significant,
+            "fitted": self.fitted,
         }
 
 
@@ -277,6 +365,8 @@ def compute_trend(
     min_points: int = 3,
     flat_tolerance: float = 0.02,
     significant_change: float = 0.05,
+    alpha: float = 0.05,
+    confidence: float = 0.95,
 ) -> Trend:
     """Least-squares trend over *points*, expressed as change per day.
 
@@ -288,6 +378,13 @@ def compute_trend(
     Fewer than *min_points* observations yields ``UNKNOWN`` rather than a guess.
     Two noisy readings are not a trend, and acting on them would burn an
     optimization cycle on nothing.
+
+    The fit comes from :func:`evolution.core.stats.ols_trend`, which attaches a
+    t-test on the slope. *alpha* is the level that test is read at and
+    *significant_change* is the practical floor the modelled change must clear;
+    :attr:`Trend.significant` requires both, plus the movement being in the bad
+    direction for this metric. *flat_tolerance* still governs the descriptive
+    rising / flat / declining label only.
     """
     ordered = sorted(points, key=lambda p: p.timestamp)
     metric = metric or (ordered[0].metric if ordered else "")
@@ -308,6 +405,8 @@ def compute_trend(
             span_days=0.0,
             higher_is_better=higher_is_better,
             note=f"need {max(2, min_points)} points, have {len(ordered)}",
+            alpha=alpha,
+            practical_threshold=significant_change,
         )
 
     t0 = ordered[0].timestamp
@@ -315,6 +414,11 @@ def compute_trend(
     ys = [p.value for p in ordered]
     span_days = xs[-1] - xs[0]
 
+    # The descriptive slope is computed here rather than taken from the fit so
+    # that the degenerate cases keep behaving as they always have: a two-point
+    # series still reports the line through both points, and a series with one
+    # shared timestamp still reports its raw movement. The fit below supplies
+    # the uncertainty, and it declines to answer in exactly those cases.
     mean_x = sum(xs) / len(xs)
     mean_y = sum(ys) / len(ys)
     denominator = sum((x - mean_x) ** 2 for x in xs)
@@ -334,6 +438,8 @@ def compute_trend(
     else:
         direction = TrendDirection.FLAT
 
+    fit = ols_trend(xs, ys, alpha=alpha, confidence=confidence)
+
     trend = Trend(
         metric=metric,
         target=target,
@@ -345,8 +451,23 @@ def compute_trend(
         n=len(ordered),
         span_days=span_days,
         higher_is_better=higher_is_better,
+        p_value=fit.p_value,
+        r_squared=fit.r_squared,
+        stderr=fit.stderr,
+        # With no spread on the time axis there is no slope to put an interval
+        # around, and a zero-width interval would read as perfect precision.
+        slope_ci=fit.slope_ci if denominator > 0 else None,
+        alpha=alpha,
+        practical_threshold=significant_change,
     )
-    trend.significant = trend.is_deterioration and abs(change) >= significant_change
+    # Three conditions, all required. Dropping the t-test is how a pure
+    # oscillation gets reported as a significant decline; dropping the
+    # magnitude floor is how a real but trivial drift burns a cycle.
+    trend.significant = (
+        trend.statistically_significant
+        and trend.is_deterioration
+        and trend.practically_significant
+    )
     return trend
 
 
@@ -620,6 +741,8 @@ class MetricStore:
         min_points: int = 3,
         flat_tolerance: float = 0.02,
         significant_change: float = 0.05,
+        alpha: float = 0.05,
+        confidence: float = 0.95,
     ) -> Trend:
         if window_days is None:
             points = self.query(metric=metric, target=target)
@@ -632,6 +755,8 @@ class MetricStore:
             min_points=min_points,
             flat_tolerance=flat_tolerance,
             significant_change=significant_change,
+            alpha=alpha,
+            confidence=confidence,
         )
 
     # -- rotation ---------------------------------------------------------

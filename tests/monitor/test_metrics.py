@@ -314,6 +314,20 @@ class TestTrends:
         )
         assert trend.direction is TrendDirection.RISING
         assert trend.is_deterioration
+        # Three points with visible scatter leave one degree of freedom, and
+        # the slope clears alpha only just short of it (p = 0.073). The
+        # direction is a deterioration; the evidence is not yet conclusive.
+        assert trend.p_value == pytest.approx(0.073, abs=0.005)
+        assert not trend.significant
+
+    def test_a_sustained_rise_in_corrections_is_significant(self):
+        trend = compute_trend(
+            self._series(
+                [1.0, 2.0, 3.0, 5.0, 6.0, 8.0], target="read_file", metric=USER_CORRECTION
+            )
+        )
+        assert trend.direction is TrendDirection.RISING
+        assert trend.is_deterioration
         assert trend.significant
 
     def test_simultaneous_points_report_change_without_a_slope(self):
@@ -342,6 +356,135 @@ class TestTrends:
         trend = store.trend(SKILL_SUCCESS_RATE, "arxiv", window_days=60, now=T0)
         assert trend.direction is TrendDirection.DECLINING
         assert trend.n == 3
+
+
+class TestTrendSignificanceIsARealTest:
+    """Significance has to be evidence, not a magnitude threshold.
+
+    The two named series here are the regression cases. Under the old rule -
+    ``is_deterioration and abs(change) >= 0.05`` - the oscillation reported a
+    significant decline and would have fired an optimization run on noise.
+    """
+
+    def _series(self, values, target="arxiv", metric=SKILL_SUCCESS_RATE, step_days=7):
+        return [
+            point(metric, target, value, days_ago=(len(values) - 1 - i) * step_days)
+            for i, value in enumerate(values)
+        ]
+
+    # The value bounces between roughly 0.9 and 0.3 and lands in the middle.
+    # There is no trend; a magnitude rule sees one because the last reading is
+    # below the first.
+    OSCILLATION = [0.90, 0.35, 0.85, 0.30, 0.88, 0.33, 0.60]
+
+    # Six readings, each below the one before it. Same story every week.
+    STEADY_EROSION = [0.91, 0.86, 0.78, 0.71, 0.62, 0.55]
+
+    def test_pure_oscillation_is_not_significant(self):
+        trend = compute_trend(self._series(self.OSCILLATION))
+        assert trend.direction is TrendDirection.DECLINING
+        assert trend.change < -0.05  # the old magnitude rule fired here
+        assert trend.p_value == pytest.approx(0.582, abs=0.01)
+        assert trend.r_squared == pytest.approx(0.06, abs=0.01)
+        assert not trend.statistically_significant
+        assert not trend.significant
+
+    def test_steady_erosion_is_significant(self):
+        trend = compute_trend(self._series(self.STEADY_EROSION))
+        assert trend.direction is TrendDirection.DECLINING
+        assert trend.p_value < 0.05
+        assert trend.r_squared > 0.95
+        assert trend.statistically_significant
+        assert trend.practically_significant
+        assert trend.significant
+
+    def test_the_oscillation_never_ranks_above_the_erosion(self):
+        noisy = compute_trend(self._series(self.OSCILLATION))
+        clean = compute_trend(self._series(self.STEADY_EROSION))
+        assert clean.p_value < noisy.p_value
+        assert clean.r_squared > noisy.r_squared
+        assert clean.significant and not noisy.significant
+
+    def test_a_real_but_trivial_drift_is_not_worth_a_cycle(self):
+        # A perfect line, so the slope is unarguable, but it loses two and a
+        # half points over five weeks. Statistically significant, practically
+        # not, and an optimization run costs the same either way.
+        trend = compute_trend(self._series([0.900, 0.895, 0.890, 0.885, 0.880, 0.875]))
+        assert trend.statistically_significant
+        assert not trend.practically_significant
+        assert not trend.significant
+
+    def test_alpha_is_configurable(self):
+        values = [1.0, 3.0, 6.0]
+        strict = compute_trend(self._series(values, metric=USER_CORRECTION))
+        lenient = compute_trend(self._series(values, metric=USER_CORRECTION), alpha=0.10)
+        assert not strict.significant
+        assert lenient.significant
+        assert lenient.alpha == 0.10
+
+    def test_the_practical_floor_still_applies(self):
+        values = [0.900, 0.895, 0.890, 0.885, 0.880, 0.875]
+        assert not compute_trend(self._series(values)).significant
+        assert compute_trend(self._series(values), significant_change=0.01).significant
+
+    def test_the_fit_carries_its_uncertainty(self):
+        trend = compute_trend(self._series(self.OSCILLATION))
+        assert trend.stderr > 0
+        assert trend.slope_ci is not None
+        assert trend.slope_ci.contains(trend.slope_per_day)
+        # The interval straddles zero, which is the same statement as p > alpha.
+        assert trend.slope_ci.contains(0.0)
+        assert trend.fitted
+
+    def test_describe_states_the_evidence(self):
+        described = compute_trend(self._series(self.STEADY_EROSION)).describe()
+        assert "p=" in described
+        assert "R²=" in described
+        assert "CI on slope" in described
+
+    def test_serialisation_carries_the_inference(self):
+        blob = compute_trend(self._series(self.OSCILLATION)).to_dict()
+        assert blob["significant"] is False
+        assert blob["statistically_significant"] is False
+        assert blob["p_value"] == pytest.approx(0.582, abs=0.01)
+        assert blob["r_squared"] == pytest.approx(0.06, abs=0.01)
+        assert blob["slope_ci"]["low"] < 0 < blob["slope_ci"]["high"]
+        assert blob["alpha"] == 0.05
+        assert blob["practical_threshold"] == 0.05
+
+    def test_too_little_history_reports_no_inference_at_all(self):
+        trend = compute_trend(self._series([0.9, 0.4]))
+        assert trend.direction is TrendDirection.UNKNOWN
+        assert not trend.fitted
+        assert trend.confidence_note() == ""
+        assert trend.to_dict()["slope_ci"] is None
+
+    def test_a_shared_timestamp_cannot_be_significant(self):
+        # Three readings at the same instant: real movement, no time axis to
+        # fit it against, so there is nothing to test the slope with.
+        points = [
+            point(SKILL_SUCCESS_RATE, "arxiv", value, days_ago=3)
+            for value in (0.9, 0.5, 0.4)
+        ]
+        trend = compute_trend(points)
+        assert trend.change == pytest.approx(-0.5)
+        assert trend.direction is TrendDirection.DECLINING
+        assert not trend.significant
+        assert not trend.fitted
+        assert trend.slope_ci is None
+        assert trend.confidence_note() == ""
+
+    def test_an_improving_series_is_never_significant_however_clean(self):
+        trend = compute_trend(self._series([0.55, 0.62, 0.71, 0.78, 0.86, 0.91]))
+        assert trend.statistically_significant
+        assert not trend.is_deterioration
+        assert not trend.significant
+
+    def test_confidence_note_is_short_enough_for_a_table(self):
+        note = compute_trend(self._series(self.STEADY_EROSION)).confidence_note()
+        assert note.startswith("p=")
+        assert "R²=" in note
+        assert len(note) < 30
 
 
 class TestArchiving:
