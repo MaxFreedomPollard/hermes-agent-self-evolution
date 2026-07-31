@@ -227,10 +227,23 @@ test a safety gate wants, `P(at least b losses)`.
 `compare_paired_binary(baseline, candidate)` builds a `PairedBinary` from two
 aligned boolean sequences and raises `ValueError` on a length mismatch, which is
 the only mechanical protection against silently unpaired input.
-`PairedBinary.delta_interval()` uses the standard McNemar variance for a
-difference of correlated proportions,
-`(b + c - (c - b)^2 / n) / n^2`, which is why a candidate that changed nothing
-has a zero-width interval regardless of `n`.
+`PairedBinary.delta_interval()` is built **conditionally on the discordant
+pairs**, not from the Wald variance. The Wald form for correlated proportions,
+`(b + c - (c - b)^2 / n) / n^2`, collapses to exactly zero whenever every
+disagreement points the same way, so a candidate that flipped ten of ten
+examples in its favour reported a zero-width 95 percent interval around +100
+percent. That is the same degeneracy Wald is rejected for two paragraphs below,
+and it is worse here because it shows up precisely on the strongest results.
+
+Conditioning fixes it. With `m = b + c` disagreements the count that went the
+candidate's way is Binomial(m, pi), so a Wilson interval on `c / m` maps back to
+the rate scale through `(2*pi - 1) * m / n` and is never zero-width for `m > 0`.
+With no disagreements at all there is nothing to condition on, so the discordant
+*rate* is bounded by a Wilson interval on `0 / n` and the difference inherits
+that bound symmetrically: no disagreement is not proof of no difference.
+`Interval.estimable` is False when a sample genuinely cannot support an interval,
+so a zero-width result is reported as "not estimable from this sample" rather
+than printed as certainty.
 
 **Wilson versus Wald.** `wilson_interval(successes, n, confidence)` is used for
 single-rate intervals. The Wald interval `p +/- z*sqrt(p(1-p)/n)` collapses at
@@ -256,11 +269,28 @@ interval, a Wilcoxon signed-rank p-value, and paired Cohen's d.
 `paired_bootstrap_ci` resamples *pairs* rather than individual observations,
 which is what preserves the pairing, and takes a fixed default seed
 (`20260731`) so a borderline gate verdict is reproducible and auditable rather
-than able to flip on a rerun. `wilcoxon_signed_rank` drops zero differences,
-assigns average ranks to ties, and uses the tie-corrected normal approximation;
-its docstring is explicit that below about eight non-zero differences the
-p-value is indicative only and the exact McNemar path is the better tool for
-binary data.
+than able to flip on a rerun.
+
+`wilcoxon_signed_rank` drops zero differences and assigns average ranks to ties.
+Its p-value is **exact** up to `_EXACT_WILCOXON_MAX_N` (50) non-zero
+differences, falling back to the tie-corrected normal approximation only above
+that. Exactness is not a refinement here, it is the difference between deploying
+and not: the approximation is badly anti-conservative in the small-sample regime
+these eval sets live in, reporting p = 0.046 for four pairs all moving the same
+way where the exact answer is 0.125. The exact null is the distribution of
+subset sums of the observed ranks over all `2**n` sign assignments, counted by
+dynamic programming over a doubled-rank lattice so the half-integer ranks that
+ties produce stay on integers.
+
+`PairedContinuous` takes its **direction from the ranks and not from the mean**.
+The two can disagree: eleven scenarios improving while one collapses drags the
+mean negative while the ranks clearly favour the candidate, and taking the
+p-value from one and the sign from the other labelled that a significant
+*regression*. `signed_rank_direction` returns the sign of `w_plus - w_minus`,
+`PairedContinuous.direction_conflict` is True when it contradicts the mean, and
+neither `significant_improvement` nor `significant_regression` can be True while
+it is. A result that hinges on one outlier is reported as inconclusive rather
+than resolved in either direction.
 
 **Trends.** `ols_trend(xs, ys)` fits `y = a + b*x`, computes the residual
 standard error, the t statistic on the slope, a two-sided p-value from
@@ -272,6 +302,25 @@ real test rather than a magnitude threshold. Fewer than three points returns a
 zero-slope non-significant result: with two points the line passes through both
 exactly, the residual variance is zero, and there is no error term left to test
 against.
+
+**Degenerate fits fall back to Mann-Kendall.** "No residual scatter" has to be
+judged relative to the data rather than against exact zero: three readings on a
+straight line leave residuals of order 1e-16, which is enough for the standard
+error to underflow and the t statistic to explode, manufacturing `p = 0.000` out
+of rounding error. `ols_trend` treats `sse <= sst * 1e-12` as a perfect fit, and
+this is not an exotic case - success rates measured over two sessions are
+quantized to {0, 0.5, 1.0}, and 1.0/0.5/0.0 is exactly collinear.
+
+The t-test being undefined does not make the question unanswerable, so
+`mann_kendall(ys)` answers it instead. It counts concordant minus discordant
+pairs, needs no estimate of sigma, and is exact up to 20 points with no repeated
+values by counting permutations with each inversion number (the Mahonian
+distribution). It gets the intuition right in both directions where a blanket
+"degenerate means no evidence" rule would not: a perfectly straight six-point
+decline is one ordering in 720, `p = 0.003`, and is significant; the same shape
+over three points is one in six, `p = 0.333`, and is not. `OLSTrend.method`
+records which test produced the p-value, and `OLSTrend.degenerate` flags the
+fallback.
 
 **Intersection-union, and why no multiplicity correction.** Accepting a Phase 2
 candidate means asserting a conjunction: "no individual tool regressed". Each
@@ -287,11 +336,24 @@ there are. A safety gate should not get easier to pass as the surface area it
 protects grows. This is stated in the `stats.py` module docstring and again at
 the guard in `cross_tool.py`.
 
+**And where correction is required.** The exemption is about the direction of
+the quantifier, not about multiplicity being harmless. `--all-sections` measures
+one baseline holdout and then tests each section against it, deploying every
+section that clears alpha. That is a **disjunction** - "any of these worked" -
+and selecting the best of k inflates the family-wise error: four sections at
+alpha = 0.05 give `1 - 0.95**4` = 18.6 percent, not 5. Those p-values are
+Holm-adjusted by `holm_adjust` in `evolve_prompt_section.evolve`, and a section
+that survives alone but not the correction is dropped with its adjusted p-value
+named in the reason. Holm rather than plain Bonferroni because it is uniformly
+more powerful and equally valid without assuming independence.
+
+The rule to carry away: correct a disjunction, never a conjunction.
+
 `stats.py` uses the standard library only: no numpy, no scipy. The incomplete
 beta function is implemented directly because a Student-t tail is needed and the
-standard library has none. Its 63 tests in `tests/core/test_stats.py` check the
-distribution primitives against published t-tables and hand-computed binomial
-values.
+standard library has none. Its tests in `tests/core/test_stats.py` check the
+distribution primitives against published t-tables, hand-computed binomial
+sums, and Anscombe quartet I.
 
 Four call sites use it, and each is described in its own section below:
 
@@ -800,7 +862,7 @@ Power is reported at three points. `min_scenarios_for_significance(alpha)`
 computes the floor empirically, by feeding the most favourable possible input
 (every scenario moving the same way by the same amount, which minimises the
 signed-rank statistic and maximises the tie correction) into the same Wilcoxon
-routine the gate uses; at alpha = 0.05 that floor is **4 scenarios**. Below it,
+routine the gate uses; at alpha = 0.05 that floor is **6 scenarios**. Below it,
 "not significant" is a statement about the sample size and not about the
 candidate, and `power_note` says exactly that. `min_detectable_paired_shift`
 gives the fraction of the suite that would have to move, and `shortfall_note`
@@ -1267,8 +1329,9 @@ Phase 3 is smaller still. The seed bank is 60 scenarios across five categories;
 split 0.5 / 0.25 / 0.25 that leaves 15 holdout scenarios for an
 `--all-sections` run and 6 for a single section (its own 12 plus the 12 platform
 scenarios carried as a regression signal). The Wilcoxon floor from
-`min_scenarios_for_significance` is 4, so significance is reachable in
-principle, but `min_detectable_paired_shift` is 83 percent of the suite at
+`min_scenarios_for_significance` is 6, so a single-section run sits exactly on
+the floor and can only reach significance when every one of its scenarios moves
+the same way, while `min_detectable_paired_shift` is 83 percent of the suite at
 n = 6 and 33 percent at n = 15. *Consequence:* most real candidates will land on
 "inconclusive" rather than on a verdict. That is the correct answer for that
 sample size, and it is now what the run reports instead of deploying on the sign
