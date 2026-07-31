@@ -57,6 +57,7 @@ from evolution.core.cost import UsageTracker
 from evolution.core.gates import GateChain, run_benchmark_gate, run_pytest_gate
 from evolution.core.pr_builder import (
     GitError,
+    require_clean_worktree,
     PullRequestPlan,
     RejectedCandidate,
     ScoreLine,
@@ -601,6 +602,7 @@ def evolve_tool_descriptions(
     push: bool = False,
     open_pr: bool = False,
     pr_base: str = "main",
+    allow_dirty: bool = False,
 ) -> Optional[dict]:
     """Run the full Phase 2 optimization. Returns the metrics it saved.
 
@@ -689,6 +691,26 @@ def evolve_tool_descriptions(
             console.print("  Would not build a branch (--no-create-pr)")
         console.print("  A dry run builds no branch and sends nothing.")
         return None
+
+    # Refuse before spending anything if the operator has uncommitted work in a
+    # file this run would overwrite. It has to happen here, before the write:
+    # afterwards the run's own edits make the same files dirty and there is no
+    # way left to tell whose changes they are. Without it, `git checkout -b`
+    # carries their work onto the evolve branch, the commit absorbs it, and
+    # restoring their ref makes it look deleted. Phase 4 has always refused this.
+    if write and create_pr is not False:
+        try:
+            require_clean_worktree(
+                repo,
+                sorted({
+                    str(e.descriptor.path.relative_to(repo))
+                    for e in catalog.select()
+                }),
+                allow_dirty=allow_dirty,
+            )
+        except GitError as exc:
+            console.print(f"[red]✗ {exc}[/red]")
+            return 1
 
     baseline_bundle = catalog.bundle()
     signatures = catalog_signatures(catalog)
@@ -955,7 +977,21 @@ def evolve_tool_descriptions(
 
     # ── 10. Write-back ──────────────────────────────────────────────────
     _banner("10. Write-back")
-    may_write = write and verdict.accepted and chain.passed and bool(changes)
+    # The holdout verdict gates too. It was previously computed, printed, and
+    # then ignored, so a candidate that held on validation and collapsed on
+    # holdout shipped anyway - and because collect_rejections walks both
+    # verdicts, the winner's own holdout regression was then filed in the PR
+    # body under "Rejected along the way". A reviewer skimming that read the
+    # exact opposite of what happened. Holdout is the split nothing optimized
+    # against, which is precisely why it is the one worth obeying.
+    holdout_blocked = holdout_verdict is not None and not holdout_verdict.accepted
+    may_write = (
+        write
+        and verdict.accepted
+        and not holdout_blocked
+        and chain.passed
+        and bool(changes)
+    )
 
     if not changes:
         console.print("  Nothing to write: no description survived validation unchanged.")
@@ -975,6 +1011,12 @@ def evolve_tool_descriptions(
                 console.print("  [yellow]--no-write is the default; re-run with --write to apply[/yellow]")
             elif not verdict.accepted:
                 console.print("  [red]Not written: the cross-tool guard rejected this candidate[/red]")
+            elif holdout_blocked:
+                console.print(
+                    "  [red]Not written: the candidate held on validation and "
+                    "regressed on holdout, the split it never optimized against[/red]"
+                )
+                console.print(f"    {holdout_verdict.summary()}")
             elif not chain.passed:
                 console.print("  [red]Not written: a gate blocked this candidate[/red]")
 
@@ -1215,6 +1257,8 @@ def evolve_tool_descriptions(
     help="Open the pull request with gh. Off by default, and needs the branch pushed",
 )
 @click.option("--pr-base", default="main", help="Base branch for the pull request")
+@click.option("--allow-dirty", is_flag=True,
+              help="Proceed even if the target files have uncommitted changes")
 def main(
     tools,
     toolset,
@@ -1232,9 +1276,10 @@ def main(
     push,
     open_pr,
     pr_base,
+    allow_dirty,
 ):
     """Evolve hermes-agent tool descriptions using DSPy + GEPA optimization."""
-    evolve_tool_descriptions(
+    code = evolve_tool_descriptions(
         tools=tools,
         toolset=toolset,
         iterations=iterations,
@@ -1251,7 +1296,14 @@ def main(
         push=push,
         open_pr=open_pr,
         pr_base=pr_base,
+        allow_dirty=allow_dirty,
     )
+    # evolve() returns a non-zero code when it refuses to start or when a
+    # requested deployment step failed. Swallowing it here made a failed push
+    # look like a clean run to a caller, and Phase 5 reads exactly that exit
+    # status to decide whether an optimization was proposed.
+    if code:
+        raise SystemExit(code)
 
 
 if __name__ == "__main__":

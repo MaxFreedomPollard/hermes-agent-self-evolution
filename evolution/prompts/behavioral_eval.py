@@ -45,6 +45,7 @@ import json
 import random
 import re
 import subprocess
+import tempfile
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -1238,6 +1239,10 @@ def make_behavioral_metric(judge: Optional[BehavioralJudge] = None):
 # ──────────────────────────────────────────────────────────────────────────
 
 
+class HarnessTimeout(RuntimeError):
+    """batch_runner did not finish in time, so nothing was measured."""
+
+
 @dataclass
 class BatchRunnerHarness:
     """Run scenarios through hermes-agent's batch_runner as a subprocess.
@@ -1354,7 +1359,18 @@ class BatchRunnerHarness:
         if not self.available:
             raise FileNotFoundError(f"no batch_runner.py at {self.runner_path}")
 
-        base = Path(self.dataset_dir or (Path(self.hermes_repo) / "data" / "_hase"))
+        # Default the scratch dataset OUT of the operator's checkout. It used
+        # to land in <hermes_repo>/data/_hase, so a --no-write run left
+        # untracked files behind in a repo the README promises it does not
+        # touch. Callers pass their own run directory; the temp dir is only the
+        # fallback. (batch_runner itself still writes its results under the
+        # repo's data/ because it runs with cwd there - that is hermes-agent's
+        # own layout, not something this harness chooses.)
+        base = Path(
+            self.dataset_dir
+            or Path(tempfile.gettempdir()) / "hase-behavioral"
+        )
+        base.mkdir(parents=True, exist_ok=True)
         dataset_file = Path(dataset_file or (base / f"{run_name}.jsonl"))
         self.build_dataset(scenarios, dataset_file)
 
@@ -1364,12 +1380,22 @@ class BatchRunnerHarness:
             system_prompt=system_prompt,
             sample_count=len(scenarios),
         )
-        subprocess.run(
-            cmd,
-            cwd=str(self.hermes_repo),
-            timeout=self.timeout,
-            check=False,
-        )
+        try:
+            subprocess.run(
+                cmd,
+                cwd=str(self.hermes_repo),
+                timeout=self.timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            # A hung batch_runner used to take the whole run down with a
+            # traceback and no metrics.json. The scenarios it did not answer
+            # come back unmeasured, which the paired comparison already knows
+            # how to drop rather than score as failures.
+            raise HarnessTimeout(
+                f"batch_runner did not finish within {self.timeout}s; "
+                f"no transcripts were collected for {run_name}"
+            ) from exc
 
         transcripts = self.parse_results(run_name)
         return _match_transcripts(scenarios, transcripts)

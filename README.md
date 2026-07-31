@@ -85,12 +85,20 @@ No phase pushes a branch or opens a pull request unless you ask for it with `--p
 # Phase 2: evolve one toolset, keeping the repo untouched
 hermes-evolve tools --toolset file --iterations 10
 
-# Phase 3: zero benchmark regression tolerance, as PLAN.md requires
-hermes-evolve prompt --section MEMORY_GUIDANCE --strict-gates
+# Phase 3: one section, measured and reported, nothing written
+hermes-evolve prompt --section MEMORY_GUIDANCE
+
+# Phase 2: apply the result and build a branch with a PR body, still local
+hermes-evolve tools --toolset file --write
 
 # Phase 5: print an installable weekly schedule (installs nothing)
 hermes-evolve monitor --emit-cron
 ```
+
+`--strict-gates` is available on Phases 2, 3 and 4 and turns a gate that could not run
+into a hard failure. Be aware of what that means today: hermes-agent ships none of the
+benchmarks PLAN.md names, so on a stock checkout the flag blocks every candidate. It is
+there for a release process that must prove every gate really ran, not for everyday use.
 
 ## What It Optimizes
 
@@ -118,12 +126,25 @@ Every evolved variant must pass:
 4. **Semantic preservation** — Must not drift from original purpose
 5. **PR review** — All changes go through human review, never direct commit
 
-Two of these are enforced mechanically rather than by convention:
+Guardrail 1 is not uniform across phases, and it is worth knowing which one you are
+getting:
 
-**Structure is frozen.** Tool schemas and prompt constants are rewritten by replacing
-the exact source span of a single string literal, then re-parsing and diffing the schema
-skeleton. Any candidate that moves a parameter name, type, enum, default, or required
-list is rejected before it reaches disk. Only description text can change.
+| Phase | What the test gate actually runs |
+|---|---|
+| 1 | Nothing. `--run-tests` sets a config field no code reads. |
+| 2 | The suite, but only with `--run-tests`; off by default. |
+| 3 | A subset, `pytest tests/ -k prompt`. |
+| 4 | The full suite, as a hard gate. Any failure rejects the candidate outright. |
+
+Two guardrails are enforced mechanically rather than by convention:
+
+**Structure is frozen.** Tool schemas and prompt constants are rewritten by replacing the
+exact source span of a single string literal, never by regenerating the file. For a tool
+schema the rewritten source is then re-parsed and its skeleton diffed against the
+original, so a candidate that moves a parameter name, type, enum, default, or required
+list is rejected before it reaches disk. For a prompt constant the equivalent proof is
+`verify_only_sections_changed`, which compares the value of every module-level string
+constant and fails if anything but the targeted section moved. Only text can change.
 
 **A missing gate is not a passing gate.** A benchmark that is not installed reports
 `unavailable`, never `passed`. Runs are permissive by default so the pipeline is usable

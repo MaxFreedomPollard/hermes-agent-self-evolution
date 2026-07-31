@@ -44,6 +44,31 @@ def _history() -> list:
         return []
 
 
+def _max_history_size() -> int:
+    """How many entries DSPy keeps before it starts evicting. 0 if unknown."""
+    try:
+        from dspy.clients import base_lm
+
+        size = getattr(base_lm, "MAX_HISTORY_SIZE", 0)
+        return int(size) if isinstance(size, int) else 0
+    except Exception:  # pragma: no cover
+        return 0
+
+
+def _entry_identity(entry: Any) -> Any:
+    """Something stable that identifies one history entry.
+
+    DSPy stamps each entry with a uuid. Falling back to ``id()`` keeps the
+    anchor working for hand-built entries in tests, where the objects are the
+    same list members throughout.
+    """
+    if isinstance(entry, dict):
+        marker = entry.get("uuid")
+        if marker is not None:
+            return ("uuid", marker)
+    return ("id", id(entry))
+
+
 @dataclass(frozen=True)
 class LMCall:
     """One model call, as much of it as DSPy recorded."""
@@ -201,23 +226,51 @@ class UsageTracker:
 
     def __init__(self) -> None:
         self._start = 0
+        self._anchor: Any = None
         self.report = CostReport()
 
     def __enter__(self) -> "UsageTracker":
-        self._start = len(_history())
+        history = _history()
+        self._start = len(history)
+        # Remember *which* entry was last, not just how many there were. DSPy
+        # evicts from the front once the log reaches MAX_HISTORY_SIZE, so its
+        # length stops growing and a length comparison alone cannot notice that
+        # 25,000 calls happened. Anchoring on an identity can.
+        self._anchor = _entry_identity(history[-1]) if history else None
         return self
 
     def __exit__(self, *exc: Any) -> None:
         self.stop()
 
     def stop(self) -> CostReport:
-        history = _history()
-        end = len(history)
-        if end < self._start:
-            # The log was evicted or reset underneath us. Everything still in
-            # it may or may not belong to this run, so take it all and flag it.
-            self.report = read_history(list(history))
+        history = list(_history())
+        cap = _max_history_size()
+
+        if self._anchor is not None:
+            index = None
+            for i in range(len(history) - 1, -1, -1):
+                if _entry_identity(history[i]) == self._anchor:
+                    index = i
+                    break
+            if index is None:
+                # The entry we anchored on has been evicted, so this run made
+                # more calls than the log can hold. Everything left is a lower
+                # bound on what happened.
+                self.report = read_history(history)
+                self.report.truncated = True
+                return self.report
+            new = history[index + 1:]
+        elif len(history) < self._start:
+            self.report = read_history(history)
             self.report.truncated = True
+            return self.report
         else:
-            self.report = read_history(list(history[self._start:end]))
+            new = history[self._start:]
+
+        self.report = read_history(new)
+        # Sitting exactly at the cap means eviction either happened or was one
+        # call away, and the two are indistinguishable from here. Say so rather
+        # than report a confident total that may be missing its first half.
+        if cap and len(history) >= cap:
+            self.report.truncated = True
         return self.report

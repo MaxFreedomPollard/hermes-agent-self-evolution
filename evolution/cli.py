@@ -19,7 +19,6 @@ you only pay for the phase you actually run.
 from __future__ import annotations
 
 import importlib
-from pathlib import Path
 from typing import Optional
 
 import click

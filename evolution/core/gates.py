@@ -202,6 +202,20 @@ def run_pytest_gate(
             duration_s=elapsed,
         )
 
+    # Exit 5 is pytest's "no tests were collected", not "tests failed". Treating
+    # it as a failure turns a too-narrow -k expression into a red suite that
+    # blocks every candidate, and tells the operator their tests are broken when
+    # the truth is that the filter matched nothing. An empty selection verifies
+    # nothing, so it is UNAVAILABLE, and strict mode still refuses to ship on it.
+    if proc.returncode == 5:
+        selection = " ".join(subset) if subset else "tests/"
+        return GateResult(
+            "pytest",
+            GateStatus.UNAVAILABLE,
+            f"no tests matched the selection ({selection}), so nothing was verified",
+            duration_s=elapsed,
+        )
+
     tail = "\n".join((proc.stdout or "").strip().splitlines()[-25:])
     return GateResult(
         "pytest",

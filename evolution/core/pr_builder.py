@@ -25,10 +25,9 @@ can assert on the name.
 
 from __future__ import annotations
 
-import json
 import shutil
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -36,6 +35,8 @@ from evolution.core.cost import CostReport
 
 __all__ = [
     "ScoreLine",
+    "dirty_paths",
+    "require_clean_worktree",
     "RejectedCandidate",
     "PullRequestPlan",
     "build_pull_request",
@@ -144,6 +145,17 @@ class PullRequestPlan:
         if self.created_branch and self.original_ref:
             _run(["git", "checkout", self.original_ref], self.repo)
 
+    def discard(self) -> None:
+        """Restore the original ref and delete the branch entirely.
+
+        For a caller that built a branch, failed to push it, and does not want
+        to leave a dead ``evolve/`` ref behind in the operator's checkout.
+        """
+        if not self.created_branch:
+            return
+        _abandon_branch(self.repo, self.branch, self.original_ref)
+        self.created_branch = False
+
     def to_dict(self) -> dict:
         return {
             "branch": self.branch,
@@ -153,6 +165,70 @@ class PullRequestPlan:
             "original_ref": self.original_ref,
             "body_path": str(self.body_path) if self.body_path else None,
         }
+
+
+def dirty_paths(repo: Path, files: Sequence[str]) -> list[str]:
+    """Which of *files* have uncommitted modifications right now.
+
+    Only the paths a run is about to touch matter. Unrelated work elsewhere in
+    the checkout survives a branch switch untouched, so refusing over it would
+    be noise; work in a file the run is about to overwrite and commit would not.
+    """
+    if not files:
+        return []
+    try:
+        out = _run(["git", "status", "--porcelain", "--", *files], repo)
+    except GitError:
+        return []
+    dirty: list[str] = []
+    for line in out.splitlines():
+        if len(line) > 3 and not line.startswith("??"):
+            dirty.append(line[3:].strip())
+    return dirty
+
+
+def require_clean_worktree(
+    repo: Path, files: Sequence[str], allow_dirty: bool = False
+) -> None:
+    """Refuse to start when the operator has uncommitted work in *files*.
+
+    Call this **before** a phase writes anything, which is the only moment the
+    distinction is still visible. Afterwards the run's own edits make the same
+    files dirty and there is no way to tell whose changes they are.
+
+    It matters because the deployment step is destructive without it:
+    ``git checkout -b`` carries uncommitted edits onto the new branch, the
+    commit absorbs them, and restoring the original ref leaves the operator's
+    work stranded on a branch they did not create - from the working tree it
+    simply looks deleted. Phase 4 has always refused this through
+    :class:`~evolution.code.organism.CodeOrganism`; this is the same rule for
+    the phases that rewrite text.
+    """
+    if allow_dirty:
+        return
+    dirty = dirty_paths(repo, files)
+    if not dirty:
+        return
+    raise GitError(
+        "uncommitted changes in "
+        + ", ".join(dirty[:5])
+        + (" and others" if len(dirty) > 5 else "")
+        + ". This run would overwrite them and commit the result onto an evolve "
+        "branch, leaving your work off your current branch. Commit or stash "
+        "first, or pass --allow-dirty to evolve on top of it."
+    )
+
+
+def _abandon_branch(repo: Path, branch: str, original: str) -> None:
+    """Put the checkout back and delete the half-built branch. Never raises."""
+    try:
+        _run(["git", "checkout", "--force", original], repo)
+    except GitError:
+        return
+    try:
+        _run(["git", "branch", "-D", branch], repo)
+    except GitError:
+        pass
 
 
 def _current_ref(repo: Path) -> str:
@@ -283,10 +359,18 @@ def build_pull_request(
     branch = f"evolve/{target}-{timestamp}"
     _run(["git", "checkout", "-b", branch], repo)
 
-    diff = ""
-    if commit and files:
-        _run(["git", "add", "--", *files], repo)
-        diff = _run(["git", "diff", "--cached"], repo)
+    # From here on the checkout is on a branch the caller did not ask to be
+    # left on. Anything that fails has to put them back before it propagates,
+    # or a caller that only handles GitError is stranded with no plan object to
+    # call restore() on.
+    try:
+        diff = ""
+        if commit and files:
+            _run(["git", "add", "--", *files], repo)
+            diff = _run(["git", "diff", "--cached"], repo)
+    except Exception:
+        _abandon_branch(repo, branch, original)
+        raise
 
     headline = ""
     if scores:
@@ -327,7 +411,11 @@ def build_pull_request(
     commit_message = "\n".join(message_lines).rstrip() + "\n"
 
     if commit and files:
-        _run(["git", "commit", "-m", commit_message], repo)
+        try:
+            _run(["git", "commit", "-m", commit_message], repo)
+        except Exception:
+            _abandon_branch(repo, branch, original)
+            raise
 
     return PullRequestPlan(
         repo=repo,
