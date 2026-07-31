@@ -431,6 +431,11 @@ class CodeOrganism:
             capture_output=True,
             text=True,
             cwd=str(self.repo),
+            # Reading one config key cannot legitimately take long, but a git
+            # that blocks on an index lock or a credential helper would hang
+            # the whole run with no output. Every other git call here is
+            # bounded; this one was the exception.
+            timeout=30,
         )
         if probe.returncode == 0 and probe.stdout.strip():
             return []

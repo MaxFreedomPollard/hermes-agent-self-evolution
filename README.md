@@ -71,7 +71,15 @@ hermes-evolve monitor --once              # Phase 5: triage and propose
 
 Phases 2 and 3 default to `--no-write`: they measure and report without touching your
 hermes-agent checkout. Pass `--write` when you want the evolved text applied to a branch.
-Phase 4 never writes to your working state at all; it produces a branch and a diff.
+
+Phase 4 is different, because evolving code means running the tests against it. It works
+on a temporary `evolve/code/...` branch in your checkout, commits each candidate there so
+the lineage is inspectable, and restores the branch you were on when it exits, including
+after an error. It refuses to start on a dirty worktree unless you pass `--allow-dirty`,
+and it never merges: the output is a branch, a diff, and a PR body for you to review.
+
+No phase pushes a branch or opens a pull request unless you ask for it with `--push` or
+`--open-pr`.
 
 ```bash
 # Phase 2: evolve one toolset, keeping the repo untouched

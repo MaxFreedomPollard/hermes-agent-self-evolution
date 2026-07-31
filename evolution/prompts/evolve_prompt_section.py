@@ -4,6 +4,7 @@ Usage:
     python -m evolution.prompts.evolve_prompt_section --section MEMORY_GUIDANCE
     python -m evolution.prompts.evolve_prompt_section --all-sections --iterations 5 --strict-gates
     python -m evolution.prompts.evolve_prompt_section --section SKILLS_GUIDANCE --write
+    python -m evolution.prompts.evolve_prompt_section --section MEMORY_GUIDANCE --write --push --open-pr
 
 This is the riskiest tier in PLAN.md, and the code is shaped by that rather
 than by the optimizer. A skill affects the sessions that load it. A tool
@@ -41,6 +42,13 @@ all about what the run refuses to do:
 Nothing here mutates the hermes-agent working tree except the explicit
 write-back step and the gate ladder's staged write, which restores the original
 in a ``finally`` and leaves a backup in the run's output directory first.
+
+A run that does write ends by building the pull request PLAN.md's constraint 5
+asks for: a branch, a commit, and a body carrying the paired holdout evidence,
+the gate results, the cost of the run, and every section that was refused along
+the way. All of that is local. Pushing the branch and opening the PR are
+separate steps that happen only when the operator asks for them by name, and
+the checkout is put back on the ref it started on either way.
 """
 
 from __future__ import annotations
@@ -48,6 +56,7 @@ from __future__ import annotations
 import json
 import sys
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import lru_cache, partial
@@ -61,7 +70,15 @@ from rich.table import Table
 
 from evolution.core.artifact_io import EVOLVABLE_PROMPT_SECTIONS
 from evolution.core.config import EvolutionConfig, resolve_hermes_agent_path
+from evolution.core.cost import CostReport, UsageTracker
 from evolution.core.gates import GateChain, run_benchmark_gate, run_pytest_gate
+from evolution.core.pr_builder import (
+    GitError,
+    PullRequestPlan,
+    RejectedCandidate,
+    ScoreLine,
+    build_pull_request,
+)
 from evolution.core.stats import (
     PairedContinuous,
     compare_paired_continuous,
@@ -696,6 +713,258 @@ def _optimize_section(
     return optimized.section_text, "MIPROv2"
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Deployment
+# ──────────────────────────────────────────────────────────────────────────
+
+
+PR_PHASE = "Phase 3 (system prompt sections)"
+
+# Branch target when one run deployed several sections. A branch name has to be
+# short and stable, and gluing four section names together is neither, so a run
+# that ships more than one section ships them under one slug.
+MULTI_SECTION_TARGET = "prompt-sections"
+
+# The run wrote and branched, but a step the operator explicitly asked for -
+# the push, or opening the PR - did not happen. Distinct from 1 (setup refused
+# before anything ran) and 2 (a live session blocked the write).
+EXIT_DEPLOYMENT_INCOMPLETE = 3
+
+
+def pr_target(names: Sequence[str]) -> str:
+    """What ``evolve/<target>-<timestamp>`` is named after."""
+    unique = list(dict.fromkeys(names))
+    if len(unique) == 1:
+        return unique[0]
+    return MULTI_SECTION_TARGET
+
+
+def repo_relative(repo: Path, path: Path) -> str:
+    """A path git can stage, relative to the repo root when it lives inside it."""
+    try:
+        return Path(path).relative_to(Path(repo)).as_posix()
+    except ValueError:
+        return Path(path).as_posix()
+
+
+def holdout_score_lines(deployed: Sequence[SectionOutcome]) -> list[ScoreLine]:
+    """One before/after row per deployed section, taken from the holdout.
+
+    Only the holdout is reported. This phase's train and validation numbers are
+    the fast judge's, measured over a different scenario set, so putting them in
+    the same table as an LLM-judged holdout mean would invite exactly the
+    comparison those numbers cannot support.
+    """
+    lines: list[ScoreLine] = []
+    multiple = len(deployed) > 1
+    for outcome in deployed:
+        comparison = outcome.holdout
+        if comparison is None or not comparison.n:
+            continue
+        up, down, unchanged = comparison.movement
+        lines.append(
+            ScoreLine(
+                split=f"holdout / {outcome.name}" if multiple else "holdout",
+                baseline=comparison.overall.baseline_mean,
+                evolved=comparison.overall.candidate_mean,
+                detail=(
+                    f"paired, n={comparison.n}, "
+                    f"p={comparison.overall.wilcoxon_p:.3f}, "
+                    f"{up} up / {down} down / {unchanged} unchanged"
+                ),
+            )
+        )
+    return lines
+
+
+def holdout_statistics(deployed: Sequence[SectionOutcome]) -> str:
+    """The paired evidence for the PR body, in the comparison's own words.
+
+    Nothing is recomputed here. :class:`HoldoutComparison` already renders the
+    delta with its interval, the Wilcoxon p, the effect size, the per-category
+    verdicts and the power note, and a second rendering of the same numbers is
+    a second chance to disagree with the gate that made the decision.
+    """
+    blocks: list[str] = []
+    for outcome in deployed:
+        comparison = outcome.holdout
+        if comparison is None or not comparison.n:
+            continue
+        lines = [
+            f"**{outcome.name}** - paired Wilcoxon signed-rank over "
+            f"{comparison.n} holdout scenario(s), alpha={comparison.alpha:g}",
+            "",
+            f"- Overall: {comparison.describe()}",
+        ]
+        for category, result in comparison.by_category.items():
+            label = category
+            if category == comparison.targeted_category:
+                label = f"{category} (targeted)"
+            verdict = "regressed" if comparison.category_regressed(result) else "held"
+            lines.append(f"- {label}: {result.describe()} [{verdict}]")
+        if comparison.underpowered_categories:
+            lines.append(
+                "- Too small to test on their own, so watched on the point "
+                f"estimate only ({comparison.category_tolerance:.0%} tolerance): "
+                + ", ".join(comparison.underpowered_categories)
+            )
+        lines.append(f"- Power: {comparison.power_note}")
+        if outcome.adjusted_p is not None:
+            lines.append(
+                "- Holm-adjusted p across the sections tested against one "
+                f"baseline: {outcome.adjusted_p:.3f}"
+            )
+        lines.append(f"- Verdict: {comparison.reason}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def rejected_candidates(
+    outcomes: Sequence[SectionOutcome], deployed: Sequence[SectionOutcome]
+) -> list[RejectedCandidate]:
+    """Every section this run produced and refused, and what refused it.
+
+    A reviewer looking at one deployed section cannot otherwise tell that three
+    more were tried, that one lost a constraint, or that one cleared alpha on
+    its own and was then dropped by the multiple-comparison correction. That
+    last one is the most useful line in the list: it says the run was selecting
+    from a family, and that the correction rather than the candidate made the
+    call.
+    """
+    shipped = {o.name for o in deployed}
+    rejected: list[RejectedCandidate] = []
+    for outcome in outcomes:
+        if outcome.name in shipped:
+            continue
+        reason = outcome.reason or "no holdout evidence"
+        if outcome.adjusted_p is not None and outcome.adjusted_p >= HOLDOUT_ALPHA:
+            reason = f"dropped by the Holm correction - {reason}"
+        rejected.append(RejectedCandidate(label=outcome.name, reason=reason))
+    return rejected
+
+
+def gate_lines(chain: Optional[GateChain]) -> list[str]:
+    """The gate ladder as flat text, including the gates that could not run."""
+    if chain is None:
+        return ["not reached - no candidate survived to be gated"]
+    if not chain.results:
+        return ["no gates ran"]
+    return [f"{r.name} ({r.status.value}): {r.message}" for r in chain.results]
+
+
+def emit_pull_request(
+    *,
+    repo: Path,
+    files: Sequence[str],
+    deployed: Sequence[SectionOutcome],
+    outcomes: Sequence[SectionOutcome],
+    timestamp: str,
+    output_dir: Path,
+    cost: Optional[CostReport] = None,
+    chain: Optional[GateChain] = None,
+    dataset: str = "",
+    iterations: Optional[int] = None,
+    notes: Sequence[str] = (),
+    push: bool = False,
+    open_pr: bool = False,
+    base: str = "main",
+) -> tuple[Optional[PullRequestPlan], int]:
+    """Branch, commit and render the pull request for a run that just wrote.
+
+    Local by default and local by design. The branch and ``PULL_REQUEST.md`` are
+    made here; the network is touched only for the steps the operator named. The
+    checkout is returned to the ref it started on in a ``finally``, so a failure
+    part way through leaves the reviewer where they were rather than parked on a
+    branch they did not ask for.
+
+    Returns the plan, or ``None`` when no branch could be made, and a process
+    exit code that is non-zero only when something explicitly requested did not
+    happen. A repo that is not a git checkout is reported and shrugged off: the
+    sections are already on disk, and failing the run after a successful write
+    would say something untrue about the write.
+    """
+    target = pr_target([o.name for o in deployed])
+    try:
+        plan = build_pull_request(
+            repo=repo,
+            target=target,
+            phase=PR_PHASE,
+            timestamp=timestamp,
+            files=list(files),
+            scores=holdout_score_lines(deployed),
+            cost=cost,
+            rejected=rejected_candidates(outcomes, deployed),
+            gates=gate_lines(chain),
+            dataset=dataset,
+            optimizer=", ".join(
+                dict.fromkeys(o.optimizer for o in deployed if o.optimizer)
+            ),
+            iterations=iterations,
+            statistics=holdout_statistics(deployed),
+            notes=list(notes),
+        )
+    except GitError as exc:
+        console.print(f"  [yellow]○ No pull request: {exc}[/yellow]")
+        console.print(
+            "  The evolved section(s) are on disk and the run's artifacts are "
+            f"in {output_dir}/, so the change can still be reviewed by hand."
+        )
+        return None, 0
+
+    code = 0
+    try:
+        body_path = plan.write_body(output_dir)
+        console.print(f"  [green]✓ Branch {plan.branch}[/green] ({len(files)} file(s))")
+        console.print(f"  PR body: {body_path}")
+
+        if push:
+            try:
+                plan.push()
+                console.print(f"  [green]✓ Pushed {plan.branch} to origin[/green]")
+            except GitError as exc:
+                console.print(f"  [red]✗ Push failed: {exc}[/red]")
+                console.print(
+                    "  The branch and the body are on this machine; nothing "
+                    "reached the remote."
+                )
+                return plan, EXIT_DEPLOYMENT_INCOMPLETE
+        else:
+            console.print("  Not pushed (--no-push is the default).")
+
+        if open_pr:
+            try:
+                plan.open(base=base)
+                console.print(f"  [green]✓ Opened a pull request against {base}[/green]")
+            except GitError as exc:
+                console.print(f"  [red]✗ Could not open the pull request: {exc}[/red]")
+                return plan, EXIT_DEPLOYMENT_INCOMPLETE
+        else:
+            console.print("  No pull request opened (--no-open-pr is the default).")
+    finally:
+        # Whatever happened above, the operator gets their checkout back. The
+        # commit lives on the evolve branch; leaving someone on it after a
+        # failed push is how an unrelated later commit ends up in this PR.
+        try:
+            plan.restore()
+            if plan.original_ref:
+                console.print(f"  Checkout restored to {plan.original_ref}.")
+        except GitError as exc:
+            console.print(
+                f"  [red]✗ Could not restore the checkout to "
+                f"{plan.original_ref}: {exc}[/red]"
+            )
+            console.print(f"  You are still on {plan.branch}.")
+            code = EXIT_DEPLOYMENT_INCOMPLETE
+
+    return plan, code
+
+
+def _save_metrics(output_dir: Path, metrics: dict) -> Path:
+    path = output_dir / "metrics.json"
+    path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    return path
+
+
 def evolve(
     section_names: Sequence[str] = (),
     all_sections: bool = False,
@@ -709,6 +978,10 @@ def evolve(
     max_turns: int = 6,
     num_workers: int = 4,
     seed: int = 0,
+    create_pr: bool = True,
+    push: bool = False,
+    open_pr: bool = False,
+    pr_base: str = "main",
 ) -> int:
     """Optimize one or more system prompt sections. Returns a process exit code."""
 
@@ -716,6 +989,30 @@ def evolve(
         "\n[bold cyan]🧬 Hermes Agent Self-Evolution[/bold cyan] "
         "- Phase 3: system prompt sections\n"
     )
+
+    # ── 0. Refuse impossible deployment combinations before spending ─────
+    #
+    # Checked here, at the top, because the alternative is discovering after a
+    # paid optimization run that the thing the operator asked for at the end
+    # was never going to happen.
+    if (push or open_pr) and not create_pr:
+        console.print(
+            "[red]✗ --no-create-pr leaves no branch to push or open a pull "
+            "request from[/red]"
+        )
+        return 1
+    if open_pr and not push:
+        console.print(
+            "[red]✗ --open-pr needs --push: gh cannot open a pull request for a "
+            "branch that exists only on this machine[/red]"
+        )
+        return 1
+    if (push or open_pr) and not write:
+        console.print(
+            "[red]✗ --push and --open-pr need --write: a pull request is only "
+            "built when a run actually deploys something[/red]"
+        )
+        return 1
 
     # ── 1. Resolve the repo and discover sections ───────────────────────
     _banner("Discovering sections")
@@ -846,10 +1143,25 @@ def evolve(
                 f"nothing this run measures could be called significant[/yellow]"
             )
         console.print(f"  Would write output to {output_dir}/")
+        console.print(
+            "  Would build a branch and a PR body only after an actual write "
+            f"({'--create-pr' if create_pr else '--no-create-pr'}); a dry run "
+            "builds neither, and nothing is ever pushed without --push."
+        )
         console.print(f"  [dim]{NEXT_SESSION_NOTICE}[/dim]")
         return 0
 
     # ── 4. Baseline behaviour ────────────────────────────────────────────
+    #
+    # The cost meter opens here and stops once the last holdout comparison is
+    # in. That is exactly the stretch of the run that calls a model - the
+    # baseline sweep, the optimizer, and the holdout - and PLAN.md wants the
+    # figure in the PR body. An ExitStack rather than a `with` block because
+    # the measured stretch covers five numbered stages, and wrapping all of
+    # them in another level of indentation would bury the structure.
+    cost_meter = ExitStack()
+    usage = cost_meter.enter_context(UsageTracker())
+
     _banner("Baseline behaviour")
     lm = dspy.LM(eval_model, temperature=0.0)
     dspy.configure(lm=lm)
@@ -920,7 +1232,9 @@ def evolve(
         outcomes.append(outcome)
 
     if not outcomes:
+        cost_meter.close()
         console.print("[red]✗ No section had scenarios to optimize against[/red]")
+        console.print(f"  Spent getting here: {usage.report.describe()}")
         return 1
 
     # ── 6. Constraints ───────────────────────────────────────────────────
@@ -1124,6 +1438,10 @@ def evolve(
             )
         deployable = survivors
 
+    # Everything that could call a model has run.
+    cost_meter.close()
+    cost = usage.report
+
     # ── 9. Results ───────────────────────────────────────────────────────
     table = Table(title="Phase 3 - System Prompt Evolution")
     table.add_column("Section", style="bold")
@@ -1223,6 +1541,22 @@ def evolve(
                 f"the point estimates say.[/yellow]"
             )
 
+    # ── 9c. Cost ─────────────────────────────────────────────────────────
+    #
+    # PLAN.md wants this figure in the PR body, and a reviewer deciding whether
+    # the run was worth repeating wants it on the console. It is reported
+    # whether or not anything is deployable: a run that spent money and shipped
+    # nothing is exactly the run whose cost is worth knowing.
+    _banner("Cost")
+    console.print(f"  {cost.describe()}")
+    for model, count in cost.models.items():
+        console.print(f"    {model}: {count} call(s)")
+    if not cost.complete:
+        console.print(
+            "  [yellow]○ Incomplete: the figure above is a lower bound, not the "
+            "full price of this run[/yellow]"
+        )
+
     # ── 10. Save ─────────────────────────────────────────────────────────
     output_dir.mkdir(parents=True, exist_ok=True)
     for outcome in outcomes:
@@ -1266,11 +1600,12 @@ def evolve(
         },
         "inventory": inventory.to_dict(),
         "gates": chain.to_dict() if chain else None,
+        "cost": cost.to_dict(),
         "sections": [o.to_dict() for o in outcomes],
+        # Filled in below when a write actually produced a branch.
+        "pull_request": None,
     }
-    (output_dir / "metrics.json").write_text(
-        json.dumps(metrics, indent=2), encoding="utf-8"
-    )
+    _save_metrics(output_dir, metrics)
     console.print(f"\n  Output saved to {output_dir}/")
 
     # ── 11. Write-back ───────────────────────────────────────────────────
@@ -1326,7 +1661,53 @@ def evolve(
     )
     console.print("  Neighbouring constants verified unchanged.")
     console.print(f"  [bold]{NEXT_SESSION_NOTICE}[/bold]")
-    return 0
+
+    # ── 12. Pull request ─────────────────────────────────────────────────
+    #
+    # PLAN.md constraint 5: evolved content reaches hermes-agent as a branch
+    # and a reviewable PR, never as a direct commit. Only reached because the
+    # write above happened - no write, no branch, and a dry run never gets
+    # here at all.
+    if not create_pr:
+        console.print("\n  No pull request requested (--no-create-pr).")
+        console.print(
+            f"  The write is in your working tree at {result.path}; commit it "
+            "yourself or re-run with --create-pr."
+        )
+        return 0
+
+    _banner("Pull request")
+    plan, code = emit_pull_request(
+        repo=repo,
+        files=[repo_relative(repo, result.path)],
+        deployed=improved,
+        outcomes=outcomes,
+        timestamp=timestamp,
+        output_dir=output_dir,
+        cost=cost,
+        chain=chain,
+        dataset=(
+            f"behavioural suite, {len(suite)} scenario(s) "
+            f"({len(train)} train / {len(val)} val / {len(holdout)} holdout), "
+            f"judged by {eval_model}"
+        ),
+        iterations=iterations,
+        notes=[
+            NEXT_SESSION_NOTICE,
+            f"Evaluation harness: {harness_reason}",
+            f"Gate ladder regression tolerance: {ZERO_REGRESSION_TOLERANCE:.0%}"
+            f"{', strict' if strict_gates else ''}",
+            "Run artifacts, including the baseline of every section and the "
+            f"scenarios used: {output_dir}/",
+        ],
+        push=push,
+        open_pr=open_pr,
+        base=pr_base,
+    )
+    if plan is not None:
+        metrics["pull_request"] = plan.to_dict()
+        _save_metrics(output_dir, metrics)
+    return code
 
 
 @click.command()
@@ -1352,6 +1733,25 @@ def evolve(
     default=False,
     help="Write accepted sections back to prompt_builder.py (default: no-write)",
 )
+@click.option(
+    "--create-pr/--no-create-pr",
+    default=True,
+    help=(
+        "On a write, branch and render PULL_REQUEST.md locally "
+        "(default: create-pr). Nothing leaves this machine either way."
+    ),
+)
+@click.option(
+    "--push/--no-push",
+    default=False,
+    help="Push the evolve branch to origin (default: no-push)",
+)
+@click.option(
+    "--open-pr/--no-open-pr",
+    default=False,
+    help="Open the pull request with gh; needs --push (default: no-open-pr)",
+)
+@click.option("--pr-base", default="main", help="Base branch for the pull request")
 def main(
     sections,
     all_sections,
@@ -1362,6 +1762,10 @@ def main(
     strict_gates,
     dry_run,
     write,
+    create_pr,
+    push,
+    open_pr,
+    pr_base,
 ):
     """Evolve hermes-agent system prompt sections with DSPy + GEPA."""
     code = evolve(
@@ -1374,6 +1778,10 @@ def main(
         strict_gates=strict_gates,
         dry_run=dry_run,
         write=write,
+        create_pr=create_pr,
+        push=push,
+        open_pr=open_pr,
+        pr_base=pr_base,
     )
     sys.exit(code)
 

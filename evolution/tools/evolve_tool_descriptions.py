@@ -3,9 +3,10 @@
 PLAN.md Phase 2. The pipeline, in order:
 
     catalogue -> selection dataset -> baseline -> GEPA -> constraints ->
-    cross-tool regression check -> gate ladder -> holdout -> write-back
+    cross-tool regression check -> gate ladder -> holdout -> write-back ->
+    pull request
 
-Three rules shape the whole thing:
+Five rules shape the whole thing:
 
 1. **All tools are always evaluated together.** Even when ``--tool`` narrows
    what may be rewritten, the selector sees the entire catalogue and the
@@ -17,16 +18,27 @@ Three rules shape the whole thing:
 3. **A gate that could not run says so.** hermes-agent ships no benchmarks
    today, so the TBLite gate reports UNAVAILABLE. ``--strict-gates`` turns that
    into a blocker for anyone who needs the gate to have actually run.
+4. **A write is deployed as a branch, never as a commit on your ref.** When the
+   run actually writes, it builds ``evolve/<target>-<timestamp>``, commits the
+   modified hermes-agent files onto it, drops PULL_REQUEST.md next to the run's
+   other artifacts, and puts the checkout back on the ref it started from. No
+   write means no branch, and a dry run builds nothing.
+5. **Nothing reaches the network unless it was asked for.** Building the branch
+   and writing the body are local. ``--push`` and ``--open-pr`` are separate
+   flags, both off by default, so a run cannot phone out to GitHub by accident.
 
 Usage:
     python -m evolution.tools.evolve_tool_descriptions --dry-run
     python -m evolution.tools.evolve_tool_descriptions --toolset file --iterations 8
     python -m evolution.tools.evolve_tool_descriptions --tool read_file --tool search_files --write
+    python -m evolution.tools.evolve_tool_descriptions --write --push --open-pr
 """
 
 from __future__ import annotations
 
 import json
+import re
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -41,7 +53,15 @@ from rich.table import Table
 
 from evolution.core.config import EvolutionConfig, resolve_hermes_agent_path
 from evolution.core.constraints import ConstraintValidator
+from evolution.core.cost import UsageTracker
 from evolution.core.gates import GateChain, run_benchmark_gate, run_pytest_gate
+from evolution.core.pr_builder import (
+    GitError,
+    PullRequestPlan,
+    RejectedCandidate,
+    ScoreLine,
+    build_pull_request,
+)
 from evolution.tools.accuracy import (
     DescriptionEntailment,
     FactualAccuracyChecker,
@@ -80,8 +100,11 @@ console = Console()
 __all__ = [
     "ConstraintOutcome",
     "build_accuracy_checker",
+    "collect_rejections",
     "enforce_constraints",
     "freeze_unselected",
+    "pr_target_slug",
+    "score_lines",
     "evolve_tool_descriptions",
     "main",
 ]
@@ -121,13 +144,25 @@ def freeze_unselected(
 
 @dataclass
 class ConstraintOutcome:
-    """What the constraint validator said about one description."""
+    """What the constraint validator said about one description.
+
+    ``messages`` is every check that ran, passing or not, because a reader of
+    the artifacts wants to see what was looked at. ``failures`` is the subset
+    that actually refused the rewrite, which is what the PR body quotes: a
+    reviewer reading "rejected because size_limit: Size OK" would rightly stop
+    trusting the report.
+    """
 
     target: str
     kind: str  # "tool_description" or "param_description"
     passed: bool
     reverted: bool
     messages: list[str] = field(default_factory=list)
+    failures: list[str] = field(default_factory=list)
+
+    def reason(self) -> str:
+        """Why this description was refused. Empty when it was not."""
+        return "; ".join(self.failures)
 
     def to_dict(self) -> dict:
         return {
@@ -136,6 +171,7 @@ class ConstraintOutcome:
             "passed": self.passed,
             "reverted": self.reverted,
             "messages": list(self.messages),
+            "failures": list(self.failures),
         }
 
 
@@ -211,6 +247,8 @@ def enforce_constraints(
                 else []
             )
             messages.extend(f"factual_accuracy: {f.describe()}" for f in findings)
+            reasons = [f"{c.constraint_name}: {c.message}" for c in failures]
+            reasons.extend(f"factual_accuracy: {f.describe()}" for f in findings)
             rejected = bool(failures or findings)
             if rejected:
                 kept.description = base.description
@@ -221,6 +259,7 @@ def enforce_constraints(
                     passed=not rejected,
                     reverted=rejected,
                     messages=messages,
+                    failures=reasons,
                 )
             )
 
@@ -240,6 +279,8 @@ def enforce_constraints(
                 else []
             )
             messages.extend(f"factual_accuracy: {f.describe()}" for f in findings)
+            reasons = [f"{c.constraint_name}: {c.message}" for c in failures]
+            reasons.extend(f"factual_accuracy: {f.describe()}" for f in findings)
             rejected = bool(failures or findings)
             if rejected:
                 kept.params[param] = base_text
@@ -250,6 +291,7 @@ def enforce_constraints(
                     passed=not rejected,
                     reverted=rejected,
                     messages=messages,
+                    failures=reasons,
                 )
             )
 
@@ -258,6 +300,175 @@ def enforce_constraints(
         result[tool_name] = kept
 
     return result, outcomes
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Deployment helpers
+# ──────────────────────────────────────────────────────────────────────────
+
+_UNSAFE_IN_A_BRANCH = re.compile(r"[^A-Za-z0-9._]+")
+
+
+def pr_target_slug(tools: Sequence[str], toolset: Optional[str] = None) -> str:
+    """A stable, branch-safe name for whatever this run evolved.
+
+    It lands in ``evolve/<target>-<timestamp>``, so it carries no spaces and no
+    slashes. One tool is named outright, a toolset run is named after its
+    toolset, and a whole-catalogue run says so rather than listing thirty tools
+    in a branch name.
+    """
+    names = [name for name in tools if name]
+    if len(names) == 1:
+        return _slugify(names[0])
+    if toolset:
+        return _slugify(f"{toolset}-toolset")
+    return "all-tools"
+
+
+def _slugify(text: str) -> str:
+    slug = _UNSAFE_IN_A_BRANCH.sub("-", text).strip("-.")
+    return slug or "tools"
+
+
+def score_lines(
+    baseline_report: CrossToolReport,
+    candidate_report: CrossToolReport,
+    val_examples: int,
+    baseline_holdout: object = None,
+    candidate_holdout: object = None,
+    holdout_examples: int = 0,
+) -> list[ScoreLine]:
+    """The before/after rows for the PR body, for the splits that were measured.
+
+    There is no train row: this phase never scores the train split, and an
+    invented number is worse than a missing one. Holdout goes last because
+    ``build_pull_request`` headlines the final row, and the split that was held
+    back is the one a reviewer should read first.
+    """
+    lines = [
+        ScoreLine(
+            split="val",
+            baseline=baseline_report.overall_accuracy,
+            evolved=candidate_report.overall_accuracy,
+            detail=(
+                f"{val_examples} examples, "
+                f"{candidate_report.chance_accuracy:.1%} chance across "
+                f"{candidate_report.num_options} options"
+            ),
+        )
+    ]
+    if baseline_holdout is not None and candidate_holdout is not None:
+        lines.append(
+            ScoreLine(
+                split="holdout",
+                baseline=baseline_holdout.tool_accuracy,
+                evolved=candidate_holdout.tool_accuracy,
+                detail=f"{holdout_examples} examples, never optimized against",
+            )
+        )
+    return lines
+
+
+def collect_rejections(
+    outcomes: Sequence[ConstraintOutcome],
+    verdict: Optional[CrossToolVerdict] = None,
+    holdout_verdict: Optional[CrossToolVerdict] = None,
+) -> list[RejectedCandidate]:
+    """Everything the run produced and refused, with the real reason attached.
+
+    PLAN.md wants these in the PR body. A body that shows only the surviving
+    rewrite hides how hard the constraint stage and the cross-tool guard were
+    working, and a reviewer cannot tell a careful run from a lucky one. Factual
+    reverts are in here on the same footing as budget failures, because that is
+    how ``enforce_constraints`` treats them.
+    """
+    rejected: list[RejectedCandidate] = []
+    for outcome in outcomes:
+        if outcome.reverted:
+            rejected.append(
+                RejectedCandidate(
+                    label=outcome.target,
+                    reason=outcome.reason() or "reverted to baseline",
+                )
+            )
+
+    for split, split_verdict in (("val", verdict), ("holdout", holdout_verdict)):
+        if split_verdict is None:
+            continue
+        for regression in split_verdict.regressions:
+            rejected.append(
+                RejectedCandidate(
+                    label=f"{regression.tool} ({split} cross-tool)",
+                    reason=regression.describe(),
+                )
+            )
+        # A verdict can refuse a candidate without naming a single regressed
+        # tool, for instance when an overall improvement was required and did
+        # not arrive. That refusal still belongs in the body.
+        if not split_verdict.accepted and not split_verdict.regressions:
+            rejected.append(
+                RejectedCandidate(
+                    label=f"whole candidate ({split} cross-tool)",
+                    reason=split_verdict.reason,
+                )
+            )
+    return rejected
+
+
+def _repo_relative(path: Path, repo: Path) -> str:
+    """A path git can stage, relative to the repo root when it lives there."""
+    try:
+        return str(Path(path).resolve().relative_to(Path(repo).resolve()))
+    except ValueError:
+        return str(path)
+
+
+def _current_git_ref(repo: Path) -> str:
+    """The ref *repo* is on, or an empty string when that cannot be read.
+
+    Best effort on purpose: a hermes-agent checkout that is not a git
+    repository is a reason to skip the PR, not a reason to end the run.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def _restore_checkout(
+    repo: Path, plan: Optional[PullRequestPlan], original_ref: str
+) -> None:
+    """Put *repo* back on the ref the run found it on. Never raises.
+
+    ``build_pull_request`` creates the branch before it can fail and has no
+    plan to hand back when it does, so the ref read before the call is the
+    fallback. Leaving an operator parked on an ``evolve/`` branch they did not
+    ask to be on is exactly the kind of surprise this pipeline is supposed to
+    avoid.
+    """
+    try:
+        if plan is not None:
+            plan.restore()
+        elif original_ref and original_ref != "HEAD":
+            subprocess.run(
+                ["git", "checkout", original_ref],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+    except Exception as exc:  # noqa: BLE001 - a cleanup path must not raise
+        console.print(
+            f"  [red]⚠ Could not restore {repo} to {original_ref or 'its original ref'}: "
+            f"{exc}[/red]"
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -386,8 +597,18 @@ def evolve_tool_descriptions(
     write: bool = False,
     regression_tolerance: float = DEFAULT_TOLERANCE,
     output_root: Optional[Path] = None,
+    create_pr: Optional[bool] = None,
+    push: bool = False,
+    open_pr: bool = False,
+    pr_base: str = "main",
 ) -> Optional[dict]:
-    """Run the full Phase 2 optimization. Returns the metrics it saved."""
+    """Run the full Phase 2 optimization. Returns the metrics it saved.
+
+    ``create_pr`` defaults to :attr:`EvolutionConfig.create_pr`. It only ever
+    does anything after a real write: no write, no branch, and a dry run builds
+    nothing at all. ``push`` and ``open_pr`` are the only two things here that
+    touch a network, and both are off unless the caller asks.
+    """
 
     config = EvolutionConfig(
         hermes_agent_path=resolve_hermes_agent_path(hermes_repo),
@@ -398,6 +619,8 @@ def evolve_tool_descriptions(
         run_pytest=run_tests,
     )
     repo = Path(config.hermes_agent_path)
+    # A dead field until now. An explicit flag wins; otherwise the config says.
+    create_pr = config.create_pr if create_pr is None else create_pr
 
     # ── 1. Load the catalogue ───────────────────────────────────────────
     console.print(
@@ -450,198 +673,220 @@ def evolve_tool_descriptions(
         console.print(
             "  Would " + ("write results back to the repo" if write else "leave the repo untouched")
         )
+        if write and create_pr:
+            console.print(
+                f"  Would then commit the modified files onto "
+                f"evolve/{pr_target_slug(selected.names, toolset)}-<timestamp> "
+                f"and write PULL_REQUEST.md beside the run artifacts"
+            )
+            console.print(
+                "  Would "
+                + ("push that branch" if push else "not push")
+                + " and would "
+                + (f"open a pull request against {pr_base}" if open_pr else "not open a pull request")
+            )
+        elif write:
+            console.print("  Would not build a branch (--no-create-pr)")
+        console.print("  A dry run builds no branch and sends nothing.")
         return None
 
     baseline_bundle = catalog.bundle()
     signatures = catalog_signatures(catalog)
 
-    # ── 2. Selection dataset ────────────────────────────────────────────
-    _banner("2. Tool-selection dataset")
-    dataset_dir = Path(dataset_path) if dataset_path else Path("datasets") / "tools" / (toolset or "all")
+    # Everything that can reach a language model happens inside this block:
+    # dataset generation, the baseline, the optimizer, and every evaluation.
+    # PLAN.md wants the cost of the run in the PR body, and a figure that
+    # skipped the optimizer would be the wrong figure.
+    with UsageTracker() as usage:
+        # ── 2. Selection dataset ────────────────────────────────────────────
+        _banner("2. Tool-selection dataset")
+        dataset_dir = Path(dataset_path) if dataset_path else Path("datasets") / "tools" / (toolset or "all")
 
-    if (dataset_dir / "train.jsonl").exists():
-        dataset = ToolSelectionDataset.load(dataset_dir)
-        console.print(f"  Loaded {len(dataset)} examples from {dataset_dir}/")
-    else:
-        console.print(f"  Generating with {config.judge_model} (all {len(catalog)} tools)")
-        builder = ToolSelectionDatasetBuilder(
-            catalog=catalog,
-            config=config,
-            lm=dspy.LM(config.judge_model, temperature=0.0),
+        if (dataset_dir / "train.jsonl").exists():
+            dataset = ToolSelectionDataset.load(dataset_dir)
+            console.print(f"  Loaded {len(dataset)} examples from {dataset_dir}/")
+        else:
+            console.print(f"  Generating with {config.judge_model} (all {len(catalog)} tools)")
+            builder = ToolSelectionDatasetBuilder(
+                catalog=catalog,
+                config=config,
+                lm=dspy.LM(config.judge_model, temperature=0.0),
+            )
+            dataset = builder.generate()
+            if not dataset.all_examples:
+                console.print("[red]✗ Dataset generation produced no usable examples[/red]")
+                sys.exit(1)
+            dataset.save(dataset_dir)
+            console.print(f"  Generated {len(dataset)} examples, saved to {dataset_dir}/")
+            if builder.rejected:
+                console.print(f"  [yellow]Rejected {len(builder.rejected)} generated case(s)[/yellow]")
+                for target, reason in builder.rejected[:5]:
+                    console.print(f"    {target}: {reason}")
+
+        console.print(
+            f"  Split: {len(dataset.train)} train / {len(dataset.val)} val / "
+            f"{len(dataset.holdout)} holdout"
         )
-        dataset = builder.generate()
-        if not dataset.all_examples:
-            console.print("[red]✗ Dataset generation produced no usable examples[/red]")
+        console.print(f"  Categories: {dataset.category_counts()}")
+
+        if not dataset.val:
+            console.print("[red]✗ The val split is empty; cannot measure a regression[/red]")
             sys.exit(1)
-        dataset.save(dataset_dir)
-        console.print(f"  Generated {len(dataset)} examples, saved to {dataset_dir}/")
-        if builder.rejected:
-            console.print(f"  [yellow]Rejected {len(builder.rejected)} generated case(s)[/yellow]")
-            for target, reason in builder.rejected[:5]:
-                console.print(f"    {target}: {reason}")
 
-    console.print(
-        f"  Split: {len(dataset.train)} train / {len(dataset.val)} val / "
-        f"{len(dataset.holdout)} holdout"
-    )
-    console.print(f"  Categories: {dataset.category_counts()}")
+        # ── 3. Baseline measurement ─────────────────────────────────────────
+        _banner("3. Baseline measurement")
+        lm = dspy.LM(config.eval_model, temperature=0.0)
+        dspy.configure(lm=lm)
 
-    if not dataset.val:
-        console.print("[red]✗ The val split is empty; cannot measure a regression[/red]")
-        sys.exit(1)
+        baseline_module = ToolSelector(baseline_bundle, signatures)
+        all_tools = list(catalog.names) + [NO_TOOL]
 
-    # ── 3. Baseline measurement ─────────────────────────────────────────
-    _banner("3. Baseline measurement")
-    lm = dspy.LM(config.eval_model, temperature=0.0)
-    dspy.configure(lm=lm)
-
-    baseline_module = ToolSelector(baseline_bundle, signatures)
-    all_tools = list(catalog.names) + [NO_TOOL]
-
-    with dspy.context(lm=lm):
-        baseline_val = evaluate_selection(dataset.val, selector_predict_fn(baseline_module))
-    baseline_report = CrossToolReport.from_report(baseline_val, tools=all_tools)
-
-    console.print(f"  Selection accuracy: {baseline_report.describe_accuracy()}")
-    console.print(f"  Parameter correctness: {baseline_val.param_accuracy:.1%}")
-    _print_confusions(baseline_report)
-
-    # ── 4. Optimize ─────────────────────────────────────────────────────
-    _banner("4. GEPA optimization")
-    console.print(f"  Optimizer model: {optimizer_model}")
-    console.print(f"  Eval model: {eval_model}")
-    console.print(f"  Iterations: {iterations}")
-
-    trainset = dataset.to_dspy_examples("train")
-    valset = dataset.to_dspy_examples("val")
-    start_time = time.time()
-    optimizer_used = "GEPA"
-
-    try:
-        optimizer = dspy.GEPA(
-            metric=gepa_selection_metric,
-            max_full_evals=iterations,
-            reflection_lm=dspy.LM(optimizer_model),
-        )
-        optimized_module = optimizer.compile(
-            baseline_module,
-            trainset=trainset,
-            valset=valset,
-        )
-    except Exception as exc:
-        # Fall back to MIPROv2 if GEPA isn't available in this DSPy version
-        console.print(f"[yellow]GEPA not available ({exc}), falling back to MIPROv2[/yellow]")
-        optimizer_used = "MIPROv2"
-        optimizer = dspy.MIPROv2(
-            metric=tool_selection_metric,
-            auto="light",
-        )
-        optimized_module = optimizer.compile(
-            baseline_module,
-            trainset=trainset,
-        )
-
-    elapsed = time.time() - start_time
-    console.print(f"\n  Optimization completed in {elapsed:.1f}s using {optimizer_used}")
-
-    raw_bundle = extract_bundle(optimized_module, baseline_bundle)
-    candidate_bundle = freeze_unselected(raw_bundle, baseline_bundle, selected.names)
-
-    # ── 5. Constraints ──────────────────────────────────────────────────
-    _banner("5. Constraint validation")
-    validator = ConstraintValidator(config)
-    accuracy = build_accuracy_checker(catalog, lm=lm)
-    candidate_bundle, constraint_outcomes = enforce_constraints(
-        candidate_bundle,
-        baseline_bundle,
-        validator,
-        allowed=selected.names,
-        accuracy=accuracy,
-    )
-    factual_reverts = sum(
-        1
-        for outcome in constraint_outcomes
-        if any(m.startswith("factual_accuracy:") for m in outcome.messages)
-    )
-    console.print(
-        "  Factual accuracy: schema-structural checks"
-        + (
-            " plus LLM entailment"
-            if accuracy.entailment_ran
-            else f" only ({accuracy.skipped_reason or 'entailment not run'})"
-        )
-    )
-
-    if not constraint_outcomes:
-        console.print("  No description changed, so nothing to validate.")
-    for outcome in constraint_outcomes:
-        icon = "✓" if outcome.passed else "✗"
-        colour = "green" if outcome.passed else "red"
-        note = "" if outcome.passed else " [reverted to baseline]"
-        console.print(f"  [{colour}]{icon} {outcome.target}[/{colour}]{note}")
-        for message in outcome.messages:
-            console.print(f"      {message}")
-
-    changes = diff_bundles(baseline_bundle, candidate_bundle)
-    console.print(f"  {len(changes)} description(s) changed after validation")
-
-    # ── 6. Cross-tool regression check ──────────────────────────────────
-    _banner("6. Cross-tool regression check")
-    candidate_module = ToolSelector(candidate_bundle, signatures)
-    with dspy.context(lm=lm):
-        candidate_val = evaluate_selection(dataset.val, selector_predict_fn(candidate_module))
-    candidate_report = CrossToolReport.from_report(candidate_val, tools=all_tools)
-
-    guard = CrossToolGuard(tolerance=regression_tolerance)
-    verdict = guard.compare(baseline_report, candidate_report)
-
-    console.print(_rates_table(baseline_report, candidate_report, verdict))
-    console.print(f"  Overall: {candidate_report.describe_accuracy()}")
-    icon = "✓" if verdict.accepted else "✗"
-    colour = "green" if verdict.accepted else "red"
-    console.print(f"  [{colour}]{icon} {verdict.summary()}[/{colour}]")
-    for regression in verdict.regressions:
-        console.print(f"    [red]{regression.describe()}[/red]")
-    if verdict.underpowered:
-        console.print(f"  [yellow]⚠ {verdict.power_note()}[/yellow]")
-    _print_confusions(candidate_report)
-
-    # ── 7. Gate ladder ──────────────────────────────────────────────────
-    _banner("7. Gate ladder")
-    chain = GateChain(strict=strict_gates)
-    gates = [lambda: verdict.to_gate_result()]
-    if run_tests:
-        gates.append(lambda: run_pytest_gate(repo))
-    gates.append(
-        lambda: run_benchmark_gate(
-            repo,
-            "tblite",
-            baseline=None,
-            regression_threshold=config.tblite_regression_threshold,
-            fast=True,
-        )
-    )
-    chain.run(*gates)
-    console.print(chain.summary())
-
-    # ── 8. Holdout ──────────────────────────────────────────────────────
-    _banner(f"8. Holdout evaluation ({len(dataset.holdout)} examples)")
-    if dataset.holdout:
         with dspy.context(lm=lm):
-            baseline_holdout = evaluate_selection(
-                dataset.holdout, selector_predict_fn(baseline_module)
+            baseline_val = evaluate_selection(dataset.val, selector_predict_fn(baseline_module))
+        baseline_report = CrossToolReport.from_report(baseline_val, tools=all_tools)
+
+        console.print(f"  Selection accuracy: {baseline_report.describe_accuracy()}")
+        console.print(f"  Parameter correctness: {baseline_val.param_accuracy:.1%}")
+        _print_confusions(baseline_report)
+
+        # ── 4. Optimize ─────────────────────────────────────────────────────
+        _banner("4. GEPA optimization")
+        console.print(f"  Optimizer model: {optimizer_model}")
+        console.print(f"  Eval model: {eval_model}")
+        console.print(f"  Iterations: {iterations}")
+
+        trainset = dataset.to_dspy_examples("train")
+        valset = dataset.to_dspy_examples("val")
+        start_time = time.time()
+        optimizer_used = "GEPA"
+
+        try:
+            optimizer = dspy.GEPA(
+                metric=gepa_selection_metric,
+                max_full_evals=iterations,
+                reflection_lm=dspy.LM(optimizer_model),
             )
-            candidate_holdout = evaluate_selection(
-                dataset.holdout, selector_predict_fn(candidate_module)
+            optimized_module = optimizer.compile(
+                baseline_module,
+                trainset=trainset,
+                valset=valset,
             )
-        holdout_baseline_report = CrossToolReport.from_report(baseline_holdout, tools=all_tools)
-        holdout_candidate_report = CrossToolReport.from_report(candidate_holdout, tools=all_tools)
-        holdout_verdict = guard.compare(holdout_baseline_report, holdout_candidate_report)
-        console.print(f"  {holdout_verdict.summary()}")
-    else:
-        baseline_holdout = candidate_holdout = None
-        holdout_verdict = None
-        console.print("  [yellow]No holdout examples; skipping[/yellow]")
+        except Exception as exc:
+            # Fall back to MIPROv2 if GEPA isn't available in this DSPy version
+            console.print(f"[yellow]GEPA not available ({exc}), falling back to MIPROv2[/yellow]")
+            optimizer_used = "MIPROv2"
+            optimizer = dspy.MIPROv2(
+                metric=tool_selection_metric,
+                auto="light",
+            )
+            optimized_module = optimizer.compile(
+                baseline_module,
+                trainset=trainset,
+            )
+
+        elapsed = time.time() - start_time
+        console.print(f"\n  Optimization completed in {elapsed:.1f}s using {optimizer_used}")
+
+        raw_bundle = extract_bundle(optimized_module, baseline_bundle)
+        candidate_bundle = freeze_unselected(raw_bundle, baseline_bundle, selected.names)
+
+        # ── 5. Constraints ──────────────────────────────────────────────────
+        _banner("5. Constraint validation")
+        validator = ConstraintValidator(config)
+        accuracy = build_accuracy_checker(catalog, lm=lm)
+        candidate_bundle, constraint_outcomes = enforce_constraints(
+            candidate_bundle,
+            baseline_bundle,
+            validator,
+            allowed=selected.names,
+            accuracy=accuracy,
+        )
+        factual_reverts = sum(
+            1
+            for outcome in constraint_outcomes
+            if any(m.startswith("factual_accuracy:") for m in outcome.messages)
+        )
+        console.print(
+            "  Factual accuracy: schema-structural checks"
+            + (
+                " plus LLM entailment"
+                if accuracy.entailment_ran
+                else f" only ({accuracy.skipped_reason or 'entailment not run'})"
+            )
+        )
+
+        if not constraint_outcomes:
+            console.print("  No description changed, so nothing to validate.")
+        for outcome in constraint_outcomes:
+            icon = "✓" if outcome.passed else "✗"
+            colour = "green" if outcome.passed else "red"
+            note = "" if outcome.passed else " [reverted to baseline]"
+            console.print(f"  [{colour}]{icon} {outcome.target}[/{colour}]{note}")
+            for message in outcome.messages:
+                console.print(f"      {message}")
+
+        changes = diff_bundles(baseline_bundle, candidate_bundle)
+        console.print(f"  {len(changes)} description(s) changed after validation")
+
+        # ── 6. Cross-tool regression check ──────────────────────────────────
+        _banner("6. Cross-tool regression check")
+        candidate_module = ToolSelector(candidate_bundle, signatures)
+        with dspy.context(lm=lm):
+            candidate_val = evaluate_selection(dataset.val, selector_predict_fn(candidate_module))
+        candidate_report = CrossToolReport.from_report(candidate_val, tools=all_tools)
+
+        guard = CrossToolGuard(tolerance=regression_tolerance)
+        verdict = guard.compare(baseline_report, candidate_report)
+
+        console.print(_rates_table(baseline_report, candidate_report, verdict))
+        console.print(f"  Overall: {candidate_report.describe_accuracy()}")
+        icon = "✓" if verdict.accepted else "✗"
+        colour = "green" if verdict.accepted else "red"
+        console.print(f"  [{colour}]{icon} {verdict.summary()}[/{colour}]")
+        for regression in verdict.regressions:
+            console.print(f"    [red]{regression.describe()}[/red]")
+        if verdict.underpowered:
+            console.print(f"  [yellow]⚠ {verdict.power_note()}[/yellow]")
+        _print_confusions(candidate_report)
+
+        # ── 7. Gate ladder ──────────────────────────────────────────────────
+        _banner("7. Gate ladder")
+        chain = GateChain(strict=strict_gates)
+        gates = [lambda: verdict.to_gate_result()]
+        if run_tests:
+            gates.append(lambda: run_pytest_gate(repo))
+        gates.append(
+            lambda: run_benchmark_gate(
+                repo,
+                "tblite",
+                baseline=None,
+                regression_threshold=config.tblite_regression_threshold,
+                fast=True,
+            )
+        )
+        chain.run(*gates)
+        console.print(chain.summary())
+
+        # ── 8. Holdout ──────────────────────────────────────────────────────
+        _banner(f"8. Holdout evaluation ({len(dataset.holdout)} examples)")
+        if dataset.holdout:
+            with dspy.context(lm=lm):
+                baseline_holdout = evaluate_selection(
+                    dataset.holdout, selector_predict_fn(baseline_module)
+                )
+                candidate_holdout = evaluate_selection(
+                    dataset.holdout, selector_predict_fn(candidate_module)
+                )
+            holdout_baseline_report = CrossToolReport.from_report(baseline_holdout, tools=all_tools)
+            holdout_candidate_report = CrossToolReport.from_report(candidate_holdout, tools=all_tools)
+            holdout_verdict = guard.compare(holdout_baseline_report, holdout_candidate_report)
+            console.print(f"  {holdout_verdict.summary()}")
+        else:
+            baseline_holdout = candidate_holdout = None
+            holdout_verdict = None
+            console.print("  [yellow]No holdout examples; skipping[/yellow]")
+
+    cost = usage.report
 
     # ── 9. Results ──────────────────────────────────────────────────────
     _banner("9. Results")
@@ -700,6 +945,10 @@ def evolve_tool_descriptions(
     )
     table.add_row("Optimizer", "", optimizer_used, "")
     table.add_row("Time", "", f"{elapsed:.1f}s", "")
+    # describe() says "at least $X" when a model had no published price or the
+    # DSPy log lost entries. Print it verbatim; a cost report that rounds an
+    # unknown down to zero is worse than no cost report.
+    table.add_row("Cost", "", cost.describe(), "")
 
     console.print()
     console.print(table)
@@ -797,10 +1046,115 @@ def evolve_tool_descriptions(
         "val_examples": len(dataset.val),
         "holdout_examples": len(dataset.holdout),
         "elapsed_seconds": elapsed,
+        "cost": cost.to_dict(),
         "written": bool(may_write and write_report and write_report.files_written),
+        "pull_request": None,
     }
-    (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+    metrics_path = output_dir / "metrics.json"
+
+    def save_metrics() -> None:
+        metrics_path.write_text(json.dumps(metrics, indent=2))
+
+    save_metrics()
     console.print(f"\n  Output saved to {output_dir}/")
+
+    # ── 12. Deployment ──────────────────────────────────────────────────
+    _banner("12. Deployment")
+    written_files = [
+        _repo_relative(path, repo)
+        for path in (write_report.files_written if write_report else [])
+    ]
+
+    if not metrics["written"] or not written_files:
+        # PLAN.md constraint 5 is about how a change reaches hermes-agent. A run
+        # that changed nothing has nothing to deploy, and inventing an empty
+        # branch for it would only add noise to the review queue.
+        console.print(
+            "  Nothing was written, so there is no branch to build and nothing "
+            "was pushed."
+        )
+    elif not create_pr:
+        console.print(
+            "  [yellow]--no-create-pr: the files were written in place and left "
+            "uncommitted. Nothing was pushed.[/yellow]"
+        )
+    else:
+        original_ref = _current_git_ref(repo)
+        plan: Optional[PullRequestPlan] = None
+        try:
+            plan = build_pull_request(
+                repo=repo,
+                target=pr_target_slug(selected.names, toolset),
+                phase="Phase 2 (tool descriptions)",
+                timestamp=timestamp,
+                files=written_files,
+                scores=score_lines(
+                    baseline_report,
+                    candidate_report,
+                    val_examples=len(dataset.val),
+                    baseline_holdout=baseline_holdout,
+                    candidate_holdout=candidate_holdout,
+                    holdout_examples=len(dataset.holdout),
+                ),
+                cost=cost,
+                rejected=collect_rejections(constraint_outcomes, verdict, holdout_verdict),
+                gates=chain.summary().splitlines(),
+                dataset=(
+                    f"{dataset_dir} - {len(dataset.train)} train / "
+                    f"{len(dataset.val)} val / {len(dataset.holdout)} holdout"
+                ),
+                optimizer=optimizer_used,
+                iterations=iterations,
+                statistics=verdict.summary(),
+                notes=[
+                    f"Reflection model: {optimizer_model}",
+                    f"Eval model: {eval_model}",
+                    f"Descriptions changed: {len(changes)}",
+                    f"Description size: {baseline_chars:,} to {candidate_chars:,} chars "
+                    f"({candidate_chars - baseline_chars:+,})",
+                    f"Optimization wall clock: {elapsed:.1f}s",
+                    f"Run artifacts: {output_dir}",
+                ],
+            )
+            body_path = plan.write_body(output_dir)
+            metrics["pull_request"] = plan.to_dict()
+            save_metrics()
+
+            console.print(f"  Branch: {plan.branch}")
+            console.print(f"  Commit: {len(written_files)} file(s) - {', '.join(written_files)}")
+            console.print(f"  PR body: {body_path}")
+
+            if push:
+                plan.push()
+                console.print("  Pushed the branch to origin, as --push asked.")
+            if open_pr:
+                if not push:
+                    console.print(
+                        "  [yellow]--open-pr without --push: gh can only open a "
+                        "pull request for a branch the remote already has.[/yellow]"
+                    )
+                plan.open(base=pr_base)
+                console.print(f"  Opened a pull request against {pr_base}, as --open-pr asked.")
+            if not push and not open_pr:
+                console.print(
+                    "  Nothing was pushed and no pull request was opened. The branch "
+                    "and PULL_REQUEST.md are local only."
+                )
+                console.print("  Re-run with --push --open-pr, or use them by hand.")
+            elif not open_pr:
+                console.print("  No pull request was opened.")
+        except GitError as exc:
+            console.print(f"  [red]✗ {exc}[/red]")
+            console.print(
+                "  The evolved descriptions are still in the run artifacts above."
+            )
+        finally:
+            _restore_checkout(repo, plan, original_ref)
+            if plan is not None:
+                console.print(
+                    f"  {repo} is back on {plan.original_ref or original_ref}; the "
+                    f"change lives on the branch, not on your checkout."
+                )
 
     improvement = candidate_report.overall_accuracy - baseline_report.overall_accuracy
     if verdict.accepted and improvement > 0:
@@ -840,6 +1194,27 @@ def evolve_tool_descriptions(
     type=float,
     help="How far one tool's selection rate may fall before rejection (0 = not at all)",
 )
+@click.option(
+    "--create-pr/--no-create-pr",
+    "create_pr",
+    default=None,
+    help=(
+        "After a write, commit the modified files onto evolve/<target>-<timestamp> "
+        "and write PULL_REQUEST.md beside the run artifacts "
+        "(default: EvolutionConfig.create_pr). Local only; see --push"
+    ),
+)
+@click.option(
+    "--push/--no-push",
+    default=False,
+    help="Push the deployment branch to origin. Off by default: nothing leaves this machine unasked",
+)
+@click.option(
+    "--open-pr/--no-open-pr",
+    default=False,
+    help="Open the pull request with gh. Off by default, and needs the branch pushed",
+)
+@click.option("--pr-base", default="main", help="Base branch for the pull request")
 def main(
     tools,
     toolset,
@@ -853,6 +1228,10 @@ def main(
     dry_run,
     write,
     regression_tolerance,
+    create_pr,
+    push,
+    open_pr,
+    pr_base,
 ):
     """Evolve hermes-agent tool descriptions using DSPy + GEPA optimization."""
     evolve_tool_descriptions(
@@ -868,6 +1247,10 @@ def main(
         dry_run=dry_run,
         write=write,
         regression_tolerance=regression_tolerance,
+        create_pr=create_pr,
+        push=push,
+        open_pr=open_pr,
+        pr_base=pr_base,
     )
 
 

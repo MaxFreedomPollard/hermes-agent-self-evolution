@@ -15,7 +15,7 @@ The shape of the run reflects that.
     guardrails first    safety.py, before anything expensive runs
     then fitness        pytest as a hard gate, then benchmark, bug, quality
     rank honestly       the margin over the runner-up, and whether it means anything
-    emit a branch       and a diff, and stop
+    emit a branch       and a diff, and a PR body, and stop
 
 Every number this command prints carries what is behind it. A score appears
 with its evidence coverage, so a 0.85 from one heuristic never looks like a
@@ -35,15 +35,22 @@ non-zero exit and says so. It does not quietly substitute a weaker mutation
 source and present the result as evolution.
 
 **No auto-merge.** PLAN.md requires human review of every line of evolved
-code, so the deliverable is a git branch plus a diff. This command never
-merges, never pushes, and always puts the operator back on the branch they
-started on.
+code, so the deliverable is a git branch, a diff and a PULL_REQUEST.md that
+carries the scores, the evidence, the cost and every candidate the guardrails
+threw out. This command never merges, and always puts the operator back on the
+branch they started on. It does not push and does not open a PR unless asked:
+``--push`` and ``--open-pr`` are separate, and both default to off, because an
+optimization run that phoned out to GitHub on its own would be a bad surprise.
+
+The branch here is the one ``CodeOrganism`` already created, so there is no
+second branch mechanism. Only the body is new.
 
 Exit codes:
     0   the run completed (a winner, or nothing that survived the guardrails)
     1   setup problem: no repo, no target, dirty tree, red baseline
     2   Darwinian Evolver is not installed
     3   the evolver ran but produced no candidate to score
+    4   the run completed, but an explicitly requested push or PR open failed
 """
 
 from __future__ import annotations
@@ -66,8 +73,19 @@ from rich.panel import Panel
 from rich.table import Table
 
 from evolution.core.config import resolve_hermes_agent_path
+from evolution.core.cost import CostReport, UsageTracker
 from evolution.core.gates import GateStatus
+from evolution.core.pr_builder import (
+    PullRequestPlan,
+    RejectedCandidate,
+    ScoreLine,
+    render_body,
+)
+# organism.py has a GitError of its own for the branch work, so the deployment
+# one is spelled out rather than shadowing it.
+from evolution.core.pr_builder import GitError as DeploymentGitError
 from evolution.code.fitness_code import (
+    BaselineSnapshot,
     BugReproduction,
     CandidateRanking,
     CodeFitness,
@@ -94,9 +112,18 @@ __all__ = [
     "ExternalEvolver",
     "BugFixBrief",
     "MUTATION_CONSTRAINTS",
+    "PHASE_LABEL",
+    "OPTIMIZER_LABEL",
+    "EVOLVER_COST_NOTE",
+    "REVIEW_NOTE",
     "find_evolver",
     "resolve_tool_file",
     "build_objective",
+    "code_score_lines",
+    "code_rejected_candidates",
+    "code_statistics",
+    "code_gate_lines",
+    "build_code_pull_request",
     "evolve_tool_code",
     "main",
 ]
@@ -539,6 +566,332 @@ class CandidateOutcome:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Pull request
+# ──────────────────────────────────────────────────────────────────────────
+#
+# PLAN.md constraint 5 is "Deployment via PR (Never Direct Commit)". Phase 4
+# already ends on a branch CodeOrganism created and a diff it produced, so
+# nothing here creates a second branch: this section renders the body PLAN.md
+# asks for and hands back a plan bound to the branch that already exists.
+# Writing that body is local. Pushing it and opening the PR are not, and are
+# never done unless the operator asked for them by name.
+
+
+PHASE_LABEL = "Phase 4 (tool implementation code)"
+
+OPTIMIZER_LABEL = "Darwinian Evolver, driven as an external CLI subprocess"
+
+# The mutation engine is a separate process. Its model calls never enter dspy's
+# history, so no tracker inside this process can see them, and a total that
+# quietly omits the engine that did the actual work reads as the cost of the
+# run when it is not. Naming the gap costs a sentence.
+EVOLVER_COST_NOTE = (
+    "Cost above covers this pipeline's own model calls only. Darwinian Evolver "
+    "runs as a separate subprocess, so its model usage never reaches dspy's "
+    "history and is not included. PLAN.md budgets roughly $2-9 per task for it, "
+    "so read the true cost of this run as the figure above plus whatever the "
+    "evolver spent."
+)
+
+REVIEW_NOTE = (
+    "PLAN.md requires human review of every line of evolved code. Nothing was "
+    "merged and nothing merges itself - this is a branch, a diff and a body, "
+    "and it stays that way until a person decides otherwise."
+)
+
+# Long enough to show a real fix, short enough that a reviewer still scrolls.
+MAX_REPORTED_TESTS = 5
+
+
+def _one_line(text: object) -> str:
+    """Collapse anything into a single line of prose."""
+    return " ".join(str(text).split())
+
+
+def _cell(text: object) -> str:
+    """A single line that is safe inside a markdown table cell."""
+    return _one_line(text).replace("|", "\\|")
+
+
+def code_score_lines(
+    baseline: BaselineSnapshot, winner: CandidateOutcome
+) -> list[ScoreLine]:
+    """Baseline versus winner on everything the run actually measured.
+
+    The composite row carries its evidence coverage in the same cell as the
+    score, for the reason the console table does: a 0.85 backed by tests, a
+    benchmark and a reproduction and a 0.85 backed by one quality heuristic
+    print as the same number, and only one of them is worth a reviewer's
+    afternoon.
+    """
+    fitness = winner.fitness
+
+    evidence = f"evidence {fitness.evidence_coverage:.0%}"
+    if fitness.missing_evidence:
+        evidence += f", no {' or '.join(fitness.missing_evidence)}"
+    lines = [
+        ScoreLine(
+            "composite fitness",
+            0.0,
+            fitness.total,
+            _cell(
+                f"{evidence}. The baseline scores 0 by construction: a candidate "
+                "identical to it is refused before it is ever scored"
+            ),
+        )
+    ]
+
+    trials = fitness.repro_trials
+    if trials is not None and trials.measured_runs:
+        baseline_trials = baseline.repro_trials
+        before = (
+            baseline_trials.fix_rate
+            if baseline_trials is not None and baseline_trials.measured_runs
+            else 0.0
+        )
+        lines.append(
+            ScoreLine(
+                "bug reproduction fix rate",
+                before,
+                trials.fix_rate,
+                _cell(trials.describe()),
+            )
+        )
+
+    suite = fitness.suite
+    if suite is not None and suite.n:
+        lines.append(
+            ScoreLine(
+                "test suite pass rate",
+                suite.paired.baseline_rate,
+                suite.paired.candidate_rate,
+                _cell(
+                    f"{suite.n} test(s) paired by node id, {suite.verdict}"
+                ),
+            )
+        )
+
+    baselines = baseline.benchmark_baselines()
+    for result in fitness.benchmark_results:
+        if result.score is None:
+            continue
+        before = baselines.get(result.name, result.baseline)
+        if before is None:
+            # No baseline measurement means no before/after to state. The gate
+            # line still reports what the benchmark said.
+            continue
+        lines.append(ScoreLine(result.name, before, result.score, _cell(result.message)))
+
+    return lines
+
+
+def _rejection_detail(fitness: CodeFitness) -> str:
+    """Why one candidate was refused, in the guardrail's own words.
+
+    A reviewer of evolved *code* needs this more than a reviewer of evolved
+    text does. "3 candidates rejected" says a filter ran; "the signature guard
+    caught a new parameter on a public function" says what it caught.
+    """
+    if not fitness.safety.passed:
+        spelled = [
+            f"{failure.name}: {'; '.join(failure.violations) or failure.message}"
+            for failure in fitness.safety.failures
+        ]
+        return _one_line(
+            "refused by the safety guardrails - " + " / ".join(spelled)
+        )
+
+    if fitness.pytest_result.status is GateStatus.FAILED:
+        detail = (
+            "refused by the hard pytest gate - " + fitness.pytest_result.message
+        )
+        suite = fitness.suite
+        if suite is not None and suite.newly_failing:
+            shown = ", ".join(suite.newly_failing[:MAX_REPORTED_TESTS])
+            extra = len(suite.newly_failing) - MAX_REPORTED_TESTS
+            detail += f" (newly failing: {shown}"
+            detail += f", and {extra} more)" if extra > 0 else ")"
+        return _one_line(detail)
+
+    return _one_line(fitness.rejection_reason or "refused, no reason recorded")
+
+
+def code_rejected_candidates(
+    outcomes: Sequence[CandidateOutcome],
+) -> list[RejectedCandidate]:
+    """Every candidate the run threw away, with the reason it was thrown away."""
+    return [
+        RejectedCandidate(o.candidate.label, _rejection_detail(o.fitness))
+        for o in outcomes
+        if not o.fitness.accepted
+    ]
+
+
+def code_statistics(
+    baseline: BaselineSnapshot,
+    winner: CandidateOutcome,
+    ranking: Optional[CandidateRanking] = None,
+) -> str:
+    """The evidence section: the paired suite and the measured fix rate.
+
+    Both of these the phase already computes. Leaving them in the metrics file
+    and out of the PR body would mean the reviewer with the least context gets
+    the least evidence.
+    """
+    fitness = winner.fitness
+    lines: list[str] = []
+
+    suite = fitness.suite
+    if suite is not None:
+        lines.append(
+            f"- Paired test suite, baseline versus {winner.candidate.label}, "
+            f"McNemar on outcomes paired by node id: {_one_line(suite.describe())}"
+        )
+        if suite.newly_failing:
+            shown = ", ".join(suite.newly_failing[:MAX_REPORTED_TESTS])
+            lines.append(f"  - Newly failing: {shown}")
+    else:
+        lines.append(
+            "- Paired test suite: not available. No per-test outcomes were "
+            "recorded on one side, so there was nothing legitimate to pair - "
+            "which is not the same as no change."
+        )
+
+    trials = fitness.repro_trials
+    if trials is not None and trials.measured_runs:
+        lines.append(
+            f"- Reproduction, {trials.measured_runs} measured run(s): "
+            f"{_one_line(trials.describe())} (Wilson interval at "
+            f"{trials.confidence:.0%})"
+        )
+        if trials.power_note:
+            lines.append(f"  - {_one_line(trials.power_note)}")
+        baseline_trials = baseline.repro_trials
+        if baseline_trials is not None and baseline_trials.measured_runs:
+            lines.append(
+                f"  - At baseline: {_one_line(baseline_trials.describe())}"
+            )
+    else:
+        lines.append(
+            "- Reproduction: none measured, so nothing here demonstrates that a "
+            "bug was fixed. The score rests on the suite and the heuristics."
+        )
+
+    if ranking is not None:
+        lines.append(f"- Ranking: {_one_line(ranking.describe())}")
+
+    return "\n".join(lines)
+
+
+def code_gate_lines(winner: CandidateOutcome) -> list[str]:
+    """What gated the winner, and what each gate said."""
+    fitness = winner.fitness
+    gates = [
+        f"safety guardrails: {len(fitness.safety.results)} check(s), "
+        f"{'all passed' if fitness.safety.passed else 'failed'}",
+        f"pytest (hard gate, zero tolerance): "
+        f"{fitness.pytest_result.status.value} - "
+        f"{_one_line(fitness.pytest_result.message)}",
+    ]
+    for result in fitness.benchmark_results:
+        gates.append(
+            f"{result.name}: {result.status.value} - {_one_line(result.message)}"
+        )
+    trials = fitness.repro_trials
+    if trials is not None:
+        gates.append(f"bug reproduction: {_one_line(trials.message)}")
+    return gates
+
+
+def build_code_pull_request(
+    *,
+    repo: Path,
+    branch: str,
+    target: str,
+    baseline: BaselineSnapshot,
+    winner: CandidateOutcome,
+    diff: str,
+    outcomes: Sequence[CandidateOutcome] = (),
+    ranking: Optional[CandidateRanking] = None,
+    cost: Optional[CostReport] = None,
+    iterations: Optional[int] = None,
+    bug_issue: Optional[str] = None,
+    repro_script: Optional[str] = None,
+    repro_runs: int = 1,
+    baseline_sha: str = "",
+    winner_sha: str = "",
+) -> PullRequestPlan:
+    """Render the PR body for the branch the organism already built.
+
+    Deliberately not :func:`evolution.core.pr_builder.build_pull_request`:
+    that one creates ``evolve/<target>-<timestamp>`` and commits into it, and
+    Phase 4 already has a branch with the winning commit on it. Two branch
+    mechanisms racing over one checkout is exactly the failure this phase
+    cannot afford, so the plan returned here is bound to the existing branch
+    and never checks anything out. ``created_branch`` is False for the same
+    reason: the organism owns the restore, and ``restore()`` here must not
+    second-guess it.
+
+    Nothing in this function touches the network.
+    """
+    dataset_parts = [
+        f"hermes-agent pytest suite ({len(baseline.test_outcomes)} test(s) "
+        "recorded at baseline)"
+    ]
+    if repro_script:
+        dataset_parts.append(
+            f"reproduction {Path(repro_script).name} x{repro_runs} per candidate"
+        )
+    else:
+        dataset_parts.append("no reproduction supplied")
+
+    notes = [EVOLVER_COST_NOTE, REVIEW_NOTE]
+    if bug_issue:
+        notes.append(f"Target bug: issue {bug_issue}")
+    notes.append(f"Branch: `{branch}` in {repo}")
+    if baseline_sha:
+        review = f"git diff {baseline_sha[:8]} {branch} -- {target}"
+        notes.append(f"Review the change with: `{review}`")
+    if winner_sha:
+        notes.append(f"Winning commit: `{winner_sha[:8]}` ({winner.candidate.label})")
+
+    body = render_body(
+        target=target,
+        phase=PHASE_LABEL,
+        scores=code_score_lines(baseline, winner),
+        diff=diff,
+        cost=cost,
+        rejected=code_rejected_candidates(outcomes),
+        gates=code_gate_lines(winner),
+        dataset=", ".join(dataset_parts),
+        optimizer=OPTIMIZER_LABEL,
+        iterations=iterations,
+        statistics=code_statistics(baseline, winner, ranking),
+        notes=notes,
+    )
+
+    title = f"evolve: {target}"
+    if bug_issue:
+        title += f" (issue {bug_issue})"
+
+    return PullRequestPlan(
+        repo=Path(repo),
+        branch=branch,
+        title=title,
+        # The organism made this commit; nothing here commits anything.
+        commit_message=(
+            winner.mutation.message
+            if winner.mutation
+            else f"evolve({Path(target).stem}): {winner.candidate.label}"
+        ),
+        body=body,
+        files=(target,),
+        created_branch=False,
+        original_ref="",
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Console helpers
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -577,6 +930,11 @@ def evolve_tool_code(
     output_root: Optional[Path] = None,
     evolver: Optional[ProposesCandidates] = None,
     repro_runs: int = 1,
+    write_pr: bool = True,
+    push: bool = False,
+    open_pr: bool = False,
+    remote: str = "origin",
+    base: str = "main",
 ) -> int:
     """Run one code-evolution pass. Returns a process exit code.
 
@@ -589,6 +947,15 @@ def evolve_tool_code(
     One is a single Bernoulli trial and is enough for a deterministic repro;
     raise it for anything that touches time, the filesystem or a subprocess,
     where one clean pass and a fix are not the same thing.
+
+    *write_pr* writes PULL_REQUEST.md beside the run's other artifacts when a
+    winner exists. That is a local file next to a local branch, so it happens
+    by default - but only when there is something to deploy. A dry run, a run
+    with no survivor and a run whose winner is identical to the baseline all
+    build nothing.
+
+    *push* and *open_pr* are the two steps that leave this machine, and both
+    default to off. Each has to be asked for by name.
     """
     console.print(
         "\n[bold cyan]🧬 Hermes Agent Self-Evolution[/bold cyan] - "
@@ -674,6 +1041,16 @@ def evolve_tool_code(
             + (f", bug reproduction x{repro_runs}" if repro else "")
         )
         console.print("  Would emit a branch and a diff. Never a merge.")
+        console.print(
+            "  Would write PULL_REQUEST.md beside the artifacts"
+            if write_pr
+            else "  Would not write a PR body (--no-write-pr)"
+        )
+        console.print(
+            f"  Would {'push to ' + remote if push else 'not push'} and "
+            f"would {'open a PR against ' + base if open_pr else 'not open a PR'}"
+        )
+        console.print("[dim]  A dry run builds nothing: no branch, no body.[/dim]")
         return 0
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -767,86 +1144,94 @@ def evolve_tool_code(
 
         # ── 5. Ask the evolver ──────────────────────────────────────────
         _step("Mutation")
-        objective = build_objective(
-            tool_module=relpath,
-            bug_issue=f"issue {bug_issue}" if bug_issue else None,
-            reproduction=repro_source,
-        )
-        console.print(f"  Objective: {objective}")
-
-        job = EvolverJob(
-            target_path=relpath,
-            source=baseline_source,
-            objective=objective,
-            iterations=iterations,
-            bug_issue=str(bug_issue) if bug_issue else None,
-            reproduction=repro_source,
-            reproduction_path=str(repro.script) if repro else None,
-        )
-
-        engine: ProposesCandidates = evolver or ExternalEvolver(
-            cmd=evolver_argv or [],
-            repo=Path(repo),
-            workdir=out_dir,
-        )
-
-        try:
-            candidates = engine.propose(job)
-        except EvolverNotInstalled as exc:
-            console.print(f"[red]✗ {exc}[/red]")
-            return 2
-        except EvolverError as exc:
-            console.print(f"[red]✗ {exc}[/red]")
-            return 3
-
-        console.print(f"  Received {len(candidates)} candidate(s)")
-
-        # ── 6. Guardrails, then fitness, one candidate at a time ────────
-        _step("Evaluation")
-        for candidate in candidates:
-            console.print(f"\n  [bold]{candidate.label}[/bold] {candidate.notes}".rstrip())
-            mutation = organism.mutate(
-                candidate.source,
-                label=candidate.label,
-                message=(
-                    f"evolve({Path(relpath).stem}): candidate {candidate.label}"
-                    + (f" for issue {bug_issue}" if bug_issue else "")
-                ),
+        # Everything this pipeline spends on model calls happens between here
+        # and the end of the candidate loop, so that is what gets measured.
+        # The evolver's own spend is not in it and cannot be: it is a separate
+        # process, and EVOLVER_COST_NOTE says so wherever the total is shown.
+        with UsageTracker() as usage:
+            objective = build_objective(
+                tool_module=relpath,
+                bug_issue=f"issue {bug_issue}" if bug_issue else None,
+                reproduction=repro_source,
             )
-            if mutation.is_empty:
-                console.print("    [dim]no textual change[/dim]")
+            console.print(f"  Objective: {objective}")
 
-            fitness = evaluator.evaluate(
-                baseline_source, candidate.source, label=candidate.label
+            job = EvolverJob(
+                target_path=relpath,
+                source=baseline_source,
+                objective=objective,
+                iterations=iterations,
+                bug_issue=str(bug_issue) if bug_issue else None,
+                reproduction=repro_source,
+                reproduction_path=str(repro.script) if repro else None,
             )
-            for line in fitness.safety.summary().splitlines():
-                console.print(f"    {line}")
-            if fitness.pytest_result.status is not GateStatus.SKIPPED:
-                console.print(
-                    f"    {_gate_icon(fitness.pytest_result.status)} pytest: "
-                    f"{fitness.pytest_result.message}"
+
+            engine: ProposesCandidates = evolver or ExternalEvolver(
+                cmd=evolver_argv or [],
+                repo=Path(repo),
+                workdir=out_dir,
+            )
+
+            try:
+                candidates = engine.propose(job)
+            except EvolverNotInstalled as exc:
+                console.print(f"[red]✗ {exc}[/red]")
+                return 2
+            except EvolverError as exc:
+                console.print(f"[red]✗ {exc}[/red]")
+                return 3
+
+            console.print(f"  Received {len(candidates)} candidate(s)")
+
+            # ── 6. Guardrails, then fitness, one candidate at a time ────
+            _step("Evaluation")
+            for candidate in candidates:
+                console.print(f"\n  [bold]{candidate.label}[/bold] {candidate.notes}".rstrip())
+                mutation = organism.mutate(
+                    candidate.source,
+                    label=candidate.label,
+                    message=(
+                        f"evolve({Path(relpath).stem}): candidate {candidate.label}"
+                        + (f" for issue {bug_issue}" if bug_issue else "")
+                    ),
                 )
-            shown = ""
-            if fitness.suite:
-                shown = f"suite vs baseline: {fitness.suite.describe()}"
-                console.print(f"    suite: {fitness.suite.describe()}")
-            if fitness.repro:
-                console.print(f"    repro: {fitness.repro.message}")
-            # Everything else the evaluator wanted on the record, including the
-            # power notes. A caveat kept out of the console is a caveat nobody
-            # reads.
-            for note in fitness.notes:
-                if note != shown:
-                    console.print(f"    [dim]{note}[/dim]")
-            if fitness.accepted:
-                console.print(f"    [green]accepted[/green] score {fitness.score_line()}")
-            else:
-                console.print(f"    [red]rejected[/red] {fitness.rejection_reason}")
+                if mutation.is_empty:
+                    console.print("    [dim]no textual change[/dim]")
 
-            outcomes.append(CandidateOutcome(candidate, fitness, mutation))
-            # Candidates are alternatives generated from the same baseline, not
-            # a sequence. Rewind so the next one is scored against baseline too.
-            organism.revert_last()
+                fitness = evaluator.evaluate(
+                    baseline_source, candidate.source, label=candidate.label
+                )
+                for line in fitness.safety.summary().splitlines():
+                    console.print(f"    {line}")
+                if fitness.pytest_result.status is not GateStatus.SKIPPED:
+                    console.print(
+                        f"    {_gate_icon(fitness.pytest_result.status)} pytest: "
+                        f"{fitness.pytest_result.message}"
+                    )
+                shown = ""
+                if fitness.suite:
+                    shown = f"suite vs baseline: {fitness.suite.describe()}"
+                    console.print(f"    suite: {fitness.suite.describe()}")
+                if fitness.repro:
+                    console.print(f"    repro: {fitness.repro.message}")
+                # Everything else the evaluator wanted on the record, including
+                # the power notes. A caveat kept out of the console is a caveat
+                # nobody reads.
+                for note in fitness.notes:
+                    if note != shown:
+                        console.print(f"    [dim]{note}[/dim]")
+                if fitness.accepted:
+                    console.print(f"    [green]accepted[/green] score {fitness.score_line()}")
+                else:
+                    console.print(f"    [red]rejected[/red] {fitness.rejection_reason}")
+
+                outcomes.append(CandidateOutcome(candidate, fitness, mutation))
+                # Candidates are alternatives generated from the same baseline,
+                # not a sequence. Rewind so the next one is scored against the
+                # baseline too.
+                organism.revert_last()
+
+        cost = usage.report
 
         # ── 7. Pick a winner and re-apply it ────────────────────────────
         accepted = [o for o in outcomes if o.fitness.accepted]
@@ -924,12 +1309,46 @@ def evolve_tool_code(
                     f"{ranking.winner_coverage:.0%} of the intended weight[/dim]"
                 )
 
-        # ── 9. Emit the branch and the diff ─────────────────────────────
+        console.print(f"\n  Cost: {cost.describe()}")
+        console.print(f"  [dim]{EVOLVER_COST_NOTE}[/dim]")
+
+        # ── 9. Emit the branch, the diff and the PR body ────────────────
         (out_dir / "baseline.py").write_text(baseline_source, encoding="utf-8")
         for outcome in outcomes:
             (out_dir / f"{outcome.candidate.label}.py").write_text(
                 outcome.candidate.source, encoding="utf-8"
             )
+
+        # No winner, or a winner that changed nothing, means there is nothing
+        # to deploy - and nothing to deploy means no PR body. A run that
+        # produced no diff should not leave a document implying it did.
+        deployable = bool(winner and winner_diff.strip())
+        pr_plan: Optional[PullRequestPlan] = None
+        pr_body_path: Optional[Path] = None
+
+        if deployable:
+            (out_dir / "winner.py").write_text(winner.candidate.source, encoding="utf-8")
+            (out_dir / "winner.diff").write_text(winner_diff, encoding="utf-8")
+            if write_pr or push or open_pr:
+                pr_plan = build_code_pull_request(
+                    repo=Path(repo),
+                    branch=organism.branch or "",
+                    target=relpath,
+                    baseline=baseline,
+                    winner=winner,
+                    diff=winner_diff,
+                    outcomes=outcomes,
+                    ranking=ranking,
+                    cost=cost,
+                    iterations=iterations,
+                    bug_issue=str(bug_issue) if bug_issue else None,
+                    repro_script=str(repro.script) if repro else None,
+                    repro_runs=repro_runs,
+                    baseline_sha=organism.baseline_sha or "",
+                    winner_sha=final.sha if final else "",
+                )
+            if pr_plan is not None and write_pr:
+                pr_body_path = pr_plan.write_body(out_dir)
 
         metrics = {
             "tool": tool,
@@ -950,12 +1369,13 @@ def evolve_tool_code(
             "ranking": ranking.to_dict() if ranking else None,
             "winner": winner.candidate.label if winner else None,
             "winner_sha": final.sha if final else None,
+            "cost": cost.to_dict(),
+            "cost_excludes": EVOLVER_COST_NOTE,
+            "pull_request": pr_plan.to_dict() if pr_plan else None,
         }
         (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
-        if winner and winner_diff.strip():
-            (out_dir / "winner.py").write_text(winner.candidate.source, encoding="utf-8")
-            (out_dir / "winner.diff").write_text(winner_diff, encoding="utf-8")
+        if deployable:
             extra_lines = ""
             if ranking is not None and ranking.margin is not None:
                 extra_lines += f"Margin:  {ranking.margin:+.3f} over {ranking.runner_up}"
@@ -967,6 +1387,10 @@ def evolve_tool_code(
                 extra_lines += f"Repro:   {trials.describe()}\n"
             if winner.fitness.suite is not None:
                 extra_lines += f"Suite:   {winner.fitness.suite.describe()}\n"
+            if pr_body_path is not None:
+                extra_lines += f"PR body: {pr_body_path}\n"
+            else:
+                extra_lines += "PR body: not written (--no-write-pr)\n"
             console.print(
                 Panel(
                     f"Branch:  [bold]{organism.branch}[/bold]\n"
@@ -982,6 +1406,34 @@ def evolve_tool_code(
                     border_style="green",
                 )
             )
+
+            # ── 10. Only now, and only if asked, leave this machine ─────
+            if pr_plan is not None and push:
+                console.print(f"\n  Pushing {pr_plan.branch} to {remote} (--push)")
+                try:
+                    pr_plan.push(remote)
+                    console.print(f"  [green]✓[/green] pushed to {remote}")
+                except DeploymentGitError as exc:
+                    console.print(f"[red]✗ push failed: {exc}[/red]")
+                    exit_code = 4
+            if pr_plan is not None and open_pr:
+                if not push:
+                    console.print(
+                        "  [dim]--open-pr without --push: gh needs the branch on "
+                        "the remote, so this works only if it is already there.[/dim]"
+                    )
+                console.print(f"  Opening a PR against {base} (--open-pr)")
+                try:
+                    output = pr_plan.open(base).strip()
+                    console.print(f"  [green]✓[/green] {output or 'PR opened'}")
+                except DeploymentGitError as exc:
+                    console.print(f"[red]✗ could not open the PR: {exc}[/red]")
+                    exit_code = 4
+            if not push and not open_pr:
+                console.print(
+                    "\n[dim]  Nothing was pushed and no PR was opened. Pass --push "
+                    "and --open-pr to do either; neither happens on its own.[/dim]"
+                )
         elif winner:
             console.print(
                 "\n[yellow]⚠ The winning candidate is identical to the baseline - "
@@ -1041,6 +1493,13 @@ def evolve_tool_code(
 @click.option("--strict-gates", is_flag=True,
               help="Treat an unavailable gate as a failure instead of a warning")
 @click.option("--dry-run", is_flag=True, help="Validate setup without mutating anything")
+@click.option("--write-pr/--no-write-pr", default=True,
+              help="Write PULL_REQUEST.md beside the run artifacts when there is a "
+                   "winner to deploy (local file, nothing is sent)")
+@click.option("--push/--no-push", default=False,
+              help="Push the evolution branch to the remote. Off unless asked for")
+@click.option("--open-pr/--no-open-pr", default=False,
+              help="Open the pull request with gh. Off unless asked for; never merges")
 def main(
     tool,
     bug_issue,
@@ -1055,6 +1514,9 @@ def main(
     allow_dirty,
     strict_gates,
     dry_run,
+    write_pr,
+    push,
+    open_pr,
 ):
     """Evolve hermes-agent tool code with Darwinian Evolver, under guardrails."""
     code = evolve_tool_code(
@@ -1071,6 +1533,9 @@ def main(
         pytest_subset=tuple(pytest_subset) or None,
         allow_dirty=allow_dirty,
         repro_runs=repro_runs,
+        write_pr=write_pr,
+        push=push,
+        open_pr=open_pr,
     )
     sys.exit(code)
 

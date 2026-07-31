@@ -14,8 +14,10 @@ departure is stated with its reason.
 
 This repo never runs inside hermes-agent. It reads a separate hermes-agent
 checkout, computes candidate rewrites, validates them, and either writes them
-back into that checkout or leaves it untouched. Nothing is merged, pushed, or
-deployed by any code path here.
+back into that checkout or leaves it untouched. Nothing is ever merged. A write
+is deployed as a git branch plus a rendered PR body, both local; pushing that
+branch and opening the pull request each need their own explicit flag and are
+off by default.
 
 ```
   hermes-agent-self-evolution                  hermes-agent checkout
@@ -29,10 +31,20 @@ deployed by any code path here.
   evolution/core/gates.py         -- runs  -->  tests/  (pytest, subprocess)
                                   -- runs  -->  environments/benchmarks/* (absent today)
   evolution/code/organism.py      -- git   -->  a new branch, one file per commit
+  evolution/core/pr_builder.py    -- git   -->  evolve/<target>-<timestamp>,
+                                                one commit holding the written files
+                                  -- net   -->  git push        (only with --push)
+                                  -- net   -->  gh pr create    (only with --open-pr)
 
   writes back:  tools/*.py descriptions (Phase 2, --write)
                 agent/prompt_builder.py sections (Phase 3, --write)
                 a git branch and a diff (Phase 4, always; never merged)
+
+  and, when a write happened:
+                a branch carrying the written files, plus PULL_REQUEST.md in
+                the run's output directory (Phases 2 and 3 build the branch
+                through pr_builder; Phase 4 reuses the branch CodeOrganism
+                already made and renders only the body)
 ```
 
 Every phase resolves the checkout through
@@ -53,6 +65,8 @@ evolution/
     constraints.py            char budgets, growth ceiling, non-empty, skill frontmatter, pytest runner
     fitness.py                LLM-as-judge FitnessScore and the fast skill_fitness_metric
     external_importers.py     mine Claude Code / Copilot / Hermes session files into an EvalDataset
+    cost.py                   UsageTracker / CostReport; what a run spent, read out of dspy's history
+    pr_builder.py             branch, commit, and render the PR body PLAN.md constraint 5 asks for
   skills/                     Phase 1
     skill_module.py           SKILL.md load/split/reassemble; SkillModule (dspy)
     evolve_skill.py           CLI and run body
@@ -76,10 +90,12 @@ evolution/
     triage.py                 ranking: potential improvement x usage frequency, plus adjustments
     loop.py                   one cycle: check, triage, dispatch, record
 
-datasets/                     generated eval datasets (gitignored)
+datasets/                     generated eval datasets (gitignored: .gitkeep is tracked, *.jsonl and *.json are not)
 reports/                      the Phase 1 validation PDF
 generate_report.py            standalone reportlab script that builds that PDF; not imported by the package
+docs/ARCHITECTURE.md          this document
 tests/                        the test suite; every test runs offline, with no API key and no network
+.github/workflows/tests.yml   pytest on 3.10 / 3.11 / 3.12 with no secrets available, plus a --help smoke test per phase
 ```
 
 `evolution/tools/__init__.py`, `prompts/__init__.py`, and `monitor/__init__.py`
@@ -95,8 +111,13 @@ statement about the code: all three packages are implemented.
 `EvolutionConfig` is a plain dataclass holding every tunable a run needs:
 model names (`optimizer_model`, `eval_model`, `judge_model`), the size budgets
 (`max_skill_size` 15000, `max_tool_desc_size` 500, `max_param_desc_size` 200,
-`max_prompt_growth` 0.2), dataset split ratios (0.5 / 0.25 / 0.25), and gate
-settings (`run_pytest`, `run_tblite`, `tblite_regression_threshold` 0.02).
+`max_prompt_growth` 0.2), dataset split ratios (0.5 / 0.25 / 0.25), gate
+settings (`run_pytest` True, `run_tblite` False,
+`tblite_regression_threshold` 0.02), and output settings (`output_dir`
+`./output`, `create_pr` True). `create_pr` was a dead field for the whole of
+Phases 1 through 5: it defaulted to True with nothing reading it. It is now the
+default for Phase 2's `--create-pr/--no-create-pr`. `run_pytest` is still dead,
+set by two phases and read by none; see section 6.
 
 Repo discovery has two entry points and one deliberate non-raising wrapper.
 
@@ -355,7 +376,7 @@ standard library has none. Its tests in `tests/core/test_stats.py` check the
 distribution primitives against published t-tables, hand-computed binomial
 sums, and Anscombe quartet I.
 
-Four call sites use it, and each is described in its own section below:
+Five call sites use it, and each is described in its own section below:
 
 | caller | what it tests | section |
 |---|---|---|
@@ -363,6 +384,7 @@ Four call sites use it, and each is described in its own section below:
 | `prompts/evolve_prompt_section.py` | holdout judge scores, paired continuous, Wilcoxon | 3.3.1 |
 | `code/fitness_code.py` | per-test pytest outcomes paired by node id; Wilson interval on a repro fix rate | 3.4 |
 | `monitor/metrics.py` | OLS trend with a t-test on the slope | 3.5.1 |
+| `monitor/triage.py` | `_rate_interval`, a Wilson interval on a triaged rate reconstructed from its mean and sample count | 3.5 |
 
 ### 2.4 `core/gates.py`
 
@@ -408,7 +430,128 @@ Phase 4 the safety guardrails run before pytest, and in
 benchmarks never run. `passed` is "no result in the list is blocking", so a
 chain that short-circuited is not passed.
 
-### 2.5 What Phase 1 built that the later phases reuse
+### 2.5 `core/cost.py`
+
+PLAN.md requires the cost of the optimization run in every PR body, and puts a
+figure on the expectation ("GEPA optimization: ~$2-10 per run"). Nothing
+measured cost at all until this module existed.
+
+**Why the number is read rather than computed.** dspy records every model call
+in `dspy.clients.base_lm.GLOBAL_HISTORY`, each entry carrying a `usage` dict and
+a `cost`. `cost.py` reads that log. It does not carry a price table of its own,
+because a local table goes stale the week a provider changes rates and a stale
+price presented as a cost is worse than no cost at all. `_history()` imports
+`GLOBAL_HISTORY` inside a `try` and returns an empty list if dspy moves it, so
+a dspy upgrade degrades the cost line rather than breaking the run.
+
+**Three honesty rules, built in rather than left to the caller.**
+
+- *An unpriced call is excluded, never zeroed.* `LMCall.cost` is `None` for any
+  model dspy has no pricing for. `CostReport.known_cost` sums only the calls
+  where `priced` is True, and `unpriced_calls` counts the rest. Summing an
+  unknown as zero would produce a total that is quietly too low, which is the
+  one failure mode a cost report must not have.
+- *A truncated history is flagged.* dspy caps the global log, so a long run can
+  lose its early entries. `UsageTracker` records `len(history)` on entry; if the
+  log is *shorter* on exit than it was on entry, entries were evicted, so the
+  tracker takes everything still there and sets `CostReport.truncated`. That is
+  a deliberate over-count of scope in exchange for never reporting a negative or
+  a silently partial total.
+- *A cached call is counted separately.* `LMCall.cached` is True when the entry
+  says so, or when it carries no usage and no cost, which is what a
+  cache-served call looks like. `cached_calls` is reported on its own line so a
+  cheap rerun is not mistaken for a cheap pipeline.
+
+`CostReport.complete` is `not truncated and unpriced_calls == 0`, and
+`describe()` prefixes the total with **"at least "** whenever it is False. Every
+phase prints `describe()` verbatim for exactly that reason. `to_dict()` carries
+the same fields into `metrics.json` under `cost`, including `complete` and
+`truncated`, so a reader of the artifact can tell a measured total from a floor.
+
+**Reading an entry defensively.** The shape of a dspy history entry is not part
+of dspy's public API, so `LMCall.from_entry` treats every field as optional: a
+non-dict entry becomes an empty `LMCall`, a non-dict `usage` is discarded, token
+counts are read from `prompt_tokens`/`input_tokens` and
+`completion_tokens`/`output_tokens` in that order, and a non-numeric cost
+becomes `None`. A malformed entry degrades to an unpriced zero-token call
+instead of raising in the middle of someone's optimization run.
+
+`UsageTracker` is a context manager and also exposes `stop()`, which is what
+lets Phase 3 hold it open across five numbered stages through an `ExitStack`
+rather than indenting all of them. `read_history(entries)` builds a report from
+raw entries and is what the tests use, since it needs no dspy at all.
+
+The scope of a measurement is "whatever entered dspy's global history inside
+this block", which means it is process-global rather than per-caller, and it
+cannot see a model call made by a subprocess. Phase 4 says so explicitly; see
+`EVOLVER_COST_NOTE` in 3.4.
+
+### 2.6 `core/pr_builder.py`
+
+PLAN.md constraint 5 is "Deployment via PR (Never Direct Commit)": an evolved
+change reaches hermes-agent as `evolve/<target>-<timestamp>` plus a pull request
+whose body carries the before/after scores per split, the full diff, the cost of
+the run, and every constraint violation caught and rejected on the way. Until
+this module existed the pipeline stopped one step short of that, writing evolved
+text and a `metrics.json` into an output directory and leaving the reviewer to
+assemble the rest by hand. `EvolutionConfig.create_pr` had defaulted to `True`
+the whole time **with nothing reading it**; it is now the default for Phase 2's
+`--create-pr/--no-create-pr`.
+
+**Local by default, network only on request.** Building a branch, staging files,
+committing them and rendering a body are local operations, and
+`build_pull_request` does all four. Pushing and opening the PR are separate
+methods on the returned plan, `PullRequestPlan.push(remote="origin")` and
+`PullRequestPlan.open(base="main")`, and every phase gates them behind its own
+`--push` and `--open-pr`, both defaulting to off. An optimization run that
+phoned out to GitHub because a config field defaulted to True would be a bad
+surprise, and "never direct commit" is a rule about review, not a licence to
+publish automatically. `open()` checks `shutil.which("gh")` first and raises
+`GitError` naming the branch and body as usable by hand, rather than failing
+opaquely.
+
+**What it does, in order.** `build_pull_request(repo=, target=, phase=,
+timestamp=, files=, ...)` raises `GitError` immediately when `repo/.git` does
+not exist, so a caller never believes in a branch that was never made. It then
+reads the current ref through `_current_ref` (branch name, or the HEAD sha when
+detached), creates `evolve/<target>-<timestamp>`, and, when `commit=True` and
+`files` is non-empty, runs `git add -- <files>`, captures `git diff --cached`
+for the body, and commits. The timestamp is a parameter rather than a clock
+read, so a run is reproducible and a test can assert on the branch name. The
+working tree is expected to already hold the evolved content: this stages what
+it is given and never decides what changed.
+
+**The body.** `render_body` emits PLAN.md's sections in PLAN.md's order:
+a one-line header, a Scores table built from `ScoreLine(split, baseline,
+evolved, detail)` rows, an Evidence block holding the phase's own statistics
+string, the Gates list, "Rejected along the way" built from
+`RejectedCandidate(label, reason)`, a Run block naming the optimizer, the
+iterations, the eval dataset and `cost.describe()` (or `not measured`), and
+finally the diff in a fenced block. The diff is clipped at `max_diff_lines`
+(400) with a note saying how many lines were dropped and that the branch has all
+of them, because a body that silently truncates a diff is worse than one that
+admits it. `RejectedCandidate` exists because a PR showing only the winner hides
+how hard the gates were working, and a reviewer who cannot see what was refused
+cannot tell a careful run from a lucky one.
+
+**The commit message** is assembled separately and follows PLAN.md's template:
+`evolve: <target> - <last split> X to Y`, then the optimizer and iteration
+count, the eval dataset, one `split: before -> after (delta)` line per score,
+and the cost. `build_pull_request` headlines the *last* score row, which is why
+each phase orders holdout last.
+
+**Restoring the checkout.** `PullRequestPlan.restore()` checks the repo back out
+onto `original_ref`, and does so only when `created_branch` is True, so a plan
+bound to a branch somebody else owns cannot fight them for it. Every caller
+invokes it from a `finally`. `to_dict()` records the branch, title, files,
+`created_branch`, `original_ref` and the body path, and each phase stores that
+under `pull_request` in its `metrics.json`.
+
+`render_body` is exported separately from `build_pull_request` for Phase 4,
+which already has a branch and a commit from `CodeOrganism` and needs the body
+without a second branch mechanism racing over the same checkout. See 3.4.
+
+### 2.7 What Phase 1 built that the later phases reuse
 
 `core/dataset_builder.py` defines `EvalExample` (`task_input`,
 `expected_behavior`, `difficulty`, `category`, `source`) and `EvalDataset`
@@ -588,8 +731,10 @@ parameter list, and the schema cannot settle it. The second tier is a single
 `DescriptionEntailment` model call asking whether the rewrite claims anything
 the baseline description and the schema do not support; it is optional, skipped
 with a stated reason when no predictor or no LM is configured, and never raises.
-`build_accuracy_checker` constructs it, and `--dry-run` and offline runs get the
-structural tier alone.
+`build_accuracy_checker`, which lives in `evolve_tool_descriptions.py` rather
+than in `accuracy.py`, constructs the checker and decides whether the entailment
+tier gets a predictor at all; `--dry-run` and offline runs get the structural
+tier alone.
 
 **Cross-tool decision.** `CrossToolReport.from_outcomes` builds per-tool
 `ToolRate` records and a `ConfusionMatrix` in which `NO_TOOL` is a row and a
@@ -613,28 +758,74 @@ bool(changes)`. `write_bundle` is called either way, with `dry_run=not
 may_write`, so a run that reports a clean write really did execute the whole
 rewrite and verification path. `--no-write` is the default.
 
+**Cost.** Everything that can reach a language model, from dataset generation
+through the baseline, the optimizer and every evaluation, happens inside a
+single `with UsageTracker() as usage:` block that opens before stage 2 and
+closes after stage 8. `cost = usage.report` is printed as a row of the results
+table via `describe()`, stored under `cost` in `metrics.json`, and handed to the
+PR body. A figure that skipped the optimizer would be the wrong figure, which is
+why the block starts where it does.
+
+**Deployment.** Stage 12 is the only stage that can build a branch, and it runs
+only when `metrics["written"]` is true and `write_report.files_written` is
+non-empty. No write means no branch: a run that changed nothing has nothing to
+deploy, and an empty branch in the review queue is noise. A dry run returns at
+stage 1 and never reaches it, printing instead what it *would* build, push and
+open. With `--no-create-pr` the files are written in place and left uncommitted,
+which the run says out loud.
+
+Otherwise `build_pull_request` is called with the target slug from
+`pr_target_slug(selected.names, toolset)`, the repo-relative paths of the files
+`write_bundle` actually wrote, `score_lines(...)` (a `val` row always, a
+`holdout` row when the holdout was measured, and no `train` row because this
+phase never scores train and an invented number is worse than a missing one),
+the `CostReport`, `collect_rejections(...)`, the gate summary, the dataset
+split, the optimizer that actually ran, `verdict.summary()` as the evidence
+block, and a notes list carrying the two model names, the description char
+delta, the wall clock and the artifact directory. `plan.write_body(output_dir)`
+drops `PULL_REQUEST.md` beside the other artifacts and `plan.to_dict()` goes
+into `metrics.json` under `pull_request`.
+
+`collect_rejections` is what makes the "constraint violations caught and
+rejected" half of PLAN.md's PR body real: every reverted description with its
+reason, every regressed tool from both the val and holdout verdicts, and a
+whole-candidate entry when a verdict refused without naming a single tool.
+Factual reverts appear on the same footing as budget failures, because that is
+how `enforce_constraints` treats them.
+
+`--push` and `--open-pr` are the only two steps that leave the machine, and both
+are off by default; `--pr-base` (default `main`) is the base branch. A `GitError`
+from any of them is reported and the run continues, because the evolved
+descriptions are already in the artifacts. A `finally` calls `_restore_checkout`,
+which prefers `plan.restore()` and falls back to the ref read before the call,
+since `build_pull_request` creates the branch before it can fail and has no plan
+to hand back when it does. Leaving an operator parked on an `evolve/` branch they
+did not ask for is exactly the surprise this stage exists to avoid.
+
 **Invocation and printed stages.**
 
 ```bash
 python -m evolution.tools.evolve_tool_descriptions --toolset file --iterations 8
 # or: hermes-evolve tools --tool read_file --tool search_files --write
+python -m evolution.tools.evolve_tool_descriptions --write --push --open-pr
 ```
 
-Phase 2 prints eleven numbered banners via `_banner`: 1 tool catalogue,
+Phase 2 prints twelve numbered banners via `_banner`: 1 tool catalogue,
 2 tool-selection dataset, 3 baseline measurement, 4 GEPA optimization,
 5 constraint validation, 6 cross-tool regression check, 7 gate ladder,
-8 holdout evaluation, 9 results, 10 write-back, 11 artifacts. `--dry-run` stops
-after stage 1. Stage 5 also reports whether the entailment tier ran. Stage 6
-prints `_rates_table`, which carries three columns beyond the rates themselves:
-the 95 percent CI on the change, `p(worse)`, and a power cell reading
-`no pairing`, `needs N%` when underpowered, `significant` in either direction,
-or a bare tick. Artifacts land in
+8 holdout evaluation, 9 results, 10 write-back, 11 artifacts, 12 deployment.
+`--dry-run` stops after stage 1. Stage 5 also reports whether the entailment
+tier ran. Stage 6 prints `_rates_table`, which carries three columns beyond the
+rates themselves: the 95 percent CI on the change, `p(worse)`, and a power cell
+reading `no pairing`, `needs N%` when underpowered, `significant` in either
+direction, or a bare tick. Artifacts land in
 `output/tools/<timestamp>/{baseline_descriptions.json,
 evolved_descriptions.json, cross_tool_report.json, gates.json, changes.json,
-metrics.json}`, and `metrics.json` records `per_tool`, `underpowered_tools`,
-`unpaired_tools`, `significant_regressions`, the two accuracy intervals,
-`chance_accuracy`, `factual_reverts`, and `entailment_ran` alongside the older
-fields.
+metrics.json}`, joined by `PULL_REQUEST.md` when stage 12 built one, and
+`metrics.json` records `per_tool`, `underpowered_tools`, `unpaired_tools`,
+`significant_regressions`, the two accuracy intervals, `chance_accuracy`,
+`factual_reverts`, `entailment_ran`, `cost`, and `pull_request` alongside the
+older fields.
 
 #### 3.2.1 How the cross-tool guard decides
 
@@ -705,12 +896,17 @@ rerunning the evaluation.
 `<hermes_repo>/agent/prompt_builder.py`: `DEFAULT_AGENT_IDENTITY` (513 chars in
 the reference checkout), `MEMORY_GUIDANCE` (1426), `SESSION_SEARCH_GUIDANCE`
 (186), `SKILLS_GUIDANCE` (1007). PLAN.md also lists `PLATFORM_HINTS`. In the
-real file that is a dict of eleven per-platform strings, not a string, so
-`sections._discover_structured` reports it as a `StructuredSection` with a
-reason and it is excluded from the allowlist. Rewriting one platform's hint has
-its own accuracy rules ("do not tell Telegram to use ANSI codes") and is a
-different operation; reporting it beats crashing discovery or silently dropping
-it.
+real file that is a dict of twenty-two per-platform strings (`whatsapp` through
+`webui`, 13,250 chars in total), not a string, so
+`sections._discover_structured` reports it as a `StructuredSection` whose
+`reason` names the key count, and it is excluded from the allowlist. Rewriting
+one platform's hint has its own accuracy rules ("do not tell Telegram to use
+ANSI codes") and is a different operation; reporting it beats crashing discovery
+or silently dropping it. `prompt_builder.py` carries a dozen other module-level
+string constants as well (`KANBAN_GUIDANCE`, `TOOL_USE_ENFORCEMENT_GUIDANCE`,
+`OPENAI_MODEL_EXECUTION_GUIDANCE` and the rest). None is on
+`EVOLVABLE_PROMPT_SECTIONS`, so discovery never returns them and
+`apply_prompt_section` refuses them by name.
 
 **Inventory.** `load_sections(repo, names, max_growth, cache_budget_tokens)`
 returns a `SectionInventory` holding `EvolvableSection` objects, the structured
@@ -737,11 +933,16 @@ Two harnesses, chosen by `select_harness`:
 
 - `BatchRunnerHarness` when `<repo>/batch_runner.py` exists. It writes a JSONL
   dataset, invokes batch_runner as a *subprocess* with
-  `--ephemeral_system_prompt=<candidate>` (never an import: batch_runner calls
-  `fire.Fire` at module scope and forks its own worker pool), and reads
-  trajectories back from `data/<run_name>/batch_*.jsonl`. Transcripts are joined
-  to scenarios by prompt text, because batch_runner reorders across batch files
-  and keys resume on prompt text.
+  `--ephemeral_system_prompt=<candidate>`, and reads trajectories back from
+  `data/<run_name>/batch_*.jsonl`. It is never imported: batch_runner is a
+  `fire`-driven CLI that forks its own `multiprocessing.Pool`, so importing it
+  would hand this process someone else's process tree. (The docstring on
+  `BatchRunnerHarness` says the `fire.Fire` call is at module scope; in the
+  reference checkout it sits under an `if __name__ == "__main__":` guard, so the
+  worker pool, not the module-scope call, is the reason subprocess is the only
+  safe option.) Transcripts are joined to scenarios by prompt text in
+  `_match_transcripts`, because batch_runner reorders across batch files and
+  keys resume on prompt text.
 - `DirectPromptHarness` otherwise. There are no real tools, so the model reports
   the tools it *would* call. This measures whether the guidance reads correctly,
   not whether the agent behaves correctly, and every report built this way is
@@ -765,13 +966,21 @@ only, then `check_caching_boundary`. The identity check uses the explicit
 `IDENTITY_TRAITS` table: helpful, direct, admits uncertainty, each satisfied by
 any of several regex phrasings so the sentence can be rewritten but the trait
 cannot be dropped; a failure names the lost trait. The caching check estimates
-tokens at 4 chars per token over the assembled prefix plus the widest platform
-hint as filler, and produces two results at different severities: exceeding
-`cache_budget_tokens` (8192) is an **error**, because past it the prefix stops
-being a stable cacheable prefix; crossing into an additional 1024-token cache
-block is a **warning**, a real per-session cost that a genuinely better prompt
-can be worth. `SectionValidation.passed` ignores warnings, `passed_strict` does
-not, and `--strict-gates` selects the latter.
+tokens at `CHARS_PER_TOKEN = 4` over `assembled_preview()`, which is the four
+evolvable sections joined in PLAN.md's order plus a filler string standing in
+for `PLATFORM_HINTS`. The filler is `max(s.total_chars for s in structured)`,
+and `StructuredSection.total_chars` is the **sum of every value in the dict**,
+so with one dict constant present the padding is all 22 hints (13,250 chars),
+not the single widest one (1,478). The local variable is named `widest` and the
+docstring says "the widest one", which describes an intent the arithmetic does
+not implement; the effect is a conservative over-estimate, and on the reference
+checkout it puts the prefix at ~4,098 tokens in 5 cache blocks. Two results come
+out at different severities: exceeding `cache_budget_tokens`
+(`DEFAULT_CACHE_BUDGET_TOKENS` 8192) is an **error**, because past it the prefix
+stops being a stable cacheable prefix; crossing into an additional
+`CACHE_BLOCK_TOKENS` (1024) block is a **warning**, a real per-session cost that
+a genuinely better prompt can be worth. `SectionValidation.passed` ignores
+warnings, `passed_strict` does not, and `--strict-gates` selects the latter.
 
 **Gate ladder.** `run_gate_ladder` measures benchmark baselines *before*
 staging, then uses the `staged_prompt_write` context manager to put the
@@ -801,20 +1010,60 @@ complementary check to `apply_prompt_section`'s span arithmetic: it catches a
 neighbouring constant that shifted, vanished, or appeared, by value rather than
 by trusting offsets.
 
+**Cost.** The meter is a `UsageTracker` held open through an `ExitStack` rather
+than a `with` block, because the stretch that can call a model spans five
+numbered stages (baseline, optimize, constraints, gates, holdout) and another
+level of indentation would bury the structure. `cost_meter.close()` fires once
+the last holdout comparison is in, and also on the early return when no section
+had scenarios to optimize, where the run prints "Spent getting here" rather than
+losing the figure. `cost.to_dict()` lands in `metrics.json`.
+
+**Deployment.** The three flag combinations that cannot work are refused at the
+very top of `evolve`, before any money is spent: `--push`/`--open-pr` with
+`--no-create-pr` (nothing to push), `--open-pr` without `--push` (gh cannot open
+a PR for a branch that exists only locally), and either without `--write` (a PR
+is only built when a run actually deploys something). All three exit 1.
+
+After a successful `write_sections`, and only then, `emit_pull_request` builds
+the branch. `--create-pr` defaults to **on** here, but it is reached only behind
+a write, so the default is "if you deployed, leave a reviewable branch", not "if
+you ran, phone home". It passes `holdout_score_lines(deployed)`,
+`rejected_candidates(outcomes, deployed)`, `gate_lines(chain)`,
+`holdout_statistics(deployed)` as the evidence block, the cost report, and notes
+carrying the next-session notice, the harness that ran, the gate tolerance and
+the artifact directory. `pr_target(names)` names the branch after the deployed
+sections.
+
+A repo that is not a git checkout raises `GitError`, which is reported and
+shrugged off with exit code 0: the sections are already on disk, and failing the
+run after a successful write would say something untrue about the write. A
+failed `--push`, a failed `--open-pr`, or a failed restore each return
+`EXIT_DEPLOYMENT_INCOMPLETE = 3`, so "you asked for this and it did not happen"
+is distinguishable from "the run finished". `plan.restore()` runs in a `finally`;
+if even that fails the run says which branch you are still on.
+
 **Invocation and printed stages.**
 
 ```bash
 python -m evolution.prompts.evolve_prompt_section --section MEMORY_GUIDANCE
 python -m evolution.prompts.evolve_prompt_section --all-sections --strict-gates --write
+python -m evolution.prompts.evolve_prompt_section --all-sections --write --push --open-pr
 ```
 
 Banners are unnumbered: "Discovering sections", "Building behavioral suite",
-"Baseline behaviour", "Optimizing", "Constraints", "Gate ladder", "Holdout",
-the results table, a per-category holdout table, then "Write-back". `--dry-run`
-stops after "Building behavioral suite" and prints the holdout power it would
-have had, including an underpowered warning, before any money is spent. Exit
-codes: 0 normal, 1 setup failure (no repo, no sections, bad `--section`,
-nothing to optimize), 2 refused because a session is live.
+"Baseline behaviour", "Optimizing (N iteration(s))", "Constraints", "Gate
+ladder", "Holdout", the results table, a per-category holdout table,
+"Write-back", then "Pull request" when one is built. `--dry-run` prints its own
+"Dry run" banner after "Building behavioral suite" and stops there, reporting
+the holdout power it would have had, including an underpowered warning, and
+stating that a dry run builds neither a branch nor a body, before any money is
+spent. Artifacts land in `output/prompts/<timestamp>/` as
+`baseline_<SECTION>.txt`, `evolved_<SECTION>.txt`, `scenarios.jsonl`,
+`prompt_builder.py.bak`, `metrics.json`, and `PULL_REQUEST.md` when a branch was
+built. Exit codes: 0 normal, 1 setup failure (no repo, no sections, bad
+`--section`, nothing to optimize, an impossible deployment flag combination),
+2 refused because a session is live, 3 an explicitly requested push, PR open, or
+checkout restore did not happen.
 
 #### 3.3.1 The paired holdout test
 
@@ -832,6 +1081,15 @@ worked around. Both runs are also labelled `HOLDOUT_SECTION_LABEL =
 "SYSTEM_PROMPT"`, because the label reaches the direct harness's instruction
 scaffold and letting it differ would change the prompt on one side of a paired
 comparison for no reason.
+
+A scenario the harness produced no transcript for is **dropped from both
+sides**, not scored as a behavioural failure. An unmeasured run is missing data:
+scoring it 0.0 on the side that timed out and a real number on the side that
+completed manufactures a difference out of a flake, and six baseline timeouts
+against a clean candidate run read as a significant improvement. Losing more
+than `MAX_UNMEASURED_FRACTION` (0.2) of the suite that way raises
+`UnpairedHoldout` outright, because at that point the run measured too little to
+compare.
 
 `compare_holdout` then builds a `HoldoutComparison`: `compare_paired_continuous`
 over all scenarios, and the same paired test again inside each behavioural
@@ -984,21 +1242,64 @@ a handful of tasks, and quality penalties in steps of 0.05). It also flags
 `fix_rate_inconclusive` when the top two candidates' Wilson intervals overlap
 and `thinner_evidence` when the winner rests on less measured evidence than the
 runner-up. The winner is re-applied with `organism.reapply`, and the deliverable
-is a branch, `winner.diff`, and a panel telling the reviewer the exact
-`git diff` command. Nothing is merged.
+is a branch, `winner.diff`, a `PULL_REQUEST.md`, and a panel telling the reviewer
+the exact `git diff` command. Nothing is merged.
+
+**Cost.** A `UsageTracker` wraps everything from the mutation request through the
+end of the candidate loop, which is every model call this *pipeline* makes. It is
+not every model call the run causes: Darwinian Evolver is a separate process, so
+its usage never enters dspy's history and no tracker inside this process can see
+it. `EVOLVER_COST_NOTE` is attached to the PR body and stored in `metrics.json`
+under `cost_excludes`, and it says exactly that, pointing at PLAN.md's own
+~$2-9 per task budget for the engine. A total that quietly omitted the component
+doing the actual work would read as the cost of the run and be wrong by most of
+it.
+
+**Deployment.** Phase 4 does not call `build_pull_request`. `CodeOrganism`
+already made `evolve/code/<stem>-<timestamp>` and already committed the winner
+onto it, and two branch mechanisms racing over one checkout is the failure this
+phase cannot afford. `build_code_pull_request` therefore renders the body with
+`pr_builder.render_body` and returns a `PullRequestPlan` **bound to the existing
+branch**, with `created_branch=False` and an empty `original_ref` so its
+`restore()` is a no-op and cannot second-guess the organism, which owns the
+restore. Nothing in that function touches git or the network.
+
+It is reached only when `winner` exists *and* `winner_diff` is non-empty. A run
+with no survivor, or one whose winner is byte-identical to the baseline, writes
+no body: a document implying a diff that does not exist is worse than no
+document. `--write-pr` (default on) controls only whether `PULL_REQUEST.md` is
+written next to the artifacts; it is a local file. The body carries the score
+lines, the gate lines, `code_rejected_candidates(outcomes)` naming every
+candidate the guardrails threw out with its rejection reason, the ranking
+statistics, the diff, `EVOLVER_COST_NOTE`, `REVIEW_NOTE`, the target issue, the
+branch, and the literal `git diff <baseline-sha> <branch> -- <target>` a
+reviewer should run.
+
+`--push` and `--open-pr` are separate and both default to off. They are the last
+thing the run does, after the review panel has printed, and a failure in either
+sets exit code 4 without disturbing the rest of the result. The remote
+(`origin`) and base branch (`main`) are parameters of `evolve_tool_code`, not
+CLI flags.
 
 **Invocation and printed stages.**
 
 ```bash
 python -m evolution.code.evolve_tool_code --tool file_tools \
     --bug-issue 742 --repro-script repros/issue_742.py --repro-runs 5 --iterations 10
+python -m evolution.code.evolve_tool_code --tool file_tools --push --open-pr
 ```
 
-Stages print as `_step` titles: Baseline, Mutation, Evaluation, Results. Exit
-codes: 0 the run completed (with or without a winner), 1 setup problem, 2
-Darwinian Evolver not installed, 3 the evolver ran but produced nothing to
-score. The `finally` block always attempts `organism.close()` and reports a
-failure to restore rather than raising over the real result.
+Stages print as `_step` titles: Baseline, Mutation, Evaluation, Results.
+Artifacts land in `output/code/<stem>/<timestamp>/`: `job.json` and
+`evolver_out/` from the evolver call, `baseline.py`, one `<label>.py` per
+candidate considered, and then `winner.py`, `winner.diff`, `metrics.json` and
+`PULL_REQUEST.md` when there is a winner. Exit codes: 0 the run
+completed (with or without a winner), 1 setup problem, 2 Darwinian Evolver not
+installed, 3 the evolver ran but produced nothing to score, 4 the run completed
+but an explicitly requested push or PR open failed. `--dry-run` validates the
+setup and returns 0 having built nothing: no branch, no body. The `finally`
+block always attempts `organism.close()` and reports a failure to restore rather
+than raising over the real result.
 
 ### 3.5 Phase 5 - the continuous loop
 
@@ -1124,10 +1425,11 @@ R squared = 0.06.
 
 `direction` is still magnitude based against `flat_tolerance`, deliberately:
 direction is a description of the movement, and significance is the claim about
-it. `Trend.fitted` (`n >= 3` and a known direction) tells a caller when
-`p_value` and `r_squared` carry information at all, so a table can print nothing
-rather than print `p=1.000` and invite a reader to mistake it for a measured
-result. `confidence_note()` renders `p=..., R²=...` for one-line output.
+it. `Trend.fitted` (`n >= 3`, a known direction, and a non-None `slope_ci`)
+tells a caller when `p_value` and `r_squared` carry information at all, so a
+table can print nothing rather than print `p=1.000` and invite a reader to
+mistake it for a measured result. `confidence_note()` returns an empty string
+when `fitted` is False and `p=..., R²=...` otherwise.
 
 The descriptive slope is still computed inside `compute_trend` rather than taken
 from the fit, so the degenerate cases behave exactly as they did: a two-point
@@ -1198,22 +1500,48 @@ candidate rewrite of `read_file`'s description travels this path:
                      -> verify_structure_unchanged   [per edit]
                 -> verify_structure_unchanged        [whole file, once more]
                 -> path.write_text  (only when may_write)
+      |
+  deploy     [only when the write above actually happened]
+             cost = usage.report                      (UsageTracker, opened
+                                                       before the dataset stage)
+             score_lines(...)          -> ScoreLine per measured split
+             collect_rejections(...)   -> RejectedCandidate per revert and
+                                          per regressed tool
+             pr_builder.build_pull_request(repo, target, phase, timestamp,
+                                           files, scores, cost, rejected,
+                                           gates, dataset, optimizer,
+                                           iterations, statistics, notes)
+                -> git checkout -b evolve/<target>-<timestamp>
+                -> git add -- <files>; git diff --cached
+                -> render_body   (scores, evidence, gates, rejected, run+cost,
+                                  clipped diff)
+                -> git commit -m <PLAN.md-shaped message>
+             plan.write_body(output_dir)  -> PULL_REQUEST.md
+             plan.push()                  (only with --push)
+             plan.open(base=pr_base)      (only with --open-pr)
+             finally: _restore_checkout   -> back to the original ref
 ```
 
 Every arrow is a function call in `evolution/tools/evolve_tool_descriptions.py`
-except the last block, which is `tool_catalog.write_bundle`. A reviewer can
-follow a single description from `tools/file_tools.py` to a verdict by reading
-`cross_tool_report.json` and `changes.json` in the run's output directory.
+except the `write` block, which is `tool_catalog.write_bundle`, and the git and
+rendering calls under `deploy`, which are `evolution/core/pr_builder.py`. A
+reviewer can follow a single description from `tools/file_tools.py` to a verdict
+by reading `cross_tool_report.json` and `changes.json` in the run's output
+directory, and to a reviewable branch by reading `PULL_REQUEST.md` beside them.
 
 The equivalent path for Phase 3 is
 `load_sections -> BehavioralSuite.from_seeds -> suite.evaluate (baseline) ->
 _optimize_section -> SectionInventory.validate -> run_gate_ladder
-(staged_prompt_write) -> suite.evaluate (holdout, LLM judge) -> write_sections
--> verify_only_sections_changed`. For Phase 4 it is
-`resolve_tool_file -> CodeOrganism.start -> snapshot_baseline ->
-ExternalEvolver.propose -> organism.mutate -> run_safety_checks ->
-CodeFitnessEvaluator.evaluate -> organism.revert_last -> organism.reapply
-(winner) -> organism.close`.
+(staged_prompt_write) -> suite.evaluate (holdout, LLM judge) -> compare_holdout
+-> holm_adjust -> detect_active_session -> write_sections ->
+verify_only_sections_changed -> emit_pull_request -> build_pull_request ->
+plan.write_body -> [plan.push] -> [plan.open] -> plan.restore`. For Phase 4 it
+is `resolve_tool_file -> CodeOrganism.start ->
+CodeFitnessEvaluator.snapshot_baseline -> ExternalEvolver.propose ->
+organism.mutate -> run_safety_checks -> CodeFitnessEvaluator.evaluate ->
+organism.revert_last -> rank_candidates -> organism.reapply (winner) ->
+build_code_pull_request (render_body only, bound to the organism's branch) ->
+plan.write_body -> [plan.push] -> [plan.open] -> organism.close`.
 
 ---
 
@@ -1245,12 +1573,19 @@ persuasive text.
 | A prompt section deploys only on paired holdout evidence | `HoldoutComparison.accepted`: significant Wilcoxon improvement, at least +10 percent, and no regressed category |
 | No multiplicity correction on a conjunction gate | intersection-union, stated and relied on in `CrossToolGuard.compare` and `HoldoutComparison.regressed_categories` |
 | Writes are opt-in | `--write/--no-write` defaults to `no-write` in Phases 2 and 3; `write_bundle(dry_run=True)` still runs the full verification path |
+| A branch is only built when something was deployed | Phase 2 stage 12 runs only on `metrics["written"]` plus non-empty `files_written`; Phase 3 reaches `emit_pull_request` only after `write_sections` returns; Phase 4 requires a winner with a non-empty diff. A dry run returns before any of them |
+| Pushing and opening a PR are each opt-in | `--push/--no-push` and `--open-pr/--no-open-pr` default off in all three phases; `PullRequestPlan.push` and `.open` are separate methods that `build_pull_request` never calls. Phase 3 additionally refuses `--open-pr` without `--push`, `--push` without `--create-pr`, and either without `--write`, at the top of the run |
+| A missing `gh` is named, not guessed around | `PullRequestPlan.open` checks `shutil.which("gh")` and raises `GitError` saying the branch and body are usable by hand |
+| The operator's ref is restored after a deployment | `_restore_checkout` in a `finally` (Phase 2), `plan.restore()` in a `finally` (Phase 3), `organism.close()` in a `finally` (Phase 4, which owns the branch, so its plan carries `created_branch=False`) |
+| A cost is never rounded up from an unknown | `cost.CostReport.known_cost` sums priced calls only; `unpriced_calls` and `truncated` are reported, `complete` is False, and `describe()` prefixes the total with "at least" |
 
 **Convention only.** These are real properties of the current code that nothing
 would stop a future change from violating.
 
-- *Nothing is merged or deployed.* No code path calls `git merge`, `git push`,
-  or `gh pr create`. That is a property of what was written, not a check.
+- *Nothing is merged.* No code path calls `git merge` or passes `--merge` to
+  `gh`. `git push` and `gh pr create` do exist, in
+  `PullRequestPlan.push`/`.open`, but nothing calls them without an explicit
+  flag. The absence of a merge is a property of what was written, not a check.
 - *No AGPL code is linked.* `evolve_tool_code` only ever runs Darwinian Evolver
   through `subprocess.run`. Nothing verifies that no future import appears.
 - *Evaluation order produces the pairing.* Both sides of a comparison are
@@ -1259,12 +1594,16 @@ would stop a future change from violating.
   checks above catch a misalignment after the fact; nothing prevents a future
   caller from evaluating the two sides over different lists.
 - *Phase 1 does not write into hermes-agent.* It writes files under `output/`
-  and a human copies them. There is no gate preventing a future `--write`.
+  and a human copies them. There is no gate preventing a future `--write`, and
+  no PR path either: Phase 1 is the one tier with no deployment step.
 - *The holdout is not touched during optimization.* GEPA sees `trainset` and
   `valset`; `holdout` is only read afterwards. Nothing enforces the separation
   structurally.
-- *PLAN.md's PR builder.* PLAN.md lists `core/pr_builder.py`. It does not exist.
-  Phases emit branches, diffs, and JSON metrics; opening the PR is manual.
+- *The PR body is complete because each phase fills it in.* `render_body` omits
+  any section it was given nothing for, so a caller that forgot to pass
+  `rejected` or `cost` produces a body that is quietly missing what PLAN.md
+  asks for. Nothing checks that the phases supply all of it; today all three
+  do.
 - *`core/benchmark_gate.py`.* PLAN.md names it; the implementation is
   `core/gates.py`, which covers pytest as well as benchmarks and adds the
   status ladder and `GateChain`.
@@ -1294,14 +1633,16 @@ is permanently `UNKNOWN`.
 
 **GEPA is not actually running in Phase 1.** `evolve_skill.evolve` calls
 `dspy.GEPA(metric=..., max_steps=iterations)`. `max_steps` is not a parameter of
-`dspy.GEPA.__init__` on dspy 3.2.1 (the pinned version), so the call raises
-`TypeError`, the broad `except Exception` catches it, and the run silently falls
+`dspy.GEPA.__init__` on dspy 3.2.1, the version installed here, so the call
+raises `TypeError`, the broad `except Exception` catches it, and the run falls
 back to `dspy.MIPROv2(auto="light")` after printing "GEPA not available". The
-fallback is legitimate; the silence is the problem, because a run reported as
-GEPA is MIPROv2. Phases 2 and 3 use `max_full_evals` and `max_metric_calls`,
-which do exist, and Phase 2 records which optimizer actually ran in
-`metrics.json`. *Consequence:* Phase 1 results are not GEPA results, and Phase 1
-does not record which optimizer produced them.
+fallback is legitimate; the silence in the artifacts is the problem, because a
+run reported as GEPA is MIPROv2. Phases 2 and 3 use `max_full_evals` and
+`max_metric_calls`, which do exist, and both record which optimizer actually ran
+in `metrics.json` (Phase 2 under `optimizer`, Phase 3 per section). `pyproject`
+asks only for `dspy>=3.0.0`, so nothing pins the version this behaviour was
+observed against. *Consequence:* Phase 1 results are not GEPA results, and
+Phase 1 does not record which optimizer produced them.
 
 **`read_file` is already over budget.** Its real description is 539 characters
 against PLAN.md's 500-character budget, and `write_file.cross_profile` is 302
@@ -1370,15 +1711,31 @@ dependency, and deliberately not substituted. *Consequence:* `--tool X` with no
 evolver installed exits 2 having mutated nothing. There is no built-in mutation
 source.
 
-**Phase 1 applies no statistics and no gate ladder.** It reports a raw holdout
-mean difference and declares improvement when it is positive. *Consequence:* a
-Phase 1 "improvement" on a 5-example holdout is not evidence, and unlike
-Phases 2 through 4 there is no pytest or benchmark gate between the optimizer
-and the file a human is invited to copy into hermes-agent. Its `--run-tests`
-flag, documented as "Run full pytest suite as constraint gate", sets
-`EvolutionConfig.run_pytest`, and nothing in the package reads that field. The
-flag is inert. Phase 2 accepts the same flag and does gate on it, through its
-own local variable rather than through the config.
+**Phase 1 applies no statistics, no gate ladder, and no deployment step.** It
+reports a raw holdout mean difference and declares improvement when it is
+positive. *Consequence:* a Phase 1 "improvement" on a 5-example holdout is not
+evidence, and unlike Phases 2 through 4 there is no pytest or benchmark gate
+between the optimizer and the file a human is invited to copy into hermes-agent.
+It is also the only phase that never builds a branch or a PR body and never
+measures what it spent: PLAN.md constraint 5 is unimplemented for skills, and
+the reviewer is still told to copy `evolved_skill.md` across by hand. Its
+`--run-tests` flag, documented as "Run full pytest suite as constraint gate",
+sets `EvolutionConfig.run_pytest`, and nothing in the package reads that field.
+The flag is inert. Phase 2 accepts the same flag and does gate on it, through
+its own local variable rather than through the config.
+
+**Cost is measured from dspy's history, so it misses what dspy cannot see.**
+`UsageTracker` reads `dspy.clients.base_lm.GLOBAL_HISTORY`, which is
+process-global, so it measures whatever entered that log inside its block rather
+than what a specific caller made. *Consequence:* three real gaps. A model dspy
+has no price for is counted as unpriced and excluded from the total, so the
+figure in the PR body is a floor and `describe()` says "at least $X"; that is
+the honest reading, not a bug, but it is not a full cost. A truncated history
+sets `truncated` and turns the total into a lower bound for the same reason.
+And Phase 4's mutation engine runs as its own process, so none of its usage
+reaches dspy at all: `EVOLVER_COST_NOTE` states that and points at PLAN.md's
+~$2-9 per task estimate, but the real total for a Phase 4 run has to be added up
+by the reader.
 
 **The factual-accuracy entailment tier needs a model.** The structural checks in
 `accuracy.py` are deterministic and always run, but they only adjudicate claims
