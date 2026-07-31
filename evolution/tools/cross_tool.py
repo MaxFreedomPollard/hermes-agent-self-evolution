@@ -444,6 +444,43 @@ class _PairedEvidence:
 
     @property
     def delta(self) -> float:
+        """The change this record's verdict is about.
+
+        Taken from the paired comparison when there is one, so the delta, the
+        interval and the p-value all describe the same set of examples. The
+        unpaired rates come from each report as a whole, and the two populations
+        are not always the same: if the candidate only managed to evaluate 2 of
+        the baseline's 20 examples for a tool, the whole-report delta was
+        +50% while the paired evidence covering those 2 examples said +0% with
+        p = 1.000, and the headline sat outside its own confidence interval.
+
+        Falls back to the report rates only when nothing could be paired, where
+        an unpaired estimate is the sole thing available and is labelled as such
+        by :attr:`unpaired`.
+        """
+        if self.paired is not None:
+            return self.paired.delta
+        return self.candidate_rate - self.baseline_rate
+
+    @property
+    def unpaired(self) -> bool:
+        """True when no paired comparison backs this record's delta."""
+        return self.paired is None
+
+    @property
+    def population_mismatch(self) -> bool:
+        """True when the pairing covers fewer examples than the report claims.
+
+        Not an error in the shipped Phase 2 path, where ``evaluate_selection``
+        scores every example and the two runs always align. It matters for any
+        caller that evaluates partially, because the unpaired rates then
+        describe a different population from the test.
+        """
+        return self.paired is not None and self.paired.n != self.opportunities
+
+    @property
+    def unpaired_delta(self) -> float:
+        """The whole-report rate difference, reported alongside but never gated on."""
         return self.candidate_rate - self.baseline_rate
 
     @property
@@ -898,7 +935,14 @@ class CrossToolGuard:
             unpaired=unpaired,
             baseline_interval=baseline.accuracy_interval(self.confidence),
             candidate_interval=candidate.accuracy_interval(self.confidence),
-            chance_accuracy=max(baseline.chance_accuracy, candidate.chance_accuracy),
+            # Derive the chance rate from the option count rather than taking
+            # the max of both. chance = 1 / num_options, so max() of one is
+            # min() of the other: two reports with 4 and 6 options used to
+            # report "25% chance across 6 options", which is arithmetically
+            # impossible. Take the wider catalogue and compute its chance rate.
+            chance_accuracy=chance_accuracy(
+                max(baseline.num_options, candidate.num_options)
+            ),
             num_options=max(baseline.num_options, candidate.num_options),
         )
 

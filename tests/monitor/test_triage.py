@@ -177,15 +177,23 @@ class TestExplanations:
 
 class TestTrendPressure:
     def _declining(self, target, values, samples=50):
+        # Spread evenly back from today so any length fits inside the window.
+        step = 25 // max(1, len(values) - 1)
         return [
-            point(SKILL_SUCCESS_RATE, target, value, days_ago=21 - 7 * i, samples=samples)
+            point(
+                SKILL_SUCCESS_RATE,
+                target,
+                value,
+                days_ago=step * (len(values) - 1 - i),
+                samples=samples,
+            )
             for i, value in enumerate(values)
         ]
 
     def test_a_declining_target_outranks_an_equally_bad_stable_one(self):
         entries = rank_points(
-            self._declining("eroding", [0.9, 0.8, 0.7])
-            + self._declining("steady", [0.8, 0.8, 0.8]),
+            self._declining("eroding", [0.90, 0.86, 0.82, 0.78, 0.74, 0.70])
+            + self._declining("steady", [0.8] * 6),
             now=T0,
         )
         ranked = by_target(entries)
@@ -194,15 +202,20 @@ class TestTrendPressure:
         assert entries[0].target == "eroding"
 
     def test_the_decline_shows_up_as_a_named_factor(self):
-        entry = by_target(rank_points(self._declining("eroding", [0.9, 0.8, 0.7]), now=T0))[
-            "eroding"
-        ]
+        entry = by_target(
+            rank_points(
+                self._declining("eroding", [0.90, 0.86, 0.82, 0.78, 0.74, 0.70]),
+                now=T0,
+            )
+        )["eroding"]
         names = [f.name for f in entry.factors]
         assert "declining trend" in names
         assert entry.trend.significant
 
     def test_a_significant_decline_triggers_even_below_the_failure_threshold(self):
-        entry = rank_points(self._declining("slipping", [0.98, 0.93, 0.88]), now=T0)[0]
+        entry = rank_points(
+            self._declining("slipping", [0.98, 0.96, 0.94, 0.92, 0.90, 0.88]), now=T0
+        )[0]
         assert entry.potential_improvement < 0.3
         assert entry.triggered
         assert "significant decline" in entry.trigger_reason
@@ -220,8 +233,15 @@ class TestUsageWeighting:
     """Volume should count without deciding the answer on its own."""
 
     def _falling(self, target, values, samples):
+        step = 25 // max(1, len(values) - 1)
         return [
-            point(SKILL_SUCCESS_RATE, target, value, days_ago=21 - 7 * i, samples=samples)
+            point(
+                SKILL_SUCCESS_RATE,
+                target,
+                value,
+                days_ago=step * (len(values) - 1 - i),
+                samples=samples,
+            )
             for i, value in enumerate(values)
         ]
 
@@ -234,8 +254,16 @@ class TestUsageWeighting:
         the milder decline came out on top.
         """
         return (
-            self._falling("collapsing", [0.91, 0.73, 0.55], samples=100)
-            + self._falling("slipping", [0.82, 0.78, 0.74], samples=200)
+            self._falling(
+                "collapsing",
+                [0.910, 0.838, 0.766, 0.694, 0.622, 0.550],
+                samples=50,
+            )
+            + self._falling(
+                "slipping",
+                [0.820, 0.804, 0.788, 0.772, 0.756, 0.740],
+                samples=100,
+            )
             + [point(SKILL_SUCCESS_RATE, "chatty", 0.99, samples=10_000)]
         )
 
@@ -292,9 +320,13 @@ class TestUsageWeighting:
         assert quiet.usage_weight > 0.3
 
     def test_compression_is_configurable(self):
+        # A rate of 0.2 rather than 0.5 so the quiet target is a demonstrated
+        # breach and survives the score floor at every compression setting.
+        # Otherwise linear weighting sinks it below min_score and it drops out
+        # of the ranking entirely, which is the behaviour under test.
         points = [
-            point(SKILL_SUCCESS_RATE, "busy", 0.5, samples=1000),
-            point(SKILL_SUCCESS_RATE, "quiet", 0.5, samples=10),
+            point(SKILL_SUCCESS_RATE, "busy", 0.2, samples=1000),
+            point(SKILL_SUCCESS_RATE, "quiet", 0.2, samples=10),
         ]
         weights = []
         for compression in (0.0, 0.01, 1.0, 100.0):
@@ -339,14 +371,14 @@ class TestFailureRateLabelling:
     def test_the_trigger_message_describes_the_quantity_it_tested(self):
         config = TriageConfig(ceiling=0.8, failure_threshold=0.3, min_samples=5)
         entry = rank_points(
-            [point(SKILL_SUCCESS_RATE, "arxiv", 0.45, samples=50)], config, now=T0
+            [point(SKILL_SUCCESS_RATE, "arxiv", 0.35, samples=50)], config, now=T0
         )[0]
         assert entry.triggered
         # The condition is headroom >= threshold, so headroom is what the
         # sentence leads with, and the real failure rate is named separately.
-        assert "headroom 35%" in entry.trigger_reason
+        assert "headroom 45%" in entry.trigger_reason
         assert "at or above threshold 30%" in entry.trigger_reason
-        assert "failure rate 55%" in entry.trigger_reason
+        assert "failure rate 65%" in entry.trigger_reason
 
     def test_both_numbers_serialise(self):
         config = TriageConfig(ceiling=0.8)
@@ -469,14 +501,38 @@ class TestCorrections:
 
 
 class TestThresholdTriggering:
-    def test_a_failure_rate_exactly_at_the_threshold_fires(self):
+    def test_a_rate_sitting_exactly_on_the_threshold_does_not_fire(self):
+        """Landing on the line is not evidence of crossing it.
+
+        A rate of 0.75 against a 0.25 threshold puts the point estimate exactly
+        at the boundary, so its interval always straddles it however many
+        samples arrive. Spending an optimization run on that is spending it on
+        a coin toss.
+        """
         config = TriageConfig(failure_threshold=0.25, min_samples=5)
         entry = rank_points(
             [point(SKILL_SUCCESS_RATE, "arxiv", 0.75, samples=20)], config, now=T0
         )[0]
         assert entry.potential_improvement == pytest.approx(0.25)
+        assert not entry.triggered
+
+    def test_a_demonstrated_breach_fires(self):
+        """Worse than the threshold by more than the noise, so it fires."""
+        config = TriageConfig(failure_threshold=0.25, min_samples=5)
+        entry = rank_points(
+            [point(SKILL_SUCCESS_RATE, "arxiv", 0.55, samples=100)], config, now=T0
+        )[0]
         assert entry.triggered
         assert "at or above threshold" in entry.trigger_reason
+
+    def test_the_same_breach_on_a_thin_sample_does_not_fire(self):
+        """Identical rate, too few observations to rule out noise."""
+        config = TriageConfig(failure_threshold=0.25, min_samples=5)
+        entry = rank_points(
+            [point(SKILL_SUCCESS_RATE, "arxiv", 0.55, samples=8)], config, now=T0
+        )[0]
+        assert entry.potential_improvement == pytest.approx(0.45)
+        assert not entry.triggered
 
     def test_just_below_the_threshold_does_not_fire(self):
         config = TriageConfig(failure_threshold=0.25, min_samples=5)
@@ -504,7 +560,11 @@ class TestThresholdTriggering:
     def test_a_custom_threshold_is_honoured(self):
         points = [point(SKILL_SUCCESS_RATE, "arxiv", 0.85, samples=50)]
         assert not rank_points(points, TriageConfig(failure_threshold=0.3), now=T0)[0].triggered
-        assert rank_points(points, TriageConfig(failure_threshold=0.1), now=T0)[0].triggered
+        # 0.85 over 50 samples reaches 0.93 at the top of its interval, so a
+        # 0.10 threshold is not demonstrated; 0.60 over 200 is.
+        assert not rank_points(points, TriageConfig(failure_threshold=0.1), now=T0)[0].triggered
+        clear = [point(SKILL_SUCCESS_RATE, "arxiv", 0.60, samples=200)]
+        assert rank_points(clear, TriageConfig(failure_threshold=0.1), now=T0)[0].triggered
 
     def test_triggers_helper_returns_only_fired_entries(self, tmp_path):
         store = MetricStore(tmp_path / "m.jsonl", clock=lambda: T0)

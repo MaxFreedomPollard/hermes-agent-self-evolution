@@ -51,6 +51,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Sequence
 
+from evolution.core.stats import Interval, wilson_interval
 from evolution.monitor.metrics import (
     BENCHMARK_SCORE,
     SECONDS_PER_DAY,
@@ -470,6 +471,21 @@ def rank_points(
     return kept
 
 
+def _rate_interval(value: float, samples: int, config: "TriageConfig") -> Interval:
+    """Wilson interval on a rate reconstructed from its mean and sample count.
+
+    Metric points carry a rate and how many observations it summarizes rather
+    than raw successes, so the success count is recovered as ``value *
+    samples``. That is exact whenever the rate really was a proportion over
+    those samples, which is what the four tracked metrics are.
+    """
+    if samples <= 0:
+        return Interval(value, 0.0, 1.0, estimable=False)
+    bounded = min(max(value, 0.0), 1.0)
+    successes = int(round(bounded * samples))
+    return wilson_interval(successes, samples)
+
+
 def _score_quality_series(
     *,
     metric: str,
@@ -532,7 +548,21 @@ def _score_quality_series(
 
     triggered = False
     reason = ""
-    if aggregate.samples >= config.min_samples and headroom >= config.failure_threshold:
+    # The trigger is the one decision in this module that spends money, so it
+    # asks for evidence rather than a point estimate. A count floor
+    # (min_samples) says how much data arrived, not how much of the shortfall
+    # is real: 21 successes in 30 sits at 0.70 with a Wilson interval reaching
+    # 0.83, so the "30% headroom" that clears a 30% threshold is equally
+    # consistent with 17%. Requiring the interval's upper bound to stay bad
+    # enough means the run only fires when the shortfall survives its own
+    # uncertainty.
+    rate_interval = _rate_interval(value, aggregate.samples, config)
+    worst_tolerable = config.ceiling - config.failure_threshold
+    if (
+        aggregate.samples >= config.min_samples
+        and headroom >= config.failure_threshold
+        and rate_interval.high <= worst_tolerable + 1e-9
+    ):
         triggered = True
         # The condition tests headroom, so the sentence says headroom. The two
         # are the same number only at a ceiling of 1.0: against a 0.8 ceiling,
@@ -541,7 +571,8 @@ def _score_quality_series(
         reason = (
             f"headroom {headroom:.0%} to the {config.ceiling:.2f} ceiling is at or "
             f"above threshold {config.failure_threshold:.0%} over "
-            f"{aggregate.samples} observations (failure rate {failure_rate:.0%})"
+            f"{aggregate.samples} observations (failure rate {failure_rate:.0%}, "
+            f"rate {rate_interval.describe()})"
         )
     elif trend.significant and aggregate.samples >= config.min_samples:
         triggered = True

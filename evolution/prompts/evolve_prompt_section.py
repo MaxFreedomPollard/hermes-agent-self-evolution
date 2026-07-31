@@ -92,6 +92,11 @@ from evolution.prompts.sections import (
 console = Console()
 
 # PLAN.md: "Benchmarks hold or improve (zero tolerance for regression here)."
+# Binary floating point makes 0.6 - 0.5 come out at 0.09999999999999998, so a
+# strict comparison rejected an exactly-10% lift against a 10% bar and printed
+# "+10.0% is under the 10% threshold". Compare with a hair of slack instead.
+_FLOAT_SLACK = 1e-9
+
 ZERO_REGRESSION_TOLERANCE = 0.0
 
 # Narrow slice of hermes-agent's suite. The full suite is 2550+ tests and none
@@ -307,10 +312,10 @@ class HoldoutComparison:
         """Significant on the test AND large enough to be worth deploying."""
         if not self.overall.significant_improvement:
             return False
-        if self.overall.delta < self.practical_threshold:
+        if self.overall.delta < self.practical_threshold - _FLOAT_SLACK:
             return False
         targeted = self.targeted
-        if targeted is not None and targeted.n and targeted.delta < self.practical_threshold:
+        if targeted is not None and targeted.n and targeted.delta < self.practical_threshold - _FLOAT_SLACK:
             return False
         return True
 
@@ -363,10 +368,10 @@ class HoldoutComparison:
             return "regressed: " + ", ".join(self.regressed_categories)
         if not self.overall.significant_improvement:
             return f"inconclusive (p={self.overall.wilcoxon_p:.3f})"
-        if self.overall.delta < self.practical_threshold:
+        if self.overall.delta < self.practical_threshold - _FLOAT_SLACK:
             return f"under the {self.practical_threshold:.0%} bar"
         targeted = self.targeted
-        if targeted is not None and targeted.n and targeted.delta < self.practical_threshold:
+        if targeted is not None and targeted.n and targeted.delta < self.practical_threshold - _FLOAT_SLACK:
             return f"targeted {targeted.delta:+.1%}, under the bar"
         return "accepted"
 
@@ -386,13 +391,13 @@ class HoldoutComparison:
                 f"inconclusive: {self.overall.delta:+.1%} is not distinguishable "
                 f"from noise (p={self.overall.wilcoxon_p:.3f}); {self.shortfall_note}"
             )
-        if self.overall.delta < self.practical_threshold:
+        if self.overall.delta < self.practical_threshold - _FLOAT_SLACK:
             return (
                 f"significant but small: {self.overall.delta:+.1%} is under the "
                 f"{self.practical_threshold:.0%} practical threshold"
             )
         targeted = self.targeted
-        if targeted is not None and targeted.n and targeted.delta < self.practical_threshold:
+        if targeted is not None and targeted.n and targeted.delta < self.practical_threshold - _FLOAT_SLACK:
             return (
                 f"targeted category {self.targeted_category} moved "
                 f"{targeted.delta:+.1%}, under the {self.practical_threshold:.0%} "
@@ -813,7 +818,7 @@ def evolve(
 
     # ── 4. Baseline behaviour ────────────────────────────────────────────
     _banner("Baseline behaviour")
-    lm = dspy.LM(eval_model)
+    lm = dspy.LM(eval_model, temperature=0.0)
     dspy.configure(lm=lm)
     fast_judge = BehavioralJudge(use_llm=False)
 

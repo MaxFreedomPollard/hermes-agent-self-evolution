@@ -694,7 +694,7 @@ class ScenarioGenerator:
             num_scenarios=count,
         )
         if self.model:
-            with dspy.context(lm=dspy.LM(self.model)):
+            with dspy.context(lm=dspy.LM(self.model, temperature=0.0)):
                 result = self.predictor(**kwargs)
         else:
             result = self.predictor(**kwargs)
@@ -971,7 +971,7 @@ class BehavioralJudge:
         )
         try:
             if self.model:
-                with dspy.context(lm=dspy.LM(self.model)):
+                with dspy.context(lm=dspy.LM(self.model, temperature=0.0)):
                     result = self.predictor(**kwargs)
             else:
                 result = self.predictor(**kwargs)
@@ -1461,7 +1461,7 @@ class DirectPromptHarness:
         module = SectionBehaviorModule(
             system_prompt, section_name, predictor=self.predictor
         )
-        lm = dspy.LM(self.model) if self.model else None
+        lm = dspy.LM(self.model, temperature=0.0) if self.model else None
 
         transcripts: list[AgentTranscript] = []
         for scenario in scenarios:

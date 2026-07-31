@@ -710,11 +710,17 @@ class TestHoldoutPairing:
 
 
 class TestPower:
-    def test_four_scenarios_is_the_floor_at_alpha_five_percent(self):
+    def test_six_scenarios_is_the_floor_at_alpha_five_percent(self):
         """The floor assumes the friendliest possible data: every scenario
-        moving the same way by the same amount, which is where the tie
-        correction takes the variance as low as it goes."""
-        assert ep.min_scenarios_for_significance(0.05) == 4
+        moving the same way by the same amount.
+
+        Six, not four. With every pair moving the same way the exact
+        signed-rank p is 2 * 0.5**n, so four pairs give 0.125 and six give
+        0.031. The normal approximation reported 0.046 at n = 4 and would have
+        deployed a prompt on it.
+        """
+        assert ep.min_scenarios_for_significance(0.05) == 6
+        assert 2 * 0.5 ** 6 < 0.05 <= 2 * 0.5 ** 5
 
     def test_a_stricter_alpha_needs_a_bigger_suite(self):
         assert ep.min_scenarios_for_significance(0.01) > ep.min_scenarios_for_significance(0.05)
@@ -728,21 +734,41 @@ class TestPower:
         assert comparison.underpowered
         assert not comparison.accepted
 
-    def test_unequal_movement_needs_more_than_the_floor(self):
-        """Real judge scores do not move by identical amounts, and the floor
-        is not reachable without that."""
-        base, cand = holdout_reports(
-            ["memory_guidance"] * 4, [0.10, 0.20, 0.30, 0.40], [0.20, 0.50, 0.80, 1.00]
+    def test_the_floor_only_holds_when_every_scenario_agrees(self):
+        """Reaching the floor needs unanimity, not just size.
+
+        Under the exact signed-rank null the magnitudes are irrelevant once
+        every pair moves the same way: p is 2 * 0.5**n whatever the sizes. So
+        six unanimous scenarios clear alpha, and six scenarios where one moves
+        against the rest do not, at 0.44.
+        """
+        floor = ep.min_scenarios_for_significance(0.05)
+
+        unanimous = ep.compare_holdout(
+            *holdout_reports(
+                ["memory_guidance"] * floor,
+                [0.10, 0.20, 0.30, 0.40, 0.50, 0.60],
+                [0.20, 0.50, 0.80, 1.00, 0.55, 0.62],
+            )
         )
-        comparison = ep.compare_holdout(base, cand)
-        assert comparison.n == ep.min_scenarios_for_significance(0.05)
-        assert not comparison.overall.significant_improvement
+        assert unanimous.n == floor
+        assert unanimous.overall.significant_improvement
+
+        one_dissenter = ep.compare_holdout(
+            *holdout_reports(
+                ["memory_guidance"] * floor,
+                [0.10, 0.20, 0.30, 0.40, 0.50, 0.90],
+                [0.20, 0.30, 0.40, 0.50, 0.60, 0.20],
+            )
+        )
+        assert one_dissenter.n == floor
+        assert not one_dissenter.overall.significant_improvement
 
     def test_an_underpowered_run_says_how_many_more_scenarios_it_needs(self):
         base, cand = uniform_holdout({"memory_guidance": (0.60, 3)})
         comparison = ep.compare_holdout(base, cand)
-        assert comparison.scenarios_needed == 1
-        assert "1 more holdout scenario" in comparison.reason
+        assert comparison.scenarios_needed == 3
+        assert "3 more holdout scenario" in comparison.reason
         assert "sample size talking" in comparison.power_note
 
     def test_a_powered_run_is_not_flagged_underpowered(self):
@@ -844,8 +870,14 @@ class TestAggregateVerdict:
 
 class TestCategoryGuard:
     def test_one_wrecked_category_sinks_an_improving_aggregate(self):
+        """Six wrecked scenarios: the rejection is carried by the test itself.
+
+        Six is the floor for the exact signed-rank null, so this is the
+        smallest category that can be refused on evidence rather than on the
+        tolerance alone.
+        """
         base, cand = uniform_holdout(
-            {"memory_guidance": (0.50, 10), "platform_formatting": (-0.20, 5)}
+            {"memory_guidance": (0.50, 10), "platform_formatting": (-0.20, 6)}
         )
         comparison = ep.compare_holdout(base, cand, targeted_category="memory_guidance")
 
@@ -856,6 +888,21 @@ class TestCategoryGuard:
         assert not comparison.accepted
         assert "category regression" in comparison.reason
         assert comparison.headline == "regressed: platform_formatting"
+
+    def test_five_wrecked_scenarios_are_refused_on_the_tolerance_alone(self):
+        """One below the floor the exact test cannot convict, so the point
+        estimate has to. The candidate is refused either way, which is the
+        whole reason the rule is a disjunction."""
+        base, cand = uniform_holdout(
+            {"memory_guidance": (0.50, 10), "platform_formatting": (-0.20, 5)}
+        )
+        comparison = ep.compare_holdout(base, cand, targeted_category="memory_guidance")
+        platform = comparison.by_category["platform_formatting"]
+
+        assert platform.wilcoxon_p == pytest.approx(2 * 0.5 ** 5)
+        assert not platform.significant_regression
+        assert comparison.regressed_categories == ("platform_formatting",)
+        assert not comparison.accepted
 
     def test_a_point_estimate_breach_is_refused_without_significance(self):
         """Conservative gate: either kind of evidence is enough to reject."""
@@ -959,7 +1006,7 @@ class TestHoldoutSerialisation:
         assert set(data["by_category"]) == {"memory_guidance", "platform_formatting"}
         assert data["targeted"]["delta"] == pytest.approx(0.50)
         assert data["regressed_categories"] == ["platform_formatting"]
-        assert data["min_scenarios_for_significance"] == 4
+        assert data["min_scenarios_for_significance"] == 6
         assert data["movement"] == {"improved": 10, "regressed": 5, "unchanged": 0}
         assert data["accepted"] is False
 

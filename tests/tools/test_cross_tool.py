@@ -666,7 +666,10 @@ class TestIntervalsInTheRecords:
         assert row["tool"] == "read_file"
         assert row["baseline_rate"] == 1.0 and row["candidate_rate"] == 0.875
         assert row["delta"] == -0.125
-        assert row["delta_ci"]["low"] < row["delta"] < row["delta_ci"]["high"]
+        # When every disagreement points the same way the point estimate sits on
+        # the interval's edge rather than inside it, so the bound is inclusive.
+        assert row["delta_ci"]["low"] <= row["delta"] <= row["delta_ci"]["high"]
+        assert row["delta_ci"]["high"] > row["delta_ci"]["low"]
         assert row["p_worse"] == pytest.approx(0.03125)
         assert row["significant_regression"] is True
         assert row["underpowered"] is False
@@ -737,3 +740,59 @@ class TestAccuracyAgainstChance:
         assert built.chance_accuracy == 0.0
         assert built.accuracy_interval().point == 0.0
         assert "0 example(s)" in built.describe_accuracy()
+
+
+class TestDeltaMatchesItsEvidence:
+    """The delta a verdict rejects on must describe the examples it tested.
+
+    Audit finding: with a partial candidate run, the whole-report rates and the
+    paired comparison covered different populations, and the headline delta
+    could land outside its own confidence interval.
+    """
+
+    def _rate(self, tool, outcomes, keys):
+        return ToolRate(
+            tool=tool,
+            opportunities=len(outcomes),
+            correct=sum(1 for o in outcomes if o),
+            outcomes=tuple(outcomes),
+            example_keys=tuple(keys),
+        )
+
+    def test_delta_comes_from_the_pairing_not_the_whole_report(self):
+        keys = [f"task{i}" for i in range(20)]
+        baseline = CrossToolReport(
+            rates={"read_file": self._rate("read_file", [True] * 10 + [False] * 10, keys)},
+            n=20,
+        )
+        # The candidate only managed two of the twenty, and got both right.
+        candidate = CrossToolReport(
+            rates={"read_file": self._rate("read_file", [True, True], keys[:2])},
+            n=2,
+        )
+        verdict = CrossToolGuard(min_opportunities=1).compare(baseline, candidate)
+        record = verdict.comparison("read_file")
+
+        assert record is not None
+        assert record.paired is not None
+        assert record.paired.n == 2
+        assert record.delta == pytest.approx(record.paired.delta)
+        assert record.population_mismatch
+        # The unpaired view is still available, just never gated on.
+        assert record.unpaired_delta != record.delta
+
+    def test_the_delta_sits_inside_its_own_interval(self):
+        keys = [f"task{i}" for i in range(20)]
+        baseline = CrossToolReport(
+            rates={"read_file": self._rate("read_file", [True] * 10 + [False] * 10, keys)},
+            n=20,
+        )
+        candidate = CrossToolReport(
+            rates={"read_file": self._rate("read_file", [True, True], keys[:2])},
+            n=2,
+        )
+        record = CrossToolGuard(min_opportunities=1).compare(
+            baseline, candidate
+        ).comparison("read_file")
+        interval = record.paired.delta_interval()
+        assert interval.low <= record.delta <= interval.high

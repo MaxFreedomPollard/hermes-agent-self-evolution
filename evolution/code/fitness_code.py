@@ -122,6 +122,11 @@ FIXED_MARKERS = ("BUG_FIXED", "BUG FIXED")
 PRESENT_MARKERS = ("BUG_PRESENT", "BUG_REPRODUCED", "BUG PRESENT")
 
 
+# 0.500 - 0.480 is 0.020000000000000018, so a margin equal to the resolution
+# tested as strictly greater and got reported as resolved.
+_FLOAT_SLACK = 1e-9
+
+
 @dataclass
 class ReproResult:
     """What one run of a reproduction script said."""
@@ -280,6 +285,12 @@ class ReproTrials:
             f"fixed {self.fixes}/{self.measured_runs} run(s), "
             f"{self.interval().describe()}"
         )
+        # Runs that errored or timed out measured nothing, so they are not in
+        # the denominator. Saying so keeps "fixed 1/1" from reading like a clean
+        # single-trial pass when in fact two runs happened and one blew up.
+        unmeasured = self.n - self.measured_runs
+        if unmeasured:
+            text += f" ({unmeasured} of {self.n} run(s) returned no verdict)"
         if self.flaky:
             text += " - flaky, not a fix"
         return text
@@ -659,9 +670,19 @@ class SuiteComparison:
         return self.paired.significant_improvement
 
     @property
+    def coverage_changed(self) -> bool:
+        """True when the candidate run did not cover the same set of tests.
+
+        A test that stopped being collected is not a test that passed. Fifty of
+        a hundred tests silently disappearing has to read as a coverage change,
+        not as an identical run.
+        """
+        return bool(self.added or self.removed)
+
+    @property
     def unchanged(self) -> bool:
-        """True when not one shared test changed its outcome."""
-        return self.paired.discordant == 0
+        """True when the same tests ran and not one of them changed outcome."""
+        return self.paired.discordant == 0 and not self.coverage_changed
 
     @property
     def verdict(self) -> str:
@@ -669,6 +690,8 @@ class SuiteComparison:
             return "significant regression"
         if self.significant_improvement:
             return "significant improvement"
+        if self.coverage_changed:
+            return "coverage changed"
         if self.unchanged:
             return "identical outcomes"
         return "no significant change"
@@ -873,7 +896,7 @@ class CandidateRanking:
         for it to be confused with.
         """
         margin = self.margin
-        return margin is None or margin > self.resolution
+        return margin is None or margin > self.resolution + _FLOAT_SLACK
 
     @property
     def within_noise(self) -> bool:
@@ -992,7 +1015,7 @@ def rank_candidates(
         runner_up=runner_up.label if runner_up else None,
         runner_up_score=runner_up.total if runner_up else None,
         tied=tuple(
-            f.label for f in ranked if winner.total - f.total <= resolution
+            f.label for f in ranked if winner.total - f.total <= resolution + _FLOAT_SLACK
         ),
         winner_coverage=winner.evidence_coverage,
         runner_up_coverage=runner_up.evidence_coverage if runner_up else None,

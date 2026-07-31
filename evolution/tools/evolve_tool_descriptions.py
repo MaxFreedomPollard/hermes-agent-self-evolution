@@ -467,7 +467,7 @@ def evolve_tool_descriptions(
         builder = ToolSelectionDatasetBuilder(
             catalog=catalog,
             config=config,
-            lm=dspy.LM(config.judge_model),
+            lm=dspy.LM(config.judge_model, temperature=0.0),
         )
         dataset = builder.generate()
         if not dataset.all_examples:
@@ -492,7 +492,7 @@ def evolve_tool_descriptions(
 
     # ── 3. Baseline measurement ─────────────────────────────────────────
     _banner("3. Baseline measurement")
-    lm = dspy.LM(config.eval_model)
+    lm = dspy.LM(config.eval_model, temperature=0.0)
     dspy.configure(lm=lm)
 
     baseline_module = ToolSelector(baseline_bundle, signatures)

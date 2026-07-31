@@ -860,7 +860,20 @@ class TestCompareTestSuites:
         assert comparison.n == 1
         assert comparison.added == ("a::new",)
         assert comparison.removed == ("a::gone",)
-        assert comparison.unchanged
+        # The shared test did not move, but the suite is not the same suite.
+        assert comparison.paired.discordant == 0
+        assert comparison.coverage_changed
+        assert not comparison.unchanged
+        assert comparison.verdict == "coverage changed"
+
+    def test_a_vanishing_test_is_not_an_identical_run(self):
+        """Fifty tests that stopped being collected are not fifty passes."""
+        baseline = {f"a::t{i}": True for i in range(100)}
+        candidate = {f"a::t{i}": True for i in range(50)}
+        comparison = compare_test_suites(baseline, candidate)
+        assert len(comparison.removed) == 50
+        assert not comparison.unchanged
+        assert comparison.verdict == "coverage changed"
 
     def test_no_shared_test_is_no_comparison(self):
         assert compare_test_suites({"a::one": True}, {"b::two": True}) is None

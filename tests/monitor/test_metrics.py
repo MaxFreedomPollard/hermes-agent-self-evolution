@@ -273,11 +273,20 @@ class TestTrends:
         assert not trend.significant
 
     def test_declining_series_is_declining_and_significant(self):
-        trend = compute_trend(self._series([0.9, 0.8, 0.7]))
+        # Six readings, not three. Three points on a straight line are one
+        # ordering in six, p = 0.33, and cannot carry a significance claim; the
+        # same shape over six points is one in 720. Direction is descriptive and
+        # is reported for both, but only the longer run is evidence.
+        trend = compute_trend(self._series([0.9, 0.8, 0.7, 0.6, 0.5, 0.4]))
         assert trend.direction is TrendDirection.DECLINING
-        assert trend.change == pytest.approx(-0.2)
+        assert trend.change == pytest.approx(-0.5)
         assert trend.significant
         assert trend.is_deterioration
+
+    def test_three_collinear_points_describe_a_decline_without_claiming_evidence(self):
+        trend = compute_trend(self._series([0.9, 0.8, 0.7]))
+        assert trend.direction is TrendDirection.DECLINING
+        assert not trend.significant
 
     def test_flat_series_is_flat(self):
         trend = compute_trend(self._series([0.8, 0.8, 0.8]))
@@ -347,7 +356,7 @@ class TestTrends:
         assert "/day" in described
 
     def test_trend_serialises(self):
-        blob = compute_trend(self._series([0.9, 0.8, 0.7])).to_dict()
+        blob = compute_trend(self._series([0.9, 0.8, 0.7, 0.6, 0.5, 0.4])).to_dict()
         assert blob["direction"] == "declining"
         assert blob["significant"] is True
 

@@ -53,6 +53,7 @@ __all__ = [
     "min_detectable_paired_shift",
     "paired_bootstrap_ci",
     "wilcoxon_signed_rank",
+    "signed_rank_direction",
     "PairedContinuous",
     "compare_paired_continuous",
     "OLSTrend",
@@ -60,6 +61,7 @@ __all__ = [
     "cohens_h",
     "cohens_d",
     "chance_accuracy",
+    "mann_kendall",
     "student_t_sf",
     "binomial_sf",
     "binomial_cdf",
@@ -176,12 +178,19 @@ def student_t_sf(t: float, df: float) -> float:
 
 @dataclass(frozen=True)
 class Interval:
-    """A confidence interval on a point estimate."""
+    """A confidence interval on a point estimate.
+
+    ``estimable`` is False when the sample cannot support an interval at all -
+    for example a bootstrap over differences that are all identical, which has
+    no spread to resample. A zero-width interval is then a statement about the
+    sample, not a claim of certainty, and callers must not print it as one.
+    """
 
     point: float
     low: float
     high: float
     confidence: float = 0.95
+    estimable: bool = True
 
     @property
     def width(self) -> float:
@@ -191,6 +200,9 @@ class Interval:
         return self.low <= value <= self.high
 
     def describe(self, as_percent: bool = True) -> str:
+        if not self.estimable:
+            body = f"{self.point:.1%}" if as_percent else f"{self.point:.3f}"
+            return f"{body} [interval not estimable from this sample]"
         if as_percent:
             return f"{self.point:.1%} [{self.low:.1%}, {self.high:.1%}]"
         return f"{self.point:.3f} [{self.low:.3f}, {self.high:.3f}]"
@@ -201,6 +213,7 @@ class Interval:
             "low": round(self.low, 6),
             "high": round(self.high, 6),
             "confidence": self.confidence,
+            "estimable": self.estimable,
         }
 
 
@@ -325,18 +338,40 @@ class PairedBinary:
     def delta_interval(self) -> Interval:
         """Confidence interval on the paired difference in rates.
 
-        Uses the standard McNemar variance for a difference of correlated
-        proportions. Only discordant pairs contribute, which is why a candidate
-        that changes nothing has an interval of zero width regardless of n.
+        Built conditionally on the discordant pairs rather than from the Wald
+        variance. The Wald form ``(b + c - (c-b)**2/n) / n**2`` collapses to
+        exactly zero whenever every disagreement points the same way, so a
+        candidate that flipped ten out of ten examples in its favour reported a
+        zero-width 95% interval around +100%. That is the same degeneracy this
+        module rejects Wald for in :func:`wilson_interval`, and it is worse
+        here because it appears precisely on the strongest results.
+
+        Conditioning fixes it. With ``m = b + c`` disagreements, the count that
+        went the candidate's way is Binomial(m, pi). A Wilson interval on
+        ``c / m`` maps back to the rate scale through ``(2*pi - 1) * m / n``,
+        which is never zero-width for m > 0. With no disagreements at all there
+        is nothing to condition on, so the discordant *rate* is bounded by a
+        Wilson interval on ``0 / n`` and the difference is bounded symmetrically
+        by it.
         """
         if self.n <= 0:
-            return Interval(0.0, 0.0, 0.0, self.confidence)
+            return Interval(0.0, 0.0, 0.0, self.confidence, estimable=False)
+
         b, c, n = self.baseline_only, self.candidate_only, self.n
-        variance = (b + c - (c - b) ** 2 / n) / (n * n)
-        se = math.sqrt(max(0.0, variance))
-        z = _z_for(self.confidence)
+        m = b + c
         d = self.delta
-        return Interval(d, max(-1.0, d - z * se), min(1.0, d + z * se), self.confidence)
+
+        if m == 0:
+            # No example changed. The rate of disagreement is not zero, it is
+            # merely unobserved, so bound it and let the difference inherit it.
+            bound = wilson_interval(0, n, self.confidence).high
+            return Interval(d, max(-1.0, -bound), min(1.0, bound), self.confidence)
+
+        pi = wilson_interval(c, m, self.confidence)
+        scale = m / n
+        low = (2 * pi.low - 1) * scale
+        high = (2 * pi.high - 1) * scale
+        return Interval(d, max(-1.0, low), min(1.0, high), self.confidence)
 
     def min_detectable_shift(self) -> float:
         return min_detectable_paired_shift(self.n, self.alpha)
@@ -452,23 +487,70 @@ def paired_bootstrap_ci(
     return Interval(point, means[lo_index], means[hi_index], confidence)
 
 
+# Above this many non-zero differences the exact null is not worth enumerating
+# and the normal approximation is accurate anyway.
+_EXACT_WILCOXON_MAX_N = 50
+
+
+def _exact_signed_rank_p(ranks: Sequence[float], w_plus: float) -> float:
+    """Two-sided exact p for the signed-rank null, conditional on the ranks.
+
+    Under the null each difference is equally likely to carry a plus or a minus,
+    so the null distribution of W+ is the distribution of subset sums of the
+    observed ranks over all 2**n sign assignments. Counting those subset sums by
+    dynamic programming is exact and cheap, where enumerating the assignments
+    would not be. Ranks are doubled first so that the half-integer average ranks
+    produced by ties stay on an integer lattice.
+    """
+    doubled = [int(round(r * 2)) for r in ranks]
+    total = sum(doubled)
+    counts = [0] * (total + 1)
+    counts[0] = 1
+    for value in doubled:
+        for s in range(total, value - 1, -1):
+            if counts[s - value]:
+                counts[s] += counts[s - value]
+
+    assignments = 2 ** len(doubled)
+    target = int(round(w_plus * 2))
+    at_or_below = sum(counts[: target + 1]) if target >= 0 else 0
+    at_or_above = sum(counts[target:]) if target <= total else 0
+    return min(1.0, 2.0 * min(at_or_below, at_or_above) / assignments)
+
+
 def wilcoxon_signed_rank(
     baseline: Sequence[float], candidate: Sequence[float]
 ) -> tuple[float, float]:
     """Wilcoxon signed-rank test on paired differences.
 
-    Returns ``(statistic, two_sided_p)``. Zero differences are dropped and ties
-    receive average ranks, both standard. The p-value uses the normal
-    approximation with a tie correction, which is reasonable from about eight
-    non-zero differences; below that it is reported but should be read as
-    indicative, and the exact McNemar path is the better tool for binary data.
+    Returns ``(statistic, two_sided_p)``, where the statistic is
+    ``min(W+, W-)``. Zero differences are dropped and ties receive average
+    ranks, both standard.
+
+    The p-value is **exact** for up to :data:`_EXACT_WILCOXON_MAX_N` non-zero
+    differences and uses the tie-corrected normal approximation above that. The
+    approximation is badly anti-conservative in the small-sample regime these
+    eval sets live in: with four pairs all moving the same way it reports
+    p = 0.046 where the exact answer is 0.125, which is the difference between
+    deploying a system prompt and correctly refusing to.
+
+    Use :func:`signed_rank_direction` to find which way the ranks point. The
+    statistic alone is directionless by construction.
     """
+    w_plus, w_minus, statistic, p = _signed_rank_parts(baseline, candidate)
+    return statistic, p
+
+
+def _signed_rank_parts(
+    baseline: Sequence[float], candidate: Sequence[float]
+) -> tuple[float, float, float, float]:
+    """Return ``(w_plus, w_minus, statistic, two_sided_p)``."""
     if len(baseline) != len(candidate):
         raise ValueError("wilcoxon needs equal lengths")
     diffs = [c - b for b, c in zip(baseline, candidate) if c != b]
     n = len(diffs)
     if n == 0:
-        return 0.0, 1.0
+        return 0.0, 0.0, 0.0, 1.0
 
     ordered = sorted(range(n), key=lambda i: abs(diffs[i]))
     ranks = [0.0] * n
@@ -486,6 +568,9 @@ def wilcoxon_signed_rank(
     w_minus = sum(r for d, r in zip(diffs, ranks) if d < 0)
     statistic = min(w_plus, w_minus)
 
+    if n <= _EXACT_WILCOXON_MAX_N:
+        return w_plus, w_minus, statistic, _exact_signed_rank_p(ranks, w_plus)
+
     mean = n * (n + 1) / 4.0
     tie_groups: dict[float, int] = {}
     for d in diffs:
@@ -493,9 +578,28 @@ def wilcoxon_signed_rank(
     tie_term = sum(t**3 - t for t in tie_groups.values())
     variance = (n * (n + 1) * (2 * n + 1) - tie_term / 2.0) / 24.0
     if variance <= 0:
-        return statistic, 1.0
+        return w_plus, w_minus, statistic, 1.0
     z = (statistic - mean) / math.sqrt(variance)
-    return statistic, min(1.0, 2.0 * _NORM.cdf(-abs(z)))
+    return w_plus, w_minus, statistic, min(1.0, 2.0 * _NORM.cdf(-abs(z)))
+
+
+def signed_rank_direction(
+    baseline: Sequence[float], candidate: Sequence[float]
+) -> int:
+    """Which way the signed ranks point: +1 better, -1 worse, 0 no signal.
+
+    The rank test and the mean answer different questions and can disagree. One
+    scenario collapsing from 1.0 to 0.0 while eleven others each improve pulls
+    the mean negative even though the ranks clearly favour the candidate. Taking
+    the p-value from the ranks and the direction from the mean then labels that
+    a significant *regression*, which is the opposite of what happened.
+    """
+    w_plus, w_minus, _, _ = _signed_rank_parts(baseline, candidate)
+    if w_plus > w_minus:
+        return 1
+    if w_minus > w_plus:
+        return -1
+    return 0
 
 
 @dataclass
@@ -510,19 +614,43 @@ class PairedContinuous:
     wilcoxon_p: float
     effect_size: float
     alpha: float = 0.05
+    rank_direction: int = 0  # +1 ranks favour candidate, -1 baseline, 0 tied
+
+    @property
+    def direction_conflict(self) -> bool:
+        """True when the mean and the ranks disagree about which way it moved.
+
+        A single collapsed observation can drag the mean one way while every
+        other pair moves the other. When that happens neither direction is
+        claimed: the honest reading is that the result depends on an outlier,
+        and a gate should look at the data rather than take a verdict.
+        """
+        if self.rank_direction == 0 or self.delta == 0:
+            return False
+        return (self.rank_direction > 0) != (self.delta > 0)
 
     @property
     def significant_improvement(self) -> bool:
-        return self.wilcoxon_p < self.alpha and self.delta > 0
+        return (
+            self.wilcoxon_p < self.alpha
+            and self.delta > 0
+            and self.rank_direction >= 0
+            and not self.direction_conflict
+        )
 
     @property
     def significant_regression(self) -> bool:
-        return self.wilcoxon_p < self.alpha and self.delta < 0
+        return (
+            self.wilcoxon_p < self.alpha
+            and self.delta < 0
+            and self.rank_direction <= 0
+            and not self.direction_conflict
+        )
 
     @property
     def inconclusive(self) -> bool:
         """True when the interval straddles zero: no evidence either way."""
-        return self.delta_ci.contains(0.0)
+        return self.direction_conflict or self.delta_ci.contains(0.0)
 
     def describe(self) -> str:
         return (
@@ -565,7 +693,8 @@ def compare_paired_continuous(
         )
     base_mean = sum(baseline) / n
     cand_mean = sum(candidate) / n
-    _, p = wilcoxon_signed_rank(baseline, candidate)
+    w_plus, w_minus, _, p = _signed_rank_parts(baseline, candidate)
+    direction = 1 if w_plus > w_minus else (-1 if w_minus > w_plus else 0)
     return PairedContinuous(
         n=n,
         baseline_mean=base_mean,
@@ -577,12 +706,79 @@ def compare_paired_continuous(
         wilcoxon_p=p,
         effect_size=cohens_d(baseline, candidate),
         alpha=alpha,
+        rank_direction=direction,
     )
 
 
 # ──────────────────────────────────────────────────────────────────────────
 # Trends
 # ──────────────────────────────────────────────────────────────────────────
+
+
+def mann_kendall(ys: Sequence[float]) -> tuple[int, float]:
+    """Distribution-free monotonic trend test. Returns ``(S, two_sided_p)``.
+
+    ``S`` counts concordant minus discordant pairs. The test asks only whether
+    the ordering is monotonic, so it needs no residual variance and stays valid
+    exactly where the least-squares t-test breaks down: a perfectly straight
+    line has nothing left to estimate sigma from, but it is still either an
+    unlikely ordering or a common one.
+
+    Exact for up to 20 points with no repeated values, by counting permutations
+    with each inversion number (the Mahonian distribution). Above that, or with
+    ties, the tie-corrected normal approximation is used.
+
+    The exact answers are the reason this is worth doing: a perfectly monotone
+    run of three points is one ordering in six, p = 0.33, and should convince
+    nobody. The same run over six points is one in 720, p = 0.003.
+    """
+    n = len(ys)
+    if n < 3:
+        return 0, 1.0
+
+    s = 0
+    for i in range(n - 1):
+        for j in range(i + 1, n):
+            if ys[j] > ys[i]:
+                s += 1
+            elif ys[j] < ys[i]:
+                s -= 1
+
+    total_pairs = n * (n - 1) // 2
+    has_ties = len(set(ys)) < n
+
+    if not has_ties and n <= 20:
+        counts = [0] * (total_pairs + 1)
+        counts[0] = 1
+        for m in range(2, n + 1):
+            running = 0
+            updated = [0] * (total_pairs + 1)
+            for k in range(total_pairs + 1):
+                running += counts[k]
+                if k >= m:
+                    running -= counts[k - m]
+                updated[k] = running
+            counts = updated
+        total = math.factorial(n)
+        discordant = (total_pairs - s) // 2
+        at_or_below = sum(counts[: discordant + 1])
+        at_or_above = sum(counts[discordant:])
+        return s, min(1.0, 2.0 * min(at_or_below, at_or_above) / total)
+
+    tie_groups: dict[float, int] = {}
+    for y in ys:
+        tie_groups[y] = tie_groups.get(y, 0) + 1
+    tie_term = sum(t * (t - 1) * (2 * t + 5) for t in tie_groups.values())
+    variance = (n * (n - 1) * (2 * n + 5) - tie_term) / 18.0
+    if variance <= 0:
+        return s, 1.0
+    if s > 0:
+        z = (s - 1) / math.sqrt(variance)
+    elif s < 0:
+        z = (s + 1) / math.sqrt(variance)
+    else:
+        z = 0.0
+    return s, min(1.0, 2.0 * _NORM.cdf(-abs(z)))
 
 
 @dataclass
@@ -600,6 +796,8 @@ class OLSTrend:
     change: float
     slope_ci: Interval
     alpha: float = 0.05
+    degenerate: bool = False
+    method: str = "ols"
 
     @property
     def significant(self) -> bool:
@@ -607,7 +805,9 @@ class OLSTrend:
 
         This is a real test, not a magnitude threshold. A steep slope through
         three scattered points is not significant, and a shallow one through
-        forty tight points is.
+        forty tight points is. A degenerate fit - no residual scatter, so no
+        estimate of the error term - is never significant, because there was
+        nothing to test the slope against.
         """
         return self.n >= 3 and self.p_value < self.alpha
 
@@ -632,6 +832,8 @@ class OLSTrend:
             "change": round(self.change, 6),
             "slope_ci": self.slope_ci.to_dict(),
             "significant": self.significant,
+            "degenerate": self.degenerate,
+            "method": self.method,
         }
 
 
@@ -673,19 +875,44 @@ def ols_trend(
     r_squared = 1.0 - sse / sst if sst > 0 else 1.0
 
     df = n - 2
-    if df <= 0 or sse <= 0:
-        # A perfect fit has no residual scatter. Treat it as significant only
-        # when there is genuine spread in y; a flat line through flat data is not.
-        perfect = sst > 0
+    # "No residual scatter" has to be judged relative to the data, not against
+    # exact zero. Three readings on a straight line leave residuals of order
+    # 1e-16 rather than 0.0, which is enough for stderr to underflow toward zero
+    # and t to explode, manufacturing p = 0.000 from rounding error. Anything
+    # this far below the total sum of squares is a perfect fit in every sense
+    # that matters; genuine data sits many orders of magnitude above it (a
+    # convincing real decline runs around sse/sst = 5e-3).
+    degenerate_fit = sse <= sst * 1e-12
+    if df <= 0 or degenerate_fit:
+        # A fit with no residual scatter leaves nothing to estimate sigma from,
+        # so the t-test is undefined. It previously reported p = 0.000 with a
+        # zero-width slope interval and called the trend certain, which fires on
+        # any exactly collinear reading - and success rates measured over two
+        # sessions are quantized to {0, 0.5, 1.0}, where 1.0/0.5/0.0 is exactly
+        # collinear.
+        #
+        # The t-test being undefined does not make the question unanswerable.
+        # Mann-Kendall tests the ordering instead of the residuals, so it stays
+        # valid precisely here, and it gets the intuition right in both
+        # directions: a perfectly straight six-point decline is one ordering in
+        # 720 and is significant, while the same shape over three points is one
+        # in six and is not.
+        span = max(xs) - min(xs)
+        _, mk_p = mann_kendall(list(ys))
         return OLSTrend(
-            n, slope, intercept, 0.0,
-            math.inf if perfect else 0.0,
-            0.0 if perfect else 1.0,
-            r_squared,
-            max(xs) - min(xs),
-            slope * (max(xs) - min(xs)),
-            Interval(slope, slope, slope, confidence),
-            alpha,
+            n=n,
+            slope=slope,
+            intercept=intercept,
+            stderr=0.0,
+            t_statistic=0.0,
+            p_value=mk_p,
+            r_squared=r_squared,
+            span=span,
+            change=slope * span,
+            slope_ci=Interval(slope, slope, slope, confidence, estimable=False),
+            alpha=alpha,
+            degenerate=True,
+            method="mann-kendall",
         )
 
     stderr = math.sqrt(sse / df / sxx)

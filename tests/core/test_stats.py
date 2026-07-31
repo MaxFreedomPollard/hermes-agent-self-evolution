@@ -156,12 +156,32 @@ class TestPairedBinary:
         assert r.candidate_rate == pytest.approx(0.6)
         assert r.delta == pytest.approx(-0.2)
 
-    def test_identical_outcomes_give_a_zero_width_interval(self):
+    def test_identical_outcomes_centre_on_zero_but_stay_uncertain(self):
+        """No disagreement is not proof of no difference.
+
+        Three examples that both versions handled the same way put the estimate
+        at zero, but the rate of disagreement is unobserved rather than known to
+        be zero, so the interval has to stay open.
+        """
         r = compare_paired_binary([True, False, True], [True, False, True])
         interval = r.delta_interval()
         assert interval.point == 0.0
-        assert interval.width == pytest.approx(0.0)
+        assert interval.width > 0.0
+        assert interval.contains(0.0)
         assert not r.significant_regression
+
+    def test_a_clean_sweep_does_not_report_a_zero_width_interval(self):
+        """The old Wald variance collapsed to zero exactly on the strongest result."""
+        r = compare_paired_binary([False] * 10, [True] * 10)
+        interval = r.delta_interval()
+        assert interval.point == pytest.approx(1.0)
+        assert interval.width > 0.1
+        assert interval.low < 1.0
+
+    def test_more_examples_narrow_the_no_disagreement_interval(self):
+        few = compare_paired_binary([True] * 5, [True] * 5).delta_interval()
+        many = compare_paired_binary([True] * 100, [True] * 100).delta_interval()
+        assert many.width < few.width
 
     def test_large_consistent_regression_is_significant(self):
         r = compare_paired_binary([True] * 20, [False] * 8 + [True] * 12)
