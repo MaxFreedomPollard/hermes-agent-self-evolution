@@ -362,7 +362,7 @@ the quantifier, not about multiplicity being harmless. `--all-sections` measures
 one baseline holdout and then tests each section against it, deploying every
 section that clears alpha. That is a **disjunction** - "any of these worked" -
 and selecting the best of k inflates the family-wise error: four sections at
-alpha = 0.05 give `1 - 0.95**4` = 18.6 percent, not 5. Those p-values are
+alpha = 0.05 give `1 - 0.95**4` = 18.5 percent, not 5. Those p-values are
 Holm-adjusted by `holm_adjust` in `evolve_prompt_section.evolve`, and a section
 that survives alone but not the correction is dropped with its adjusted p-value
 named in the reason. Holm rather than plain Bonferroni because it is uniformly

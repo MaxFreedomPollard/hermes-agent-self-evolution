@@ -1406,7 +1406,7 @@ def evolve(
     # Each section above was tested at alpha on its own. Deploying every section
     # that clears is a disjunction - "any of these worked" - and selecting the
     # best of k inflates the family-wise error: four sections at 0.05 give
-    # 1 - 0.95**4 = 18.6%, not 5%. Holm-adjust the surviving p-values and drop
+    # 1 - 0.95**4 = 18.5%, not 5%. Holm-adjust the surviving p-values and drop
     # any that no longer clear.
     #
     # This is the opposite call from the per-category guard a few lines above,

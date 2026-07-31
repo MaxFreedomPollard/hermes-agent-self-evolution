@@ -989,7 +989,7 @@ def holm_adjust(p_values: Sequence[float]) -> list[float]:
     Use this for a **disjunction**: several candidates tested against one
     baseline where any that clears alpha gets deployed. Selecting the best of k
     inflates the family-wise error rate, and four independent sections tested at
-    0.05 give ``1 - 0.95**4`` = 18.6%, not 5%.
+    0.05 give ``1 - 0.95**4`` = 18.5%, not 5%.
 
     Do not use it for the per-tool and per-category conjunctions elsewhere in
     this codebase. Those are intersection-union tests, where accepting means
