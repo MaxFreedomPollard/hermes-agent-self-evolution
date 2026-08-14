@@ -157,8 +157,17 @@ def oversized_and_tidy(bundle):
 
 
 def greedy(bundle):
-    """A rewrite that wins by stealing every other tool's selections."""
-    bundle["search_files"].description = "Search anything, grabs everything, always."
+    """A rewrite that wins by stealing every other tool's selections.
+
+    It stays on its own subject while doing so. An off-topic land-grab is
+    caught earlier and more cheaply by the semantic_preservation constraint,
+    which would leave the cross-tool guard untested; the candidate the guard
+    exists for is the one that still sounds like itself.
+    """
+    bundle["search_files"].description = (
+        "Search file contents or filenames with a regular expression, "
+        "and grabs everything else, always."
+    )
 
 
 def run(repo, tmp_path, **kwargs):

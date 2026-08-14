@@ -136,7 +136,7 @@ getting:
 | 3 | A subset, `pytest tests/ -k prompt`. |
 | 4 | The full suite, as a hard gate. Any failure rejects the candidate outright. |
 
-Two guardrails are enforced mechanically rather than by convention:
+Three guardrails are enforced mechanically rather than by convention:
 
 **Structure is frozen.** Tool schemas and prompt constants are rewritten by replacing the
 exact source span of a single string literal, never by regenerating the file. For a tool
@@ -145,6 +145,19 @@ original, so a candidate that moves a parameter name, type, enum, default, or re
 list is rejected before it reaches disk. For a prompt constant the equivalent proof is
 `verify_only_sections_changed`, which compares the value of every module-level string
 constant and fails if anything but the targeted section moved. Only text can change.
+
+**Deleting is not drifting.** Guardrail 4 is a measurement, not a convention: every
+candidate is scored against its baseline on shared content vocabulary and rejected below
+`min_semantic_similarity`, which defaults to 0.4 and can be set to 0 to turn the check
+off. The measure is deliberately blind to two things, because a frequency-weighted one
+rejects the changes these phases exist to make. Repetition is not subject matter, so the
+comparison is on the set of terms rather than their counts: a description that repeats
+one clause six times is about the same thing as one that says it once. And a candidate
+that introduces no vocabulary the baseline did not already have cannot have changed
+subject, however much shorter it is. Twelve descriptions in a stock checkout are already
+over budget, so a similarity floor must not be the thing that forbids cutting them down.
+Whether a shorter description still describes its tool well enough is a real question,
+and the cross-tool selection-accuracy gate is what answers it.
 
 **A missing gate is not a passing gate.** A benchmark that is not installed reports
 `unavailable`, never `passed`. Runs are permissive by default so the pipeline is usable

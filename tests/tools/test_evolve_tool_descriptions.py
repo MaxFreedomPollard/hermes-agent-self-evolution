@@ -30,6 +30,13 @@ from evolution.tools.tool_catalog import ToolDescriptions, load_catalog
 # first on any large rewrite of a short baseline.
 NO_GROWTH_LIMIT = EvolutionConfig(max_prompt_growth=100.0)
 
+# Boundary cases for the size budget are written as filler ("x" * 480 against
+# "y" * 500) because only the length is under test. Filler shares no vocabulary
+# with filler, so semantic_preservation correctly reads it as a total topic
+# change; disabling it here keeps those tests measuring the one thing they name.
+# Semantic preservation has its own tests in tests/core/.
+BUDGETS_ONLY = EvolutionConfig(max_prompt_growth=100.0, min_semantic_similarity=0.0)
+
 
 def bundle(**tools) -> dict[str, ToolDescriptions]:
     return {
@@ -76,7 +83,7 @@ class TestFreezeUnselected:
 
 
 class TestConstraintBudgets:
-    def validator(self, config=NO_GROWTH_LIMIT):
+    def validator(self, config=BUDGETS_ONLY):
         return ConstraintValidator(config)
 
     def test_a_short_rewrite_is_accepted(self):
@@ -377,7 +384,13 @@ def tidy(bundle):
 
 
 def greedy(bundle):
-    bundle["search_files"].description = f"Search anything, {GREEDY_MARKER}, always."
+    # On-topic on purpose: an off-topic land-grab is rejected earlier by the
+    # semantic_preservation constraint, which would leave the cross-tool guard
+    # untested. The candidate that guard exists for still sounds like itself.
+    bundle["search_files"].description = (
+        "Search file contents or filenames with a regular expression, "
+        f"and {GREEDY_MARKER} else, always."
+    )
 
 
 class TestFullRun:
