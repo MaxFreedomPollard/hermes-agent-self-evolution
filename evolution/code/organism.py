@@ -330,14 +330,14 @@ class CodeOrganism:
         if not self._mutations:
             return None
         dropped = self._mutations.pop()
-        self._git(["reset", "--hard", dropped.parent_sha])
+        self._rewind_to(dropped.parent_sha)
         return dropped
 
     def revert_to_baseline(self) -> None:
         """Undo every mutation and return the file to its baseline content."""
         self._require_open()
         assert self._baseline_sha is not None  # guaranteed by _require_open
-        self._git(["reset", "--hard", self._baseline_sha])
+        self._rewind_to(self._baseline_sha)
         self._mutations = []
 
     def reapply(self, mutation: Mutation, label: Optional[str] = None) -> Mutation:
@@ -423,6 +423,27 @@ class CodeOrganism:
             raise OrganismError(
                 "organism is not open - use it as a context manager or call start()"
             )
+
+    def _rewind_to(self, sha: str) -> None:
+        """Move the branch back to *sha*, touching only the target file.
+
+        ``git reset --hard`` would do this in one call, and that is what this
+        used to be. But ``--hard`` rewrites the entire working tree, so an
+        operator running with ``allow_dirty=True`` lost uncommitted work in
+        files this class never staged - and ``revert_last`` runs once per
+        candidate, so the first one took it. Rewind the ref with ``--soft``,
+        which leaves the working tree alone, then restore the one path this
+        organism is allowed to move.
+        """
+        self._git(["reset", "--soft", sha])
+        restored = self._git(["checkout", sha, "--", self.relpath], check=False)
+        if restored.returncode != 0:
+            # The target does not exist at *sha*: it was untracked when the
+            # organism started and only entered history via mutate(). Leave
+            # what a hard reset left - no index entry and no file.
+            self._git(["rm", "--cached", "--force", "--quiet", "--", self.relpath],
+                      check=False)
+            self.target.unlink(missing_ok=True)
 
     def _identity_args(self) -> list[str]:
         """Supply an author only when the repo has none configured."""

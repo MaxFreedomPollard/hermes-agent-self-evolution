@@ -220,9 +220,21 @@ def require_clean_worktree(
 
 
 def _abandon_branch(repo: Path, branch: str, original: str) -> None:
-    """Put the checkout back and delete the half-built branch. Never raises."""
+    """Put the checkout back and delete the half-built branch. Never raises.
+
+    The checkout is deliberately not forced. ``git checkout --force`` discards
+    local modifications across the whole tree, which would destroy exactly the
+    unrelated work :func:`require_clean_worktree` promises will survive - and
+    this runs on the failure path, when the operator is already having a bad
+    time. A plain checkout cannot conflict here anyway: the branch is abandoned
+    before any commit lands on it, so it still points at *original*.
+
+    If the checkout does refuse, that refusal is git protecting something. Leave
+    the operator on the branch with their tree intact rather than clearing the
+    way; a stray ``evolve/`` ref is recoverable and their afternoon is not.
+    """
     try:
-        _run(["git", "checkout", "--force", original], repo)
+        _run(["git", "checkout", original], repo)
     except GitError:
         return
     try:
@@ -412,7 +424,14 @@ def build_pull_request(
 
     if commit and files:
         try:
-            _run(["git", "commit", "-m", commit_message], repo)
+            # --no-verify, matching CodeOrganism.mutate. The two used to
+            # disagree, which meant a checkout whose hooks Phase 4 ignored could
+            # still fail Phases 2 and 3. Skipping them is the deliberate choice:
+            # this commit lands on a scratch evolve/ branch that nothing merges
+            # on its own, the repo's hooks run for real when a human commits the
+            # reviewed result, and a rejecting hook here throws away a paid
+            # optimization run to enforce a rule about a branch nobody keeps.
+            _run(["git", "commit", "--no-verify", "-m", commit_message], repo)
         except Exception:
             _abandon_branch(repo, branch, original)
             raise

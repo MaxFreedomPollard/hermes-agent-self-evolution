@@ -205,6 +205,39 @@ class TestDirtyWorktree:
             assert "README.md" in status
         assert (repo / "README.md").read_text() == "operator edit\n"
 
+    def test_revert_last_leaves_unrelated_dirty_files_alone(self, repo):
+        """A rewind must not reach outside the target file.
+
+        The evolution loop calls revert_last() once per candidate, so a
+        repo-wide reset would take an operator's uncommitted work on the very
+        first one.
+        """
+        (repo / "README.md").write_text("operator edit\n")
+        with CodeOrganism(repo, "tools/file_tools.py", allow_dirty=True) as organism:
+            organism.mutate(FIXED, label="c01")
+            organism.revert_last()
+            assert (repo / "README.md").read_text() == "operator edit\n"
+        assert (repo / "README.md").read_text() == "operator edit\n"
+
+    def test_revert_to_baseline_leaves_unrelated_dirty_files_alone(self, repo):
+        (repo / "README.md").write_text("operator edit\n")
+        with CodeOrganism(repo, "tools/file_tools.py", allow_dirty=True) as organism:
+            organism.mutate(FIXED, label="c01")
+            organism.mutate(FIXED + "# two\n", label="c02")
+            organism.revert_to_baseline()
+            assert (repo / "README.md").read_text() == "operator edit\n"
+            assert organism.current_source() == organism.baseline_source
+        assert (repo / "README.md").read_text() == "operator edit\n"
+
+    def test_revert_last_leaves_unrelated_staged_work_alone(self, repo):
+        """Staged-but-uncommitted work is just as unrecoverable as unstaged."""
+        (repo / "README.md").write_text("staged edit\n")
+        git(repo, "add", "README.md")
+        with CodeOrganism(repo, "tools/file_tools.py", allow_dirty=True) as organism:
+            organism.mutate(FIXED, label="c01")
+            organism.revert_last()
+            assert (repo / "README.md").read_text() == "staged edit\n"
+
 
 class TestMutation:
     def test_mutate_writes_commits_and_diffs(self, repo):

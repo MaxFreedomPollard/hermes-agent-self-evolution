@@ -277,3 +277,76 @@ class TestAHalfBuiltBranchIsAbandoned:
         plan = build(evolved)
         plan.discard()
         plan.discard()
+
+    def test_abandoning_does_not_discard_unrelated_uncommitted_work(self, evolved):
+        """The cleanup path must honour the promise require_clean_worktree makes.
+
+        That function deliberately does not refuse over unrelated dirty files,
+        on the grounds that they survive a branch switch. A forced checkout in
+        the abandon path would make that untrue, and it would happen on the
+        failure path, where nobody is looking.
+        """
+        (evolved / "notes.md").write_text("operator's uncommitted work\n")
+        git(evolved, "add", "notes.md")
+        (evolved / "other.txt").write_text("unstaged too\n")
+
+        with pytest.raises(GitError):
+            build(evolved, files=["does_not_exist.py"])
+
+        assert (evolved / "notes.md").read_text() == "operator's uncommitted work\n"
+        assert (evolved / "other.txt").read_text() == "unstaged too\n"
+
+    def test_a_failing_commit_also_spares_unrelated_work(self, repo):
+        """The commit itself failing must not cost the operator anything either.
+
+        The unrelated file has to be *tracked and modified* to be at risk:
+        untracked files survive a forced checkout, committed-then-edited ones
+        are the ones it silently rewinds. A signing failure is used to make the
+        commit fail, because hooks are deliberately skipped (see
+        TestCommitHooksAreSkipped).
+        """
+        (repo / "notes.md").write_text("committed\n")
+        git(repo, "add", "notes.md")
+        git(repo, "commit", "-qm", "add notes")
+
+        git(repo, "config", "commit.gpgsign", "true")
+        git(repo, "config", "gpg.program", "/bin/false")
+
+        (repo / "notes.md").write_text("operator's uncommitted work\n")
+        (repo / "tool.py").write_text("DESCRIPTION = 'after'\n")
+
+        with pytest.raises(GitError):
+            build(repo)
+
+        assert (repo / "notes.md").read_text() == "operator's uncommitted work\n"
+
+
+class TestCommitHooksAreSkipped:
+    """Phases 2 and 3 skip commit hooks, matching Phase 4's CodeOrganism.
+
+    The two disagreed before: a checkout whose hooks Phase 4 ignored could still
+    fail Phases 2 and 3. Skipping is the deliberate choice, because the commit
+    lands on a scratch evolve/ branch nothing merges on its own.
+    """
+
+    def test_a_rejecting_pre_commit_hook_does_not_stop_the_run(self, evolved):
+        hook = evolved / ".git" / "hooks" / "pre-commit"
+        hook.write_text("#!/bin/sh\nexit 1\n")
+        hook.chmod(0o755)
+
+        plan = build(evolved)
+
+        assert plan.branch.startswith("evolve/")
+        head = subprocess.run(
+            ["git", "log", "-1", "--pretty=%s"],
+            cwd=str(evolved), capture_output=True, text=True,
+        ).stdout.strip()
+        assert head.startswith("evolve: ")
+
+    def test_a_rejecting_commit_msg_hook_does_not_stop_the_run(self, evolved):
+        hook = evolved / ".git" / "hooks" / "commit-msg"
+        hook.write_text("#!/bin/sh\nexit 1\n")
+        hook.chmod(0o755)
+
+        plan = build(evolved)
+        assert plan.branch.startswith("evolve/")
