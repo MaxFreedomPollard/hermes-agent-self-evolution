@@ -73,9 +73,11 @@ class ScoreLine:
 
     @property
     def delta(self) -> float:
+        """Change from baseline to evolved."""
         return self.evolved - self.baseline
 
     def row(self) -> str:
+        """This split rendered as one Markdown table row."""
         detail = f" | {self.detail}" if self.detail else " |"
         return (
             f"| {self.split} | {self.baseline:.3f} | {self.evolved:.3f} "
@@ -157,6 +159,7 @@ class PullRequestPlan:
         self.created_branch = False
 
     def to_dict(self) -> dict:
+        """Serialise the plan, without the body text itself."""
         return {
             "branch": self.branch,
             "title": self.title,

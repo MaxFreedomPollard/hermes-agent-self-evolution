@@ -171,6 +171,7 @@ class ConstraintOutcome:
         return "; ".join(self.failures)
 
     def to_dict(self) -> dict:
+        """Serialise one constraint outcome, including whether it was reverted."""
         return {
             "target": self.target,
             "kind": self.kind,
@@ -1132,6 +1133,7 @@ def evolve_tool_descriptions(
     metrics_path = output_dir / "metrics.json"
 
     def save_metrics() -> None:
+        """Write the metrics file now, so a later crash still leaves one behind."""
         metrics_path.write_text(json.dumps(metrics, indent=2))
 
     save_metrics()

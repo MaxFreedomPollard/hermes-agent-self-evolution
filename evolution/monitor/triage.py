@@ -164,6 +164,7 @@ class TriageConfig:
     extra_metric_types: dict = field(default_factory=dict)
 
     def metric_types(self) -> dict:
+        """The metric-to-target-type map with any caller overrides applied."""
         merged = dict(METRIC_TARGET_TYPES)
         merged.update(self.extra_metric_types)
         return merged
@@ -178,6 +179,7 @@ class ScoreFactor:
     detail: str
 
     def to_dict(self) -> dict:
+        """Serialise one scoring signal and its detail."""
         return {"name": self.name, "value": self.value, "detail": self.detail}
 
 
@@ -255,6 +257,7 @@ class TriageEntry:
         return [f"{f.name}: {f.detail}" for f in self.factors]
 
     def to_dict(self) -> dict:
+        """Serialise the triage entry, its score and its signals."""
         return {
             "target": self.target,
             "target_type": self.target_type.value,
@@ -674,6 +677,7 @@ class AutoTriage:
         limit: Optional[int] = None,
         actionable_only: bool = False,
     ) -> list[TriageEntry]:
+        """Rank triage entries worst first."""
         end = self.store.now() if now is None else now
         entries = rank_points(self.store.load(), self.config, now=end)
         if actionable_only:

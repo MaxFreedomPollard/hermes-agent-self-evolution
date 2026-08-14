@@ -110,6 +110,7 @@ class FitnessError(RuntimeError):
 
 
 class ReproStatus(str, Enum):
+    """Whether the bug a candidate claims to fix still reproduces."""
     FIXED = "fixed"
     PRESENT = "present"
     UNAVAILABLE = "unavailable"
@@ -139,6 +140,7 @@ class ReproResult:
 
     @property
     def fixed(self) -> bool:
+        """True when this run reports the bug no longer reproduces."""
         return self.status is ReproStatus.FIXED
 
     @property
@@ -147,6 +149,7 @@ class ReproResult:
         return self.status in (ReproStatus.FIXED, ReproStatus.PRESENT)
 
     def to_dict(self) -> dict:
+        """Serialise the reproduction result for the run artifacts."""
         return {
             "status": self.status.value,
             "message": self.message,
@@ -187,10 +190,12 @@ class ReproTrials:
 
     @property
     def fixes(self) -> int:
+        """How many runs reported the bug fixed."""
         return sum(1 for r in self.runs if r.fixed)
 
     @property
     def fix_rate(self) -> float:
+        """Fraction of measured runs that reported the bug fixed."""
         return self.fixes / self.measured_runs if self.measured_runs else 0.0
 
     def interval(self) -> Interval:
@@ -221,6 +226,7 @@ class ReproTrials:
 
     @property
     def fixed(self) -> bool:
+        """True when the representative run reports the bug fixed."""
         return self.status is ReproStatus.FIXED
 
     @property
@@ -256,6 +262,7 @@ class ReproTrials:
 
     @property
     def message(self) -> str:
+        """The representative run's message, with the trial tally when there are several."""
         representative = self.representative
         base = representative.message if representative else "reproduction was not run"
         if self.n <= 1:
@@ -279,6 +286,7 @@ class ReproTrials:
         )
 
     def describe(self) -> str:
+        """Fix count, rate and interval across the trials."""
         if not self.measured_runs:
             return f"no verdict from {self.n} run(s)"
         text = (
@@ -296,6 +304,7 @@ class ReproTrials:
         return text
 
     def to_dict(self) -> dict:
+        """Serialise the trial set for the run artifacts."""
         return {
             "runs": self.n,
             "measured_runs": self.measured_runs,
@@ -333,9 +342,11 @@ class BugReproduction:
 
     @property
     def name(self) -> str:
+        """File name of the reproduction script."""
         return self.script.name
 
     def available(self) -> bool:
+        """True when the reproduction script exists and can be run."""
         return self.script.is_file()
 
     def command(self, python: Optional[str] = None) -> list[str]:
@@ -521,6 +532,7 @@ class PerTestGateResult(GateResult):
     outcomes: dict[str, bool] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
+        """Serialise the gate result, adding the per-test outcome tally."""
         blob = super().to_dict()
         failing = sorted(name for name, ok in self.outcomes.items() if not ok)
         blob["tests_measured"] = len(self.outcomes)
@@ -659,14 +671,17 @@ class SuiteComparison:
 
     @property
     def n(self) -> int:
+        """Number of tests shared by both runs, which is what the pairing uses."""
         return self.paired.n
 
     @property
     def significant_regression(self) -> bool:
+        """True when the paired test finds a regression at alpha."""
         return self.paired.significant_regression
 
     @property
     def significant_improvement(self) -> bool:
+        """True when the paired test finds an improvement at alpha."""
         return self.paired.significant_improvement
 
     @property
@@ -686,6 +701,7 @@ class SuiteComparison:
 
     @property
     def verdict(self) -> str:
+        """One phrase for the outcome: regression, improvement, or coverage change."""
         if self.significant_regression:
             return "significant regression"
         if self.significant_improvement:
@@ -697,6 +713,7 @@ class SuiteComparison:
         return "no significant change"
 
     def describe(self) -> str:
+        """The verdict, the paired statistics, and any newly failing or passing tests."""
         parts = [f"{self.verdict}: {self.paired.describe()}"]
         if self.newly_failing:
             parts.append(f"{len(self.newly_failing)} newly failing")
@@ -710,6 +727,7 @@ class SuiteComparison:
         return "; ".join(parts)
 
     def to_dict(self) -> dict:
+        """Serialise the comparison for the run artifacts."""
         return {
             "verdict": self.verdict,
             "paired": self.paired.to_dict(),
@@ -778,6 +796,7 @@ class FitnessWeights:
         return self.bug_fix + self.benchmark + self.quality
 
     def to_dict(self) -> dict:
+        """Serialise the score components."""
         return {
             "bug_fix": self.bug_fix,
             "benchmark": self.benchmark,
@@ -808,6 +827,7 @@ class CodeFitness:
 
     @property
     def rejected(self) -> bool:
+        """True when the candidate did not clear the guardrails."""
         return not self.accepted
 
     def score_line(self) -> str:
@@ -823,6 +843,7 @@ class CodeFitness:
         return line + ")"
 
     def to_dict(self) -> dict:
+        """Serialise the fitness verdict, its score and its evidence coverage."""
         return {
             "label": self.label,
             "accepted": self.accepted,
@@ -900,6 +921,7 @@ class CandidateRanking:
 
     @property
     def within_noise(self) -> bool:
+        """True when the top two candidates are not separated by the data."""
         return not self.separated
 
     @property
@@ -922,6 +944,7 @@ class CandidateRanking:
         return self.winner_coverage < self.runner_up_coverage
 
     def describe(self) -> str:
+        """The winner, its margin over the runner-up, and whether that margin means anything."""
         if self.margin is None:
             return (
                 f"{self.winner} wins at {self.winner_score:.3f} - the only candidate "
@@ -957,6 +980,7 @@ class CandidateRanking:
         return text
 
     def to_dict(self) -> dict:
+        """Serialise the ranking for the run artifacts."""
         return {
             "winner": self.winner,
             "winner_score": round(self.winner_score, 6),
@@ -1038,6 +1062,7 @@ class BaselineSnapshot:
 
     @property
     def tests_green(self) -> bool:
+        """True when the hard pytest gate passed."""
         return self.pytest_result.status is GateStatus.PASSED
 
     @property
@@ -1053,9 +1078,11 @@ class BaselineSnapshot:
         return self.repro is not None and self.repro.status is ReproStatus.PRESENT
 
     def benchmark_baselines(self) -> dict[str, Optional[float]]:
+        """Each benchmark's baseline score by name, None where it did not run."""
         return {r.name: r.score for r in self.benchmark_results}
 
     def to_dict(self) -> dict:
+        """Serialise every gate result that fed this fitness verdict."""
         return {
             "pytest": self.pytest_result.to_dict(),
             "repro": self.repro.to_dict() if self.repro else None,

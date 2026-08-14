@@ -195,12 +195,15 @@ class Interval:
 
     @property
     def width(self) -> float:
+        """Distance from the low bound to the high bound."""
         return self.high - self.low
 
     def contains(self, value: float) -> bool:
+        """True when *value* falls inside the interval, endpoints included."""
         return self.low <= value <= self.high
 
     def describe(self, as_percent: bool = True) -> str:
+        """The point estimate with its interval, or a note when no interval is estimable."""
         if not self.estimable:
             body = f"{self.point:.1%}" if as_percent else f"{self.point:.3f}"
             return f"{body} [interval not estimable from this sample]"
@@ -209,6 +212,7 @@ class Interval:
         return f"{self.point:.3f} [{self.low:.3f}, {self.high:.3f}]"
 
     def to_dict(self) -> dict:
+        """Serialise the interval for the run artifacts."""
         return {
             "point": round(self.point, 6),
             "low": round(self.low, 6),
@@ -297,26 +301,36 @@ class PairedBinary:
 
     @property
     def baseline_correct(self) -> int:
+        """Examples the baseline got right."""
         return self.both_correct + self.baseline_only
 
     @property
     def candidate_correct(self) -> int:
+        """Examples the candidate got right."""
         return self.both_correct + self.candidate_only
 
     @property
     def baseline_rate(self) -> float:
+        """Baseline accuracy over the paired examples."""
         return self.baseline_correct / self.n if self.n else 0.0
 
     @property
     def candidate_rate(self) -> float:
+        """Candidate accuracy over the paired examples."""
         return self.candidate_correct / self.n if self.n else 0.0
 
     @property
     def delta(self) -> float:
+        """Candidate rate minus baseline rate."""
         return self.candidate_rate - self.baseline_rate
 
     @property
     def discordant(self) -> int:
+        """Examples where exactly one of the two was right.
+
+        These are the only ones McNemar's test uses: agreements carry no
+        information about which is better.
+        """
         return self.baseline_only + self.candidate_only
 
     @property
@@ -326,14 +340,17 @@ class PairedBinary:
 
     @property
     def p_two_sided(self) -> float:
+        """Two-sided p-value from McNemar's exact conditional test."""
         return mcnemar_exact(self.baseline_only, self.candidate_only, "two-sided")
 
     @property
     def significant_regression(self) -> bool:
+        """True when the candidate is worse at alpha."""
         return self.p_worse < self.alpha
 
     @property
     def significant_improvement(self) -> bool:
+        """True when the candidate is better at alpha."""
         return mcnemar_exact(self.baseline_only, self.candidate_only, "better") < self.alpha
 
     def delta_interval(self) -> Interval:
@@ -375,6 +392,7 @@ class PairedBinary:
         return Interval(d, max(-1.0, low), min(1.0, high), self.confidence)
 
     def min_detectable_shift(self) -> float:
+        """The smallest paired shift this sample size could have detected."""
         return min_detectable_paired_shift(self.n, self.alpha)
 
     def underpowered_for(self, tolerance: float) -> bool:
@@ -382,6 +400,7 @@ class PairedBinary:
         return self.min_detectable_shift() > abs(tolerance)
 
     def describe(self) -> str:
+        """Rates, delta, interval, sample size, discordant pairs and p-value."""
         ci = self.delta_interval()
         return (
             f"{self.baseline_rate:.1%} -> {self.candidate_rate:.1%} "
@@ -390,6 +409,7 @@ class PairedBinary:
         )
 
     def to_dict(self) -> dict:
+        """Serialise the paired binary comparison."""
         return {
             "n": self.n,
             "baseline_rate": round(self.baseline_rate, 6),
@@ -632,6 +652,7 @@ class PairedContinuous:
 
     @property
     def significant_improvement(self) -> bool:
+        """True when the signed-rank test and the mean agree the candidate is better."""
         return (
             self.wilcoxon_p < self.alpha
             and self.delta > 0
@@ -641,6 +662,7 @@ class PairedContinuous:
 
     @property
     def significant_regression(self) -> bool:
+        """True when the signed-rank test and the mean agree the candidate is worse."""
         return (
             self.wilcoxon_p < self.alpha
             and self.delta < 0
@@ -654,6 +676,7 @@ class PairedContinuous:
         return self.direction_conflict or self.delta_ci.contains(0.0)
 
     def describe(self) -> str:
+        """Means, delta, interval, sample size, p-value and effect size."""
         return (
             f"{self.baseline_mean:.3f} -> {self.candidate_mean:.3f} "
             f"({self.delta:+.3f}, 95% CI [{self.delta_ci.low:+.3f}, "
@@ -662,6 +685,7 @@ class PairedContinuous:
         )
 
     def to_dict(self) -> dict:
+        """Serialise the paired continuous comparison."""
         return {
             "n": self.n,
             "baseline_mean": round(self.baseline_mean, 6),
@@ -813,6 +837,7 @@ class OLSTrend:
         return self.n >= 3 and self.p_value < self.alpha
 
     def describe(self) -> str:
+        """Slope per day with its interval, total change, fit quality and p-value."""
         return (
             f"slope {self.slope:+.4f}/day (95% CI [{self.slope_ci.low:+.4f}, "
             f"{self.slope_ci.high:+.4f}]), change {self.change:+.3f} over "
@@ -821,6 +846,7 @@ class OLSTrend:
         )
 
     def to_dict(self) -> dict:
+        """Serialise the trend fit."""
         return {
             "n": self.n,
             "slope": round(self.slope, 8),

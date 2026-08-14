@@ -162,12 +162,14 @@ class AccuracyFinding:
     source: str = SOURCE_STRUCTURAL
 
     def describe(self) -> str:
+        """The target, the problem, and the text it was found in."""
         text = f"{self.target}: {self.message}"
         if self.evidence:
             text += f" (in: {self.evidence!r})"
         return text
 
     def to_dict(self) -> dict:
+        """Serialise one factual finding."""
         return {
             "tool": self.tool,
             "target": self.target,
@@ -189,18 +191,22 @@ class AccuracyReport:
 
     @property
     def passed(self) -> bool:
+        """True when nothing was found."""
         return not self.findings
 
     def for_target(self, target: str) -> list[AccuracyFinding]:
+        """Findings recorded against one target."""
         return [f for f in self.findings if f.target == target]
 
     def by_target(self) -> dict[str, list[AccuracyFinding]]:
+        """Findings grouped by target, name-sorted."""
         grouped: dict[str, list[AccuracyFinding]] = {}
         for finding in self.findings:
             grouped.setdefault(finding.target, []).append(finding)
         return {key: grouped[key] for key in sorted(grouped)}
 
     def summary(self) -> str:
+        """One line naming the finding count and whether entailment ran."""
         head = (
             f"factual accuracy: {len(self.findings)} finding(s) over "
             f"{self.checked} description(s) checked"
@@ -212,6 +218,7 @@ class AccuracyReport:
         return head + "; structural checks only"
 
     def to_dict(self) -> dict:
+        """Serialise the accuracy report, entailment status included."""
         return {
             "passed": self.passed,
             "checked": self.checked,
@@ -245,6 +252,7 @@ class ToolSchemaFacts:
 
     @property
     def enum_values(self) -> set[str]:
+        """Every declared enum value across the schema, flattened."""
         return {value for values in self.enums.values() for value in values}
 
     def render(self) -> str:
@@ -362,6 +370,7 @@ class FactualAccuracyChecker:
 
     # ── plumbing ────────────────────────────────────────────────────────
     def facts_for(self, tool: str) -> Optional[ToolSchemaFacts]:
+        """Schema facts for *tool*, or None when it is not in the catalogue."""
         return self.facts.get(tool)
 
     def _lm_available(self) -> bool:

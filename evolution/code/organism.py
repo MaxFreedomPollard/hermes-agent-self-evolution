@@ -102,6 +102,7 @@ class Mutation:
 
     @property
     def short_sha(self) -> str:
+        """The commit sha abbreviated for display."""
         return self.sha[:8]
 
     @property
@@ -110,6 +111,7 @@ class Mutation:
         return not self.diff.strip()
 
     def to_dict(self) -> dict:
+        """Serialise the mutation, including its diff, for the lineage record."""
         return {
             "index": self.index,
             "label": self.label,
@@ -175,18 +177,22 @@ class CodeOrganism:
 
     @property
     def is_open(self) -> bool:
+        """True between start() and close()."""
         return self._open
 
     @property
     def branch(self) -> Optional[str]:
+        """The evolve branch this organism created, or None before start()."""
         return self._branch
 
     @property
     def original_ref(self) -> Optional[str]:
+        """The ref the checkout was on before start(), restored by close()."""
         return self._original_ref
 
     @property
     def baseline_sha(self) -> Optional[str]:
+        """HEAD when the branch was created, which every candidate is scored against."""
         return self._baseline_sha
 
     @property
@@ -206,6 +212,7 @@ class CodeOrganism:
         return self.target.read_text(encoding="utf-8")
 
     def describe(self) -> dict:
+        """The repo, target, branch and full mutation lineage as a dict."""
         return {
             "repo": str(self.repo),
             "target": self.relpath,

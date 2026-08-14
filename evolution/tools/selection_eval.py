@@ -176,9 +176,11 @@ class ToolSelectionExample:
 
     @property
     def expects_no_tool(self) -> bool:
+        """True when the right answer is to call nothing at all."""
         return self.correct_tool == NO_TOOL
 
     def to_dict(self) -> dict:
+        """Serialise the example for the dataset file."""
         return {
             "task": self.task,
             "correct_tool": self.correct_tool,
@@ -191,6 +193,7 @@ class ToolSelectionExample:
 
     @classmethod
     def from_dict(cls, blob: dict) -> "ToolSelectionExample":
+        """Build from a stored dict, defaulting every absent field."""
         return cls(
             task=blob.get("task", ""),
             correct_tool=blob.get("correct_tool", NO_TOOL),
@@ -217,6 +220,7 @@ class ToolSelectionExample:
         )
 
     def to_dspy_example(self) -> dspy.Example:
+        """Convert to a ``dspy.Example`` with the task as its only input."""
         return dspy.Example(
             task=self.task,
             correct_tool=self.correct_tool,
@@ -290,29 +294,34 @@ class ToolSelectionDataset:
 
     @property
     def all_examples(self) -> list[ToolSelectionExample]:
+        """Every example across all three splits."""
         return self.train + self.val + self.holdout
 
     def __len__(self) -> int:
         return len(self.all_examples)
 
     def split(self, name: str) -> list[ToolSelectionExample]:
+        """The named split, or raise ValueError for anything but the three."""
         if name not in ("train", "val", "holdout"):
             raise ValueError(f"unknown split {name!r}")
         return getattr(self, name)
 
     def category_counts(self) -> dict[str, int]:
+        """Example count per category, zero-filled for categories with none."""
         counts = {category: 0 for category in CATEGORIES}
         for example in self.all_examples:
             counts[example.category] = counts.get(example.category, 0) + 1
         return counts
 
     def tool_counts(self) -> dict[str, int]:
+        """Example count per correct tool."""
         counts: dict[str, int] = {}
         for example in self.all_examples:
             counts[example.correct_tool] = counts.get(example.correct_tool, 0) + 1
         return counts
 
     def save(self, path: Path) -> Path:
+        """Write each split to its own JSONL file under *path*."""
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
         for name in ("train", "val", "holdout"):
@@ -323,6 +332,7 @@ class ToolSelectionDataset:
 
     @classmethod
     def load(cls, path: Path) -> "ToolSelectionDataset":
+        """Read a dataset back, skipping any split with no file on disk."""
         path = Path(path)
         dataset = cls()
         for name in ("train", "val", "holdout"):
@@ -338,6 +348,7 @@ class ToolSelectionDataset:
         return dataset
 
     def to_dspy_examples(self, split: str = "train") -> list[dspy.Example]:
+        """The named split as ``dspy.Example`` objects."""
         return [example.to_dspy_example() for example in self.split(split)]
 
     def to_eval_dataset(self) -> EvalDataset:
@@ -426,6 +437,7 @@ def parse_tool_catalog(
     collected: dict[str, dict[str, list[str]]] = {}
 
     def flush() -> None:
+        """Commit the buffered lines to the tool and mode currently being read."""
         if current is None or mode is None:
             return
         collected.setdefault(current, {})[mode] = list(buffer)
@@ -522,6 +534,7 @@ class ToolSelector(dspy.Module):
         self.predictor = dspy.ChainOfThought(SelectTool.with_instructions(self.rendered))
 
     def forward(self, task: str) -> dspy.Prediction:
+        """Select a tool for *task* and parse the parameters it proposed."""
         result = self.predictor(task=task, tool_catalog=self.rendered)
         return dspy.Prediction(
             tool_name=normalise_tool_name(getattr(result, "tool_name", "")),
@@ -613,20 +626,24 @@ class SelectionOutcome:
 
     @property
     def expected_tool(self) -> str:
+        """The tool this example should have selected."""
         return self.example.correct_tool
 
     @property
     def tool_correct(self) -> bool:
+        """True when the predicted tool matches the expected one."""
         return self.predicted_tool == self.expected_tool
 
     @property
     def param_score(self) -> float:
+        """Parameter correctness, 0.0 when the tool itself was wrong."""
         if not self.tool_correct:
             return 0.0
         return parameter_correctness(self.example.correct_params, self.predicted_params)
 
     @property
     def score(self) -> float:
+        """Weighted tool and parameter score for this example."""
         return TOOL_WEIGHT * float(self.tool_correct) + PARAM_WEIGHT * self.param_score
 
     def feedback(self) -> str:
@@ -662,6 +679,7 @@ class SelectionOutcome:
         )
 
     def to_dict(self) -> dict:
+        """Serialise one selection outcome."""
         return {
             "task": self.example.task,
             "category": self.example.category,
@@ -681,10 +699,12 @@ class SelectionReport:
 
     @property
     def n(self) -> int:
+        """How many examples were scored."""
         return len(self.outcomes)
 
     @property
     def tool_accuracy(self) -> float:
+        """Fraction of examples where the right tool was selected."""
         if not self.outcomes:
             return 0.0
         return sum(1 for o in self.outcomes if o.tool_correct) / len(self.outcomes)
@@ -703,11 +723,13 @@ class SelectionReport:
 
     @property
     def score(self) -> float:
+        """Mean weighted score across every outcome."""
         if not self.outcomes:
             return 0.0
         return sum(o.score for o in self.outcomes) / len(self.outcomes)
 
     def by_category(self) -> dict[str, float]:
+        """Selection accuracy per category."""
         buckets: dict[str, list[SelectionOutcome]] = {}
         for outcome in self.outcomes:
             buckets.setdefault(outcome.example.category, []).append(outcome)
@@ -717,9 +739,11 @@ class SelectionReport:
         }
 
     def failures(self) -> list[SelectionOutcome]:
+        """The outcomes where the wrong tool was selected."""
         return [o for o in self.outcomes if not o.tool_correct]
 
     def to_dict(self) -> dict:
+        """Serialise the selection report and its per-category breakdown."""
         return {
             "n": self.n,
             "tool_accuracy": round(self.tool_accuracy, 4),
@@ -777,6 +801,7 @@ def selector_predict_fn(module: Any) -> PredictFn:
     """Adapt a :class:`ToolSelector` to the ``predict`` shape above."""
 
     def predict(example: ToolSelectionExample):
+        """Run the module over one example's task."""
         return module(task=example.task)
 
     return predict

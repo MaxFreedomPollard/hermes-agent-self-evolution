@@ -215,13 +215,16 @@ class SectionCheck:
 
     @property
     def is_error(self) -> bool:
+        """A failed check severe enough to block."""
         return not self.passed and self.severity == "error"
 
     @property
     def is_warning(self) -> bool:
+        """A failed check that reports without blocking."""
         return not self.passed and self.severity == "warning"
 
     def to_dict(self) -> dict:
+        """Serialise one section check."""
         return {
             "name": self.name,
             "passed": self.passed,
@@ -250,19 +253,23 @@ class SectionValidation:
 
     @property
     def errors(self) -> list[SectionCheck]:
+        """The blocking failures."""
         return [c for c in self.checks if c.is_error]
 
     @property
     def warnings(self) -> list[SectionCheck]:
+        """The non-blocking failures."""
         return [c for c in self.checks if c.is_warning]
 
     def summary(self) -> str:
+        """One line per check, marked pass or fail."""
         icons = {True: "✓", False: "✗"}
         return "\n".join(
             f"{icons[c.passed]} {c.name}: {c.message}" for c in self.checks
         )
 
     def to_dict(self) -> dict:
+        """Serialise the section report, strict verdict included."""
         return {
             "section": self.section,
             "passed": self.passed,
@@ -304,6 +311,7 @@ class EvolvableSection:
     def from_prompt_section(
         cls, section: PromptSection, max_growth: float = 0.2
     ) -> "EvolvableSection":
+        """Wrap a discovered :class:`PromptSection` as an evolvable one."""
         return cls(
             name=section.name,
             path=section.path,
@@ -315,10 +323,12 @@ class EvolvableSection:
     # ── shape ────────────────────────────────────────────────────────────
     @property
     def baseline_size(self) -> int:
+        """Baseline length in characters."""
         return len(self.baseline_text)
 
     @property
     def baseline_tokens(self) -> int:
+        """Estimated tokens in the baseline text."""
         return estimate_tokens(self.baseline_text)
 
     @property
@@ -328,6 +338,7 @@ class EvolvableSection:
 
     @property
     def is_identity(self) -> bool:
+        """True for the identity section, which is held to stricter rules."""
         return self.name == IDENTITY_SECTION
 
     def growth_of(self, candidate: str) -> float:
@@ -336,6 +347,7 @@ class EvolvableSection:
 
     # ── checks ───────────────────────────────────────────────────────────
     def check_non_empty(self, candidate: str) -> SectionCheck:
+        """Reject a blank candidate, which would silently delete guidance."""
         if candidate.strip():
             return SectionCheck(
                 "non_empty", True, f"{len(candidate):,} chars of content"
@@ -347,6 +359,7 @@ class EvolvableSection:
         )
 
     def check_growth(self, candidate: str) -> SectionCheck:
+        """Reject a candidate that grows the section past its ceiling."""
         growth = self.growth_of(candidate)
         # Compare on the ratio, with a float-noise epsilon, so exactly +20%
         # passes and one character beyond it does not.
@@ -410,6 +423,7 @@ class EvolvableSection:
         return SectionValidation(section=self.name, checks=checks)
 
     def to_dict(self) -> dict:
+        """Serialise the evolvable section and its baseline measurements."""
         return {
             "name": self.name,
             "path": str(self.path),
@@ -439,6 +453,7 @@ class StructuredSection:
     reason: str
 
     def to_dict(self) -> dict:
+        """Serialise a structured prompt constant and its keys."""
         return {
             "name": self.name,
             "path": str(self.path),
@@ -550,6 +565,7 @@ class SectionInventory:
     # ── lookup ───────────────────────────────────────────────────────────
     @property
     def names(self) -> list[str]:
+        """Every section name, in file order."""
         return [s.name for s in self.sections]
 
     def __len__(self) -> int:
@@ -559,6 +575,7 @@ class SectionInventory:
         return iter(self.sections)
 
     def get(self, name: str) -> EvolvableSection:
+        """The section named *name*, or raise UnknownSection naming what does exist."""
         for section in self.sections:
             if section.name == name:
                 return section
@@ -598,9 +615,11 @@ class SectionInventory:
         return "\n\n".join(parts)
 
     def estimated_tokens(self, overrides: Optional[Mapping[str, str]] = None) -> int:
+        """Estimated token count of the assembled prompt."""
         return estimate_tokens(self.assembled_preview(overrides))
 
     def cache_blocks(self, overrides: Optional[Mapping[str, str]] = None) -> int:
+        """Cache blocks the assembled prompt would occupy, rounded up."""
         tokens = self.estimated_tokens(overrides)
         return -(-tokens // CACHE_BLOCK_TOKENS)
 
@@ -689,6 +708,7 @@ class SectionInventory:
         return validation
 
     def to_dict(self) -> dict:
+        """Serialise the whole discovery result, missing sections included."""
         return {
             "prompt_builder": str(self.prompt_builder) if self.prompt_builder else None,
             "sections": [s.to_dict() for s in self.sections],
@@ -775,11 +795,13 @@ class ActiveSessionReport:
 
     @property
     def summary(self) -> str:
+        """One line saying whether a live session was detected, and on what evidence."""
         if not self.active:
             return "no active Hermes session detected"
         return "active session: " + "; ".join(self.evidence)
 
     def to_dict(self) -> dict:
+        """Serialise the session probe and everything it checked."""
         return {
             "active": self.active,
             "evidence": list(self.evidence),
@@ -926,6 +948,7 @@ class WriteResult:
     dry_run: bool
 
     def to_dict(self) -> dict:
+        """Serialise the write result, with sizes before and after."""
         return {
             "path": str(self.path),
             "updated": list(self.updated),

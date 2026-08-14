@@ -172,6 +172,7 @@ def default_history_path(output_dir: Optional[Path] = None) -> Path:
 
 
 class CycleStatus(str, Enum):
+    """How one monitor cycle ended."""
     PROPOSED = "proposed"
     SKIPPED = "skipped"
     FAILED = "failed"
@@ -180,6 +181,7 @@ class CycleStatus(str, Enum):
 
 
 class DispatchStatus(str, Enum):
+    """How one dispatched phase run ended."""
     PROPOSED = "proposed"
     # A phase can exit 0 having decided nothing was deployable: the guard
     # rejected the candidate, the gates blocked it, or the rewrite came back
@@ -211,6 +213,7 @@ class CheckOutcome:
     recorded: bool = False
 
     def to_dict(self) -> dict:
+        """Serialise one gate outcome from a dispatched run."""
         return {
             "name": self.name,
             "status": self.status,
@@ -238,9 +241,11 @@ class Dispatch:
 
     @property
     def command_line(self) -> str:
+        """The dispatched command, shell-quoted so it can be copied and rerun."""
         return " ".join(shlex.quote(part) for part in self.command)
 
     def to_dict(self) -> dict:
+        """Serialise the dispatch and everything it reported."""
         return {
             "target": self.target,
             "target_type": self.target_type.value,
@@ -272,17 +277,21 @@ class CycleReport:
 
     @property
     def proposed(self) -> list[Dispatch]:
+        """Dispatches that produced a proposal for review."""
         return [d for d in self.dispatches if d.status is DispatchStatus.PROPOSED]
 
     @property
     def skipped(self) -> list[Dispatch]:
+        """Dispatches that declined to run."""
         return [d for d in self.dispatches if d.status is DispatchStatus.SKIPPED]
 
     @property
     def failed(self) -> list[Dispatch]:
+        """Dispatches that exited non-zero."""
         return [d for d in self.dispatches if d.status is DispatchStatus.FAILED]
 
     def to_dict(self) -> dict:
+        """Serialise the whole cycle for the run log."""
         return {
             "started_at": self.started_at,
             "status": self.status.value,
@@ -347,6 +356,7 @@ def phase_module_available(module: str) -> bool:
 
 
 def has_api_key(env: Optional[dict] = None) -> bool:
+    """True when any recognised model-provider key is set and non-empty."""
     source = os.environ if env is None else env
     return any(str(source.get(name, "")).strip() for name in API_KEY_ENV_VARS)
 

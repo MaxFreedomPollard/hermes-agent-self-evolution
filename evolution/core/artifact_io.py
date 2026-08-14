@@ -70,6 +70,7 @@ class SourceSpan:
     end: int
 
     def slice(self, source: str) -> str:
+        """Return the exact substring of *source* that this span covers."""
         return source[self.start:self.end]
 
 
@@ -95,6 +96,7 @@ class ToolDescriptor:
 
     @property
     def module(self) -> str:
+        """Importable module name for the file this descriptor came from."""
         return self.path.stem
 
 

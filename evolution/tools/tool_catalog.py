@@ -97,6 +97,7 @@ class ToolsetIndex:
     by_constant: dict[str, str] = field(default_factory=dict)
 
     def lookup(self, tool_name: str, constant: str) -> Optional[str]:
+        """The module for a tool, found by tool name or by schema constant name."""
         return self.by_tool.get(tool_name) or self.by_constant.get(constant)
 
     def __bool__(self) -> bool:
@@ -196,19 +197,23 @@ class BudgetFinding:
 
     @property
     def overage(self) -> int:
+        """Characters over budget, negative when within it."""
         return self.size - self.budget
 
     @property
     def target(self) -> str:
+        """The tool, or ``tool.param`` when the finding is on a parameter."""
         return self.tool_name if self.param is None else f"{self.tool_name}.{self.param}"
 
     def describe(self) -> str:
+        """The target, its size against its budget, and the overage."""
         return (
             f"{self.target}: {self.size}/{self.budget} chars "
             f"({self.overage:+d} over budget)"
         )
 
     def to_dict(self) -> dict:
+        """Serialise one budget finding."""
         return {
             "tool_name": self.tool_name,
             "kind": self.kind,
@@ -228,13 +233,16 @@ class ToolDescriptions:
     params: dict[str, str] = field(default_factory=dict)
 
     def copy(self) -> "ToolDescriptions":
+        """A copy whose parameter dict can be mutated without touching this one."""
         return ToolDescriptions(self.tool_name, self.description, dict(self.params))
 
     @property
     def total_chars(self) -> int:
+        """Description plus every parameter description."""
         return len(self.description) + sum(len(v) for v in self.params.values())
 
     def to_dict(self) -> dict:
+        """Serialise the editable text for this tool."""
         return {
             "tool_name": self.tool_name,
             "description": self.description,
@@ -243,6 +251,7 @@ class ToolDescriptions:
 
     @classmethod
     def from_dict(cls, blob: dict) -> "ToolDescriptions":
+        """Rebuild from a serialised bundle entry."""
         return cls(
             tool_name=blob["tool_name"],
             description=blob.get("description", ""),
@@ -269,47 +278,58 @@ class ToolEntry:
     # Pass-throughs so callers do not reach into the descriptor for basics.
     @property
     def tool_name(self) -> str:
+        """Registered name of the tool."""
         return self.descriptor.tool_name
 
     @property
     def constant(self) -> str:
+        """Name of the module-level schema constant."""
         return self.descriptor.constant
 
     @property
     def path(self) -> Path:
+        """File the schema is defined in."""
         return self.descriptor.path
 
     @property
     def module(self) -> str:
+        """Importable module name for that file."""
         return self.descriptor.module
 
     @property
     def description(self) -> str:
+        """The tool description text."""
         return self.descriptor.description
 
     @property
     def param_names(self) -> tuple[str, ...]:
+        """Parameter names in declaration order."""
         return tuple(self.descriptor.params)
 
     @property
     def param_descriptions(self) -> dict[str, str]:
+        """Each parameter description, keyed by parameter name."""
         return {name: p.description for name, p in self.descriptor.params.items()}
 
     # Sizes.
     @property
     def description_size(self) -> int:
+        """Length of the tool description in characters."""
         return len(self.description)
 
     @property
     def param_sizes(self) -> dict[str, int]:
+        """Length of each parameter description, keyed by name."""
         return {name: len(text) for name, text in self.param_descriptions.items()}
 
     @property
     def total_chars(self) -> int:
+        """Description plus every parameter description."""
         return self.description_size + sum(self.param_sizes.values())
 
     @property
     def over_budget(self) -> bool:
+        """True when anything on this tool exceeds its budget."""
         return bool(self.budget_findings())
 
     def budget_findings(self) -> list[BudgetFinding]:
@@ -339,6 +359,7 @@ class ToolEntry:
         return findings
 
     def descriptions(self) -> ToolDescriptions:
+        """This entry's editable text: the tool description and its parameters."""
         return ToolDescriptions(
             tool_name=self.tool_name,
             description=self.description,
@@ -360,6 +381,7 @@ class ToolEntry:
         return f"{self.tool_name}({', '.join(bits)})"
 
     def to_dict(self) -> dict:
+        """Serialise the catalogue entry and its measurements."""
         return {
             "tool_name": self.tool_name,
             "constant": self.constant,
@@ -396,15 +418,18 @@ class ToolCatalog:
 
     @property
     def names(self) -> list[str]:
+        """Every tool name, in catalogue order."""
         return [e.tool_name for e in self.entries]
 
     def get(self, tool_name: str) -> Optional[ToolEntry]:
+        """The entry for *tool_name*, or None when it is not in the catalogue."""
         for entry in self.entries:
             if entry.tool_name == tool_name:
                 return entry
         return None
 
     def require(self, tool_name: str) -> ToolEntry:
+        """The entry for *tool_name*, or raise UnknownTool naming what does exist."""
         entry = self.get(tool_name)
         if entry is None:
             raise UnknownTool(
@@ -414,12 +439,14 @@ class ToolCatalog:
         return entry
 
     def by_toolset(self) -> dict[str, list[ToolEntry]]:
+        """Entries grouped by toolset, name-sorted."""
         grouped: dict[str, list[ToolEntry]] = {}
         for entry in self.entries:
             grouped.setdefault(entry.toolset, []).append(entry)
         return {k: grouped[k] for k in sorted(grouped)}
 
     def by_module(self) -> dict[str, list[ToolEntry]]:
+        """Entries grouped by defining module, name-sorted."""
         grouped: dict[str, list[ToolEntry]] = {}
         for entry in self.entries:
             grouped.setdefault(entry.module, []).append(entry)
@@ -454,6 +481,7 @@ class ToolCatalog:
         )
 
     def budget_findings(self) -> list[BudgetFinding]:
+        """Every over-budget description across the whole catalogue."""
         findings: list[BudgetFinding] = []
         for entry in self.entries:
             findings.extend(entry.budget_findings())
@@ -461,6 +489,7 @@ class ToolCatalog:
 
     @property
     def total_description_chars(self) -> int:
+        """Description characters across the whole catalogue."""
         return sum(e.total_chars for e in self.entries)
 
     def bundle(self) -> dict[str, ToolDescriptions]:
@@ -468,6 +497,7 @@ class ToolCatalog:
         return {e.tool_name: e.descriptions() for e in self.entries}
 
     def to_dict(self) -> dict:
+        """Serialise the catalogue, grouped by toolset."""
         return {
             "hermes_repo": str(self.hermes_repo),
             "tools": [e.to_dict() for e in self.entries],
@@ -550,10 +580,12 @@ def load_catalog(
 
 
 def bundle_to_dict(bundle: dict[str, ToolDescriptions]) -> dict:
+    """Serialise a name-to-descriptions bundle for JSON."""
     return {name: descriptions.to_dict() for name, descriptions in bundle.items()}
 
 
 def bundle_from_dict(blob: dict) -> dict[str, ToolDescriptions]:
+    """Rebuild a bundle from its serialised form."""
     return {name: ToolDescriptions.from_dict(entry) for name, entry in blob.items()}
 
 
@@ -569,13 +601,16 @@ class DescriptionChange:
 
     @property
     def target(self) -> str:
+        """The tool, or ``tool.param`` when the change is on a parameter."""
         return self.tool_name if self.param is None else f"{self.tool_name}.{self.param}"
 
     @property
     def delta_chars(self) -> int:
+        """Characters gained or lost by this change."""
         return len(self.after) - len(self.before)
 
     def to_dict(self) -> dict:
+        """Serialise one description change, before and after."""
         return {
             "tool_name": self.tool_name,
             "kind": self.kind,
@@ -642,9 +677,11 @@ class WriteReport:
 
     @property
     def changed(self) -> int:
+        """How many descriptions were changed."""
         return len(self.changes)
 
     def summary(self) -> str:
+        """One line naming how many descriptions changed and in how many files."""
         verb = "would write" if self.dry_run else "wrote"
         return (
             f"{verb} {self.changed} description(s) across "
@@ -652,6 +689,7 @@ class WriteReport:
         )
 
     def to_dict(self) -> dict:
+        """Serialise the write result, skips and reasons included."""
         return {
             "dry_run": self.dry_run,
             "changes": [c.to_dict() for c in self.changes],

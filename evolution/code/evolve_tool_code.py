@@ -259,9 +259,11 @@ class Candidate:
 
     @property
     def label(self) -> str:
+        """Short stable label for this candidate, such as ``c03``."""
         return f"c{self.index:02d}"
 
     def to_dict(self) -> dict:
+        """Serialise the candidate for the run artifacts."""
         return {
             "index": self.index,
             "label": self.label,
@@ -290,6 +292,7 @@ class EvolverJob:
     reproduction_path: Optional[str] = None
 
     def to_dict(self) -> dict:
+        """Serialise the job so the external evolver can read it as JSON."""
         return {
             "target_path": self.target_path,
             "source": self.source,
@@ -306,6 +309,7 @@ class ProposesCandidates(Protocol):
     """What :func:`evolve_tool_code` needs from a mutation source."""
 
     def propose(self, job: EvolverJob) -> list[Candidate]:  # pragma: no cover
+        """Return candidate rewrites of the target described by *job*."""
         ...
 
 
@@ -344,6 +348,12 @@ class ExternalEvolver:
         self.last_returncode: Optional[int] = None
 
     def propose(self, job: EvolverJob) -> list[Candidate]:
+        """Run the external evolver as a subprocess and collect its candidates.
+
+        The job is handed over as JSON on disk and the results are read back from
+        an output directory, so the evolver stays a separate process sharing no
+        state with this one.
+        """
         self.workdir.mkdir(parents=True, exist_ok=True)
         job_path = self.workdir / "job.json"
         out_dir = self.workdir / "evolver_out"
@@ -558,6 +568,7 @@ class CandidateOutcome:
     mutation: Optional[Mutation] = None
 
     def to_dict(self) -> dict:
+        """Serialise the candidate, its fitness and its commit together."""
         return {
             "candidate": self.candidate.to_dict(),
             "fitness": self.fitness.to_dict(),

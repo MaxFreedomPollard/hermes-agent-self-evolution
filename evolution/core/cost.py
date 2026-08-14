@@ -81,10 +81,12 @@ class LMCall:
 
     @property
     def total_tokens(self) -> int:
+        """Prompt plus completion tokens for this call."""
         return self.prompt_tokens + self.completion_tokens
 
     @property
     def priced(self) -> bool:
+        """True when a price was available for this call."""
         return self.cost is not None
 
     @classmethod
@@ -132,18 +134,22 @@ class CostReport:
 
     @property
     def n_calls(self) -> int:
+        """How many model calls were recorded."""
         return len(self.calls)
 
     @property
     def prompt_tokens(self) -> int:
+        """Prompt tokens summed across every call."""
         return sum(c.prompt_tokens for c in self.calls)
 
     @property
     def completion_tokens(self) -> int:
+        """Completion tokens summed across every call."""
         return sum(c.completion_tokens for c in self.calls)
 
     @property
     def total_tokens(self) -> int:
+        """Prompt plus completion tokens across every call."""
         return self.prompt_tokens + self.completion_tokens
 
     @property
@@ -153,10 +159,12 @@ class CostReport:
 
     @property
     def unpriced_calls(self) -> int:
+        """Calls with no price available, which make the total a lower bound."""
         return sum(1 for c in self.calls if not c.priced and not c.cached)
 
     @property
     def cached_calls(self) -> int:
+        """Calls served from cache, which are not counted as unpriced."""
         return sum(1 for c in self.calls if c.cached)
 
     @property
@@ -166,12 +174,14 @@ class CostReport:
 
     @property
     def models(self) -> dict[str, int]:
+        """Call count per model, name-sorted."""
         counts: dict[str, int] = {}
         for call in self.calls:
             counts[call.model] = counts.get(call.model, 0) + 1
         return dict(sorted(counts.items()))
 
     def describe(self) -> str:
+        """One line of cost, saying so plainly when the total is only a lower bound."""
         if not self.calls:
             return "no model calls recorded"
 
@@ -192,6 +202,7 @@ class CostReport:
         return ", ".join(parts)
 
     def to_dict(self) -> dict:
+        """Serialise the cost report for the run artifacts."""
         return {
             "calls": self.n_calls,
             "prompt_tokens": self.prompt_tokens,
@@ -243,6 +254,12 @@ class UsageTracker:
         self.stop()
 
     def stop(self) -> CostReport:
+        """Stop tracking and return everything recorded since :meth:`start`.
+
+        The anchor is searched from the end of the history, so a run whose anchor
+        the history cap has already evicted reports the whole visible window
+        rather than silently reporting nothing.
+        """
         history = list(_history())
         cap = _max_history_size()
 

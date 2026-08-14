@@ -279,10 +279,12 @@ class HoldoutComparison:
 
     @property
     def n(self) -> int:
+        """Scenarios compared, which is what the pairing uses."""
         return self.overall.n
 
     @property
     def delta(self) -> float:
+        """Overall change from baseline to candidate."""
         return self.overall.delta
 
     @property
@@ -349,6 +351,7 @@ class HoldoutComparison:
 
     @property
     def underpowered_categories(self) -> tuple[str, ...]:
+        """Categories with too few scenarios for a significant result."""
         floor = min_scenarios_for_significance(self.alpha)
         return tuple(
             name for name, comparison in self.by_category.items() if comparison.n < floor
@@ -368,10 +371,12 @@ class HoldoutComparison:
 
     @property
     def accepted(self) -> bool:
+        """True when the run improved and no category regressed."""
         return bool(self.n) and self.improved and not self.regressed_categories
 
     @property
     def power_note(self) -> str:
+        """What shift this sample size could have detected, in plain words."""
         if self.n == 0:
             return "no holdout scenarios, so this run measured nothing"
         floor = min_scenarios_for_significance(self.alpha)
@@ -456,9 +461,11 @@ class HoldoutComparison:
         )
 
     def describe(self) -> str:
+        """The overall paired comparison as one line."""
         return self.overall.describe()
 
     def to_dict(self) -> dict:
+        """Serialise the holdout analysis, movement and per-category detail."""
         up, down, flat = self.movement
         targeted = self.targeted
         return {
@@ -578,10 +585,12 @@ class SectionOutcome:
 
     @property
     def growth(self) -> float:
+        """Size change as a fraction of the baseline."""
         base = max(1, len(self.baseline_text))
         return (len(self.evolved_text) - len(self.baseline_text)) / base
 
     def to_dict(self) -> dict:
+        """Serialise the section change with its sizes and growth."""
         return {
             "name": self.name,
             "baseline_chars": len(self.baseline_text),

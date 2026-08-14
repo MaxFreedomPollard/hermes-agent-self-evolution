@@ -44,6 +44,12 @@ __all__ = [
 
 
 class GateStatus(str, Enum):
+    """The four outcomes a gate can report.
+
+    UNAVAILABLE is deliberately distinct from PASSED and SKIPPED. A benchmark
+    that is not installed has proved nothing, and must never be counted as
+    though it had passed.
+    """
     PASSED = "passed"
     FAILED = "failed"
     UNAVAILABLE = "unavailable"
@@ -64,6 +70,7 @@ class GateResult:
 
     @property
     def passed(self) -> bool:
+        """True only for PASSED, so UNAVAILABLE never reads as success."""
         return self.status is GateStatus.PASSED
 
     @property
@@ -72,6 +79,7 @@ class GateResult:
         return self.status is GateStatus.FAILED
 
     def to_dict(self) -> dict:
+        """Serialise the gate result for the run artifacts."""
         return {
             "name": self.name,
             "status": self.status.value,
@@ -395,6 +403,7 @@ class GateChain:
     results: list[GateResult] = field(default_factory=list)
 
     def run(self, *gates) -> "GateChain":
+        """Run each gate in order, stopping at the first blocking failure."""
         for gate in gates:
             result = gate() if callable(gate) else gate
             self.results.append(result)
@@ -409,13 +418,16 @@ class GateChain:
 
     @property
     def passed(self) -> bool:
+        """True when no gate in the chain is blocking."""
         return not any(self._is_blocking(r) for r in self.results)
 
     @property
     def blockers(self) -> list[GateResult]:
+        """The gate results that block, which depends on strict mode."""
         return [r for r in self.results if self._is_blocking(r)]
 
     def summary(self) -> str:
+        """One line per gate, iconised by status."""
         icon = {
             GateStatus.PASSED: "✓",
             GateStatus.FAILED: "✗",
@@ -427,6 +439,7 @@ class GateChain:
         )
 
     def to_dict(self) -> dict:
+        """Serialise the whole chain, strict flag included."""
         return {
             "strict": self.strict,
             "passed": self.passed,

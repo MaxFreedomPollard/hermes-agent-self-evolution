@@ -61,9 +61,15 @@ class _LazyGroup(click.Group):
     """A group that imports a subcommand's module only when it is invoked."""
 
     def list_commands(self, ctx: click.Context) -> list[str]:
+        """Advertise the lazily loaded phase subcommands alongside the eager ones."""
         return sorted(set(super().list_commands(ctx)) | set(_SUBCOMMANDS))
 
     def get_command(self, ctx: click.Context, name: str) -> Optional[click.Command]:
+        """Resolve a subcommand, importing its module only when it is asked for.
+
+        The laziness is what lets ``hermes-evolve --help`` work without a
+        hermes-agent checkout or every phase's optional dependencies installed.
+        """
         existing = super().get_command(ctx, name)
         if existing is not None:
             return existing
@@ -83,6 +89,7 @@ class _LazyGroup(click.Group):
         return getattr(module, attribute)
 
     def format_commands(self, ctx: click.Context, formatter) -> None:
+        """Render the command list from the lazy table, which Click cannot see itself."""
         rows = [(name, _SUBCOMMANDS[name][2]) for name in sorted(_SUBCOMMANDS)]
         rows.append(("status", "Report what is discoverable and gateable"))
         with formatter.section("Commands"):
@@ -192,6 +199,7 @@ def status(hermes_repo: Optional[str]) -> None:
 
 
 def main() -> None:
+    """Console-script entry point for ``hermes-evolve``."""
     cli()
 
 

@@ -96,6 +96,7 @@ class SafetyResult:
     info: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
+        """Serialise one safety check and its violations."""
         return {
             "name": self.name,
             "passed": self.passed,
@@ -113,29 +114,35 @@ class SafetyReport:
 
     @property
     def passed(self) -> bool:
+        """True when every check passed."""
         return all(r.passed for r in self.results)
 
     @property
     def failures(self) -> list[SafetyResult]:
+        """The checks that failed."""
         return [r for r in self.results if not r.passed]
 
     @property
     def violations(self) -> list[str]:
+        """Every violation across the failing checks, message as fallback."""
         out: list[str] = []
         for result in self.failures:
             out.extend(result.violations or [result.message])
         return out
 
     def summary(self) -> str:
+        """One line per check, marked pass or fail."""
         return "\n".join(
             f"{'✓' if r.passed else '✗'} {r.name}: {r.message}" for r in self.results
         )
 
     def first_failure(self) -> Optional[SafetyResult]:
+        """The first failing check, or None when everything passed."""
         failures = self.failures
         return failures[0] if failures else None
 
     def to_dict(self) -> dict:
+        """Serialise the whole safety report."""
         return {
             "passed": self.passed,
             "results": [r.to_dict() for r in self.results],
@@ -183,6 +190,11 @@ def _walk_functions(
     """Yield ``(qualname, node)`` for every function, nested ones included."""
 
     def visit(node: ast.AST, prefix: str):
+        """Walk nested definitions, yielding each qualified name with its node.
+
+        Functions inside functions are followed, so a mutation hidden in a closure
+        is still compared.
+        """
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 qualname = f"{prefix}{child.name}"
@@ -221,6 +233,7 @@ class FunctionSignature:
     kwarg: Optional[str]
 
     def render(self) -> str:
+        """Render the signature back to source text, defaults included."""
         bits: list[str] = []
         positional = list(self.posonly) + list(self.args)
         pad = len(positional) - len(self.defaults)
@@ -374,6 +387,7 @@ class ErrorHandlingCensus:
     per_function: dict[str, int]
 
     def totals(self) -> dict[str, int]:
+        """The raw counts behind the error-handling comparison."""
         return {
             "try_blocks": self.try_blocks,
             "handlers": self.handlers,
@@ -497,6 +511,7 @@ class GuardCensus:
 
     @property
     def total_guard_calls(self) -> int:
+        """How many guard calls the source makes in total."""
         return sum(self.guard_calls.values())
 
 
@@ -709,6 +724,7 @@ class QualitySignals:
     details: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
+        """Serialise the quality score with its notes and details."""
         return {
             "score": round(self.score, 4),
             "notes": list(self.notes),

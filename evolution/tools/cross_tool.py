@@ -105,10 +105,12 @@ class ConfusionMatrix:
     counts: dict[str, dict[str, int]] = field(default_factory=dict)
 
     def record(self, expected: str, predicted: str, n: int = 1) -> None:
+        """Add *n* observations of *expected* being answered with *predicted*."""
         row = self.counts.setdefault(expected, {})
         row[predicted] = row.get(predicted, 0) + n
 
     def row(self, expected: str) -> dict[str, int]:
+        """Predictions recorded for one expected tool."""
         return dict(self.counts.get(expected, {}))
 
     def column(self, predicted: str) -> dict[str, int]:
@@ -120,12 +122,15 @@ class ConfusionMatrix:
         }
 
     def total(self) -> int:
+        """Every observation in the matrix."""
         return sum(sum(row.values()) for row in self.counts.values())
 
     def correct(self, expected: str) -> int:
+        """How often *expected* was answered with itself."""
         return self.counts.get(expected, {}).get(expected, 0)
 
     def opportunities(self, expected: str) -> int:
+        """How often *expected* was the right answer, however it was answered."""
         return sum(self.counts.get(expected, {}).values())
 
     def misroutes(self, expected: str) -> list[tuple[str, int]]:
@@ -146,6 +151,7 @@ class ConfusionMatrix:
         return pairs[:limit]
 
     def to_dict(self) -> dict:
+        """Serialise the confusion matrix, expected tool first."""
         return {expected: dict(row) for expected, row in sorted(self.counts.items())}
 
 
@@ -168,6 +174,7 @@ class ToolRate:
 
     @property
     def rate(self) -> float:
+        """Correct selections over opportunities, 0.0 when there were none."""
         if self.opportunities <= 0:
             return 0.0
         return self.correct / self.opportunities
@@ -178,6 +185,7 @@ class ToolRate:
         return bool(self.outcomes)
 
     def to_dict(self) -> dict:
+        """Serialise one tool's selection rate."""
         return {
             "tool": self.tool,
             "opportunities": self.opportunities,
@@ -277,13 +285,16 @@ class CrossToolReport:
         report: SelectionReport,
         tools: Optional[Iterable[str]] = None,
     ) -> "CrossToolReport":
+        """Build from a :class:`SelectionReport`, optionally restricted to *tools*."""
         return cls.from_outcomes(report.outcomes, tools=tools)
 
     def rate(self, tool: str) -> float:
+        """Selection accuracy for *tool*, or 0.0 when it was never the answer."""
         entry = self.rates.get(tool)
         return entry.rate if entry else 0.0
 
     def opportunities(self, tool: str) -> int:
+        """How many examples *tool* was the correct answer for."""
         entry = self.rates.get(tool)
         return entry.opportunities if entry else 0
 
@@ -293,6 +304,11 @@ class CrossToolReport:
         return entry.outcomes if entry else ()
 
     def example_keys(self, tool: str) -> tuple[str, ...]:
+        """Keys of the examples *tool* was the correct answer for.
+
+        These are what let a baseline and a candidate report be compared pairwise
+        rather than as two independent rates.
+        """
         entry = self.rates.get(tool)
         return entry.example_keys if entry else ()
 
@@ -339,6 +355,7 @@ class CrossToolReport:
         )
 
     def to_dict(self) -> dict:
+        """Serialise the report with its per-tool rates and accuracy interval."""
         interval = self.accuracy_interval()
         return {
             "n": self.n,
@@ -490,10 +507,12 @@ class _PairedEvidence:
 
     @property
     def significant_regression(self) -> bool:
+        """True when the paired test finds a regression, False when unpaired."""
         return bool(self.paired and self.paired.significant_regression)
 
     @property
     def significant_improvement(self) -> bool:
+        """True when the paired test finds an improvement, False when unpaired."""
         return bool(self.paired and self.paired.significant_improvement)
 
     @property
@@ -514,6 +533,7 @@ class _PairedEvidence:
 
     @property
     def min_detectable_shift(self) -> Optional[float]:
+        """Smallest shift this sample could detect, or None when unpaired."""
         return self.paired.min_detectable_shift() if self.paired else None
 
     @property
@@ -530,6 +550,7 @@ class _PairedEvidence:
         return self.paired.underpowered_for(self.tolerance)
 
     def delta_interval(self) -> Optional[Interval]:
+        """Confidence interval on the change, or None when the runs were not paired."""
         return self.paired.delta_interval() if self.paired else None
 
     def _evidence(self) -> str:
@@ -593,12 +614,15 @@ class ToolComparison(_PairedEvidence):
 
     @property
     def improved(self) -> bool:
+        """True when the tool gained beyond floating-point noise."""
         return self.delta > _EPSILON
 
     def describe(self) -> str:
+        """The tool, its move, and the evidence behind it."""
         return self._headline() + self._evidence()
 
     def to_dict(self) -> dict:
+        """Serialise the improvement with its rates and evidence."""
         blob = {
             "tool": self.tool,
             "baseline_rate": round(self.baseline_rate, 4),
@@ -626,6 +650,7 @@ class ToolRegression(_PairedEvidence):
     tolerance: float = DEFAULT_TOLERANCE
 
     def describe(self) -> str:
+        """The regression, plus which tools took the selections it lost."""
         text = self._headline() + self._evidence()
         if self.stolen_by:
             thief = ", ".join(
@@ -636,6 +661,7 @@ class ToolRegression(_PairedEvidence):
         return text
 
     def to_dict(self) -> dict:
+        """Serialise the regression, including where its selections went."""
         blob = {
             "tool": self.tool,
             "baseline_rate": round(self.baseline_rate, 4),
@@ -660,12 +686,14 @@ class ToolImprovement(_PairedEvidence):
     tolerance: float = DEFAULT_TOLERANCE
 
     def describe(self) -> str:
+        """The tool, its move, and the evidence behind it."""
         return (
             f"{self.tool}: {self.baseline_rate:.1%} -> {self.candidate_rate:.1%} "
             f"({self.delta:+.1%})" + self._evidence()
         )
 
     def to_dict(self) -> dict:
+        """Serialise the per-tool comparison."""
         blob = {
             "tool": self.tool,
             "baseline_rate": round(self.baseline_rate, 4),
@@ -699,6 +727,7 @@ class CrossToolVerdict:
 
     @property
     def overall_delta(self) -> float:
+        """Candidate accuracy minus baseline accuracy across all tools."""
         return self.candidate_accuracy - self.baseline_accuracy
 
     @property
@@ -707,6 +736,7 @@ class CrossToolVerdict:
         return [r for r in self.regressions if r.significant_regression]
 
     def comparison(self, tool: str) -> Optional[ToolComparison]:
+        """The per-tool comparison for *tool*, or None."""
         for entry in self.comparisons:
             if entry.tool == tool:
                 return entry
@@ -734,6 +764,7 @@ class CrossToolVerdict:
         )
 
     def summary(self) -> str:
+        """One line: the verdict, the overall move, and the reason for it."""
         head = "accepted" if self.accepted else "REJECTED"
         text = (
             f"cross-tool {head}: overall {self.baseline_accuracy:.1%} -> "
@@ -765,6 +796,7 @@ class CrossToolVerdict:
         )
 
     def to_dict(self) -> dict:
+        """Serialise the verdict with every regression, improvement and ignored tool."""
         return {
             "accepted": self.accepted,
             "baseline_accuracy": round(self.baseline_accuracy, 4),
@@ -821,6 +853,12 @@ class CrossToolGuard:
         baseline: CrossToolReport,
         candidate: CrossToolReport,
     ) -> CrossToolVerdict:
+        """Compare baseline against candidate and decide whether to accept.
+
+        A tool that regressed past tolerance rejects the candidate outright. A
+        tool with no measurable opportunities is reported as ignored rather than
+        counted as unchanged, so an untested tool cannot look like a safe one.
+        """
         regressions: list[ToolRegression] = []
         improvements: list[ToolImprovement] = []
         comparisons: list[ToolComparison] = []

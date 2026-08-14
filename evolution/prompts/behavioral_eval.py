@@ -133,6 +133,7 @@ class BehavioralScenario:
             self.scenario_id = f"{self.category}-{digest}"
 
     def to_dict(self) -> dict:
+        """Serialise the scenario, tool lists included."""
         data = asdict(self)
         data["expected_tools"] = list(self.expected_tools)
         data["forbidden_tools"] = list(self.forbidden_tools)
@@ -140,6 +141,7 @@ class BehavioralScenario:
 
     @classmethod
     def from_dict(cls, data: Mapping) -> "BehavioralScenario":
+        """Build from a stored mapping, ignoring keys this dataclass does not declare."""
         fields = set(cls.__dataclass_fields__)
         return cls(**{k: v for k, v in data.items() if k in fields})
 
@@ -676,6 +678,7 @@ class ScenarioGenerator:
 
     @property
     def predictor(self):
+        """The scenario generator, built on first use so import stays cheap."""
         if self._predictor is None:
             self._predictor = dspy.ChainOfThought(GenerateScenarios)
         return self._predictor
@@ -739,10 +742,12 @@ class AgentTranscript:
     raw: dict = field(default_factory=dict)
 
     def called(self, tool: str) -> bool:
+        """True when *tool* appears in any recorded call, case-insensitively."""
         needle = tool.lower()
         return any(needle in call.lower() for call in self.tool_calls)
 
     def to_dict(self) -> dict:
+        """Serialise the transcript for the run artifacts."""
         return {
             "prompt": self.prompt,
             "response": self.response,
@@ -777,6 +782,7 @@ class BehavioralOutcome:
     judge: str = "heuristic"
 
     def to_dict(self) -> dict:
+        """Serialise one scored outcome."""
         return {
             "scenario_id": self.scenario_id,
             "category": self.category,
@@ -959,6 +965,7 @@ class BehavioralJudge:
 
     @property
     def predictor(self):
+        """The judge, built on first use so import stays cheap."""
         if self._predictor is None:
             self._predictor = dspy.ChainOfThought(JudgeBehavior)
         return self._predictor
@@ -966,6 +973,7 @@ class BehavioralJudge:
     def score(
         self, scenario: BehavioralScenario, transcript: AgentTranscript
     ) -> BehavioralOutcome:
+        """Score one transcript against its scenario, by judge or by heuristic."""
         if not self.use_llm:
             return heuristic_outcome(scenario, transcript)
 
@@ -1003,6 +1011,7 @@ class BehavioralJudge:
         scenarios: Sequence[BehavioralScenario],
         transcripts: Mapping[str, AgentTranscript],
     ) -> "BehavioralReport":
+        """Score every scenario, recording a miss where no transcript arrived."""
         outcomes = []
         for scenario in scenarios:
             transcript = transcripts.get(scenario.scenario_id)
@@ -1044,32 +1053,38 @@ class BehavioralReport:
 
     @property
     def mean_score(self) -> float:
+        """Mean score across every outcome, 0.0 when there are none."""
         if not self.outcomes:
             return 0.0
         return sum(o.score for o in self.outcomes) / len(self.outcomes)
 
     @property
     def pass_rate(self) -> float:
+        """Fraction of outcomes that passed, 0.0 when there are none."""
         if not self.outcomes:
             return 0.0
         return sum(1 for o in self.outcomes if o.passed) / len(self.outcomes)
 
     def by_category(self) -> dict[str, float]:
+        """Mean score per scenario category."""
         buckets: dict[str, list[float]] = {}
         for outcome in self.outcomes:
             buckets.setdefault(outcome.category, []).append(outcome.score)
         return {k: sum(v) / len(v) for k, v in sorted(buckets.items())}
 
     def by_section(self) -> dict[str, float]:
+        """Mean score per prompt section under test."""
         buckets: dict[str, list[float]] = {}
         for outcome in self.outcomes:
             buckets.setdefault(outcome.section, []).append(outcome.score)
         return {k: sum(v) / len(v) for k, v in sorted(buckets.items())}
 
     def worst(self, n: int = 5) -> list[BehavioralOutcome]:
+        """The *n* lowest scoring outcomes, worst first."""
         return sorted(self.outcomes, key=lambda o: o.score)[:n]
 
     def to_dict(self) -> dict:
+        """Serialise the report with its per-category and per-section breakdowns."""
         return {
             "harness": self.harness,
             "n": len(self.outcomes),
@@ -1161,6 +1176,7 @@ class SectionBehaviorModule(dspy.Module):
         return self._baseline_text
 
     def forward(self, user_message: str) -> dspy.Prediction:
+        """Run the agent for one user message, returning its reply and tool calls."""
         result = self.predictor(user_message=user_message)
         return dspy.Prediction(
             response=getattr(result, "response", ""),
@@ -1219,6 +1235,7 @@ def make_behavioral_metric(judge: Optional[BehavioralJudge] = None):
     """
 
     def metric(example, prediction, trace=None, *args, **kwargs) -> float:
+        """DSPy metric that turns a prediction into a scored behavioural outcome."""
         scenario = _example_to_scenario(example)
         transcript = AgentTranscript(
             prompt=scenario.prompt,
@@ -1265,10 +1282,12 @@ class BatchRunnerHarness:
 
     @property
     def runner_path(self) -> Path:
+        """Where the hermes-agent batch runner is expected to live."""
         return Path(self.hermes_repo) / "batch_runner.py"
 
     @property
     def available(self) -> bool:
+        """True when the batch runner exists and can be invoked."""
         return self.runner_path.is_file()
 
     def build_dataset(
@@ -1491,6 +1510,7 @@ class DirectPromptHarness:
         section_name: str = "SYSTEM_PROMPT",
         run_name: str = "direct",
     ) -> list[AgentTranscript]:
+        """Run every scenario against *system_prompt* and collect the transcripts."""
         module = SectionBehaviorModule(
             system_prompt, section_name, predictor=self.predictor
         )
@@ -1569,6 +1589,7 @@ class BehavioralSuite:
         per_category: Optional[int] = None,
         include_platform: bool = True,
     ) -> "BehavioralSuite":
+        """Build a suite from the seed scenario bank."""
         return cls(
             scenarios=build_scenarios(
                 sections=sections,
@@ -1579,13 +1600,16 @@ class BehavioralSuite:
         )
 
     def extend(self, scenarios: Iterable[BehavioralScenario]) -> "BehavioralSuite":
+        """Add scenarios in place and return self, so calls can be chained."""
         self.scenarios.extend(scenarios)
         return self
 
     def for_section(self, section: str) -> list[BehavioralScenario]:
+        """Every scenario whose section under test is *section*."""
         return [s for s in self.scenarios if s.section_under_test == section]
 
     def categories(self) -> dict[str, int]:
+        """Scenario count per category, name-sorted."""
         counts: dict[str, int] = {}
         for scenario in self.scenarios:
             counts[scenario.category] = counts.get(scenario.category, 0) + 1
@@ -1630,6 +1654,7 @@ class BehavioralSuite:
         return train, val, holdout
 
     def save(self, path: Path) -> Path:
+        """Write the suite to *path* as JSONL and return the path."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", encoding="utf-8") as handle:
@@ -1639,6 +1664,7 @@ class BehavioralSuite:
 
     @classmethod
     def load(cls, path: Path) -> "BehavioralSuite":
+        """Read a suite back from a JSONL file."""
         scenarios = []
         for line in Path(path).read_text(encoding="utf-8").splitlines():
             if line.strip():

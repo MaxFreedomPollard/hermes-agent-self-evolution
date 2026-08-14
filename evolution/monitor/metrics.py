@@ -169,9 +169,11 @@ class MetricPoint:
 
     @property
     def higher_is_better(self) -> bool:
+        """Whether a rise in this metric is an improvement."""
         return HIGHER_IS_BETTER.get(self.metric, True)
 
     def to_dict(self) -> dict:
+        """Serialise the point for the JSONL store."""
         record = {
             "metric": self.metric,
             "target": self.target,
@@ -188,10 +190,12 @@ class MetricPoint:
         return record
 
     def to_json_line(self) -> str:
+        """Serialise to one JSONL line, key-sorted so diffs stay stable."""
         return json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True)
 
     @classmethod
     def from_dict(cls, blob: dict) -> "MetricPoint":
+        """Rebuild from a stored dict, accepting the older 'at' timestamp field."""
         timestamp = blob.get("timestamp")
         if timestamp is None:
             at = blob.get("at")
@@ -210,6 +214,7 @@ class MetricPoint:
 
     @classmethod
     def from_json_line(cls, line: str) -> "MetricPoint":
+        """Rebuild from one JSONL line."""
         return cls.from_dict(json.loads(line))
 
 
@@ -219,6 +224,7 @@ class MetricPoint:
 
 
 class TrendDirection(str, Enum):
+    """Which way a metric is moving, or UNKNOWN when there is too little data."""
     RISING = "rising"
     FLAT = "flat"
     DECLINING = "declining"
@@ -275,6 +281,7 @@ class Trend:
 
     @property
     def is_deterioration(self) -> bool:
+        """True when the trend moves the wrong way for this metric."""
         if self.direction is TrendDirection.DECLINING:
             return self.higher_is_better
         if self.direction is TrendDirection.RISING:
@@ -316,6 +323,7 @@ class Trend:
         return f"p={self.p_value:.3f}, R²={self.r_squared:.2f}"
 
     def describe(self) -> str:
+        """Direction, change, slope, sample size and fit, or why it is unknown."""
         if self.direction is TrendDirection.UNKNOWN:
             return self.note or f"not enough history ({self.n} points)"
         line = (
@@ -331,6 +339,7 @@ class Trend:
         return line
 
     def to_dict(self) -> dict:
+        """Serialise the trend for the run artifacts."""
         return {
             "metric": self.metric,
             "target": self.target,
@@ -496,9 +505,11 @@ class Aggregate:
 
     @property
     def empty(self) -> bool:
+        """True when no points fell in the window."""
         return self.count == 0
 
     def to_dict(self) -> dict:
+        """Serialise the aggregate."""
         return {
             "metric": self.metric,
             "target": self.target,
@@ -577,6 +588,7 @@ class MetricStore:
     # -- clock ------------------------------------------------------------
 
     def now(self) -> float:
+        """Current time from the injected clock, so tests can control it."""
         return float(self._clock())
 
     # -- writing ----------------------------------------------------------
@@ -590,6 +602,7 @@ class MetricStore:
         return point
 
     def extend(self, points: Iterable[MetricPoint]) -> list[MetricPoint]:
+        """Append points to the store and return the ones written."""
         written: list[MetricPoint] = []
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as handle:
@@ -707,6 +720,7 @@ class MetricStore:
         metric: Selector = None,
         points: Optional[Sequence[MetricPoint]] = None,
     ) -> list[str]:
+        """Every target seen, optionally restricted to *metric*."""
         metrics = _as_set(metric)
         source = self.load() if points is None else points
         return sorted(
@@ -714,6 +728,7 @@ class MetricStore:
         )
 
     def latest(self, metric: str, target: str) -> Optional[MetricPoint]:
+        """The most recent point for a metric and target, or None."""
         found = self.query(metric=metric, target=target)
         return found[-1] if found else None
 
@@ -725,6 +740,7 @@ class MetricStore:
         window_days: Optional[float] = None,
         now: Optional[float] = None,
     ) -> Aggregate:
+        """Aggregate one metric for one target, optionally over a trailing window."""
         if window_days is None:
             points = self.query(metric=metric, target=target)
         else:
@@ -744,6 +760,7 @@ class MetricStore:
         alpha: float = 0.05,
         confidence: float = 0.95,
     ) -> Trend:
+        """Direction and slope for a metric, UNKNOWN below *min_points*."""
         if window_days is None:
             points = self.query(metric=metric, target=target)
         else:
@@ -763,6 +780,7 @@ class MetricStore:
 
     @property
     def archive_path(self) -> Path:
+        """Where rotated history is written when the store is compacted."""
         return self.path.with_suffix(".archive" + self.path.suffix)
 
     def archive_before(self, cutoff: float) -> int:
