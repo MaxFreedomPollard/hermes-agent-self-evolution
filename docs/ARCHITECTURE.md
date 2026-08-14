@@ -825,7 +825,9 @@ metrics.json}`, joined by `PULL_REQUEST.md` when stage 12 built one, and
 `metrics.json` records `per_tool`, `underpowered_tools`, `unpaired_tools`,
 `significant_regressions`, the two accuracy intervals, `chance_accuracy`,
 `factual_reverts`, `entailment_ran`, `cost`, and `pull_request` alongside the
-older fields.
+older fields. `docs/example-run/` holds one of these directories verbatim, so
+the format can be read without executing a run first; its own README says what
+the numbers in it are and are not worth.
 
 #### 3.2.1 How the cross-tool guard decides
 
