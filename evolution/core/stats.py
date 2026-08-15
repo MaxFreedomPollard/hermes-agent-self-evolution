@@ -488,12 +488,23 @@ def paired_bootstrap_ci(
         raise ValueError("paired bootstrap needs equal lengths")
     n = len(baseline)
     if n == 0:
-        return Interval(0.0, 0.0, 0.0, confidence)
+        return Interval(0.0, 0.0, 0.0, confidence, estimable=False)
 
     diffs = [c - b for b, c in zip(baseline, candidate)]
     point = sum(diffs) / n
-    if n == 1 or all(d == diffs[0] for d in diffs):
-        return Interval(point, point, point, confidence)
+    # A single pair, or differences with no spread, gives every bootstrap
+    # resample the same sample. The zero-width interval that comes back is a
+    # statement about the data, not a claim of certainty, which is exactly the
+    # case Interval documents ``estimable=False`` for. Marked here rather than
+    # left to the reader, because [+1.000, +1.000] off a single observation
+    # otherwise reads as the most confident result in the file.
+    #
+    # Compared with a tolerance, not ==: differences that are identical in
+    # intent routinely differ in the last bit or two (0.3 - 0.1 against
+    # 0.4 - 0.2), and resampling that noise produces a e-17 wide interval that
+    # is no more estimable than an exactly-zero-width one.
+    if n == 1 or math.isclose(max(diffs), min(diffs), rel_tol=1e-12, abs_tol=1e-12):
+        return Interval(point, point, point, confidence, estimable=False)
 
     rng = random.Random(seed)
     means = []
@@ -672,8 +683,30 @@ class PairedContinuous:
 
     @property
     def inconclusive(self) -> bool:
-        """True when the interval straddles zero: no evidence either way."""
-        return self.direction_conflict or self.delta_ci.contains(0.0)
+        """True when there is no evidence either way.
+
+        Reading ``contains(0.0)`` alone was wrong when the interval is not
+        estimable: a single pair produces a zero-width interval sitting off
+        zero, which does not contain zero and so reported the least informative
+        sample available as a conclusive result.
+
+        Deferring wholesale to ``estimable`` would be wrong in the other
+        direction, and by more. Differences with no spread are not an absence
+        of evidence, they are perfect consistency: eight pairs that every one
+        move +0.20 give a signed-rank p of 0.008, which is the cleanest signal
+        this comparison can produce, and calling it inconclusive would throw
+        away the best result in the set alongside the worst.
+
+        So a non-estimable interval simply contributes nothing, and the verdict
+        falls to the signed-rank test, which stays valid either way. One pair
+        gives p = 1.0 and settles nothing; eight identical pairs give p = 0.008
+        and settle it.
+        """
+        if self.direction_conflict:
+            return True
+        if not self.delta_ci.estimable:
+            return not (self.significant_improvement or self.significant_regression)
+        return self.delta_ci.contains(0.0)
 
     def describe(self) -> str:
         """Means, delta, interval, sample size, p-value and effect size."""
@@ -714,7 +747,14 @@ def compare_paired_continuous(
     n = len(baseline)
     if n == 0:
         return PairedContinuous(
-            0, 0.0, 0.0, 0.0, Interval(0.0, 0.0, 0.0, confidence), 1.0, 0.0, alpha
+            0,
+            0.0,
+            0.0,
+            0.0,
+            Interval(0.0, 0.0, 0.0, confidence, estimable=False),
+            1.0,
+            0.0,
+            alpha,
         )
     base_mean = sum(baseline) / n
     cand_mean = sum(candidate) / n

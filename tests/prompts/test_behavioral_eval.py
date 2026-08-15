@@ -744,3 +744,51 @@ class TestDirectHarnessAndEvaluate:
         suite = BehavioralSuite(scenarios=[])
         report = suite.evaluate("T", DirectPromptHarness(predictor=FakePredictor()))
         assert len(report) == 0 and report.harness == "none"
+
+
+class TestTheArtifactRecordsWhetherItWasMeasured:
+    """An unmeasured scenario and a measured failure are different claims.
+
+    The distinction is the whole reason the field exists: a 0.0 that was never
+    run, sitting opposite a real score in a paired comparison, invents a
+    difference out of a timeout.
+    """
+
+    def outcome(self, **kw):
+        base = dict(
+            scenario_id="s1",
+            category="restraint",
+            section="MEMORY_GUIDANCE",
+            score=0.0,
+            passed=False,
+        )
+        base.update(kw)
+        return BehavioralOutcome(**base)
+
+    def test_an_unmeasured_outcome_serialises_as_unmeasured(self):
+        assert self.outcome(measured=False).to_dict()["measured"] is False
+
+    def test_a_measured_failure_serialises_as_measured(self):
+        assert self.outcome(measured=True).to_dict()["measured"] is True
+
+    def test_the_default_is_carried_explicitly_not_left_to_a_reload(self):
+        assert "measured" in self.outcome().to_dict()
+
+    def test_a_timeout_is_distinguishable_from_a_failure_in_the_artifact(self):
+        timed_out = self.outcome(measured=False).to_dict()
+        really_failed = self.outcome(measured=True).to_dict()
+        assert timed_out["score"] == really_failed["score"]
+        assert timed_out["passed"] == really_failed["passed"]
+        assert timed_out != really_failed
+
+    def test_it_still_carries_everything_it_used_to(self):
+        blob = self.outcome().to_dict()
+        assert set(blob) >= {
+            "scenario_id",
+            "category",
+            "section",
+            "score",
+            "passed",
+            "feedback",
+            "judge",
+        }

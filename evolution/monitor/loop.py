@@ -854,6 +854,18 @@ def _dispatch_one(
 
     if status is DispatchStatus.PROPOSED:
         out.print(f"  [green]✓ proposed[/green] {entry.target} in {elapsed:.1f}s")
+    elif status is DispatchStatus.NO_CHANGE:
+        # The status has been distinct from FAILED since the branch comparison
+        # went in, but this line was not: a run that did everything right and
+        # found nothing to deploy printed "✗ failed ... exit 0", which is both
+        # red and self-contradictory. Nothing deployable is an ordinary outcome
+        # of a guard doing its job, not a failure.
+        out.print(
+            f"  [yellow]- no change[/yellow] {entry.target}: ran cleanly in "
+            f"{elapsed:.1f}s and produced no branch"
+        )
+        if result.output:
+            out.print(f"    [dim]{result.output.splitlines()[-1]}[/dim]")
     else:
         out.print(
             f"  [red]✗ failed[/red] {entry.target}: exit {result.returncode}"

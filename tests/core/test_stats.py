@@ -395,3 +395,91 @@ class TestHolmAdjust:
         raw = [0.01, 0.02, 0.03]
         bonferroni = [min(1.0, len(raw) * p) for p in raw]
         assert holm_adjust(raw)[0] <= bonferroni[0]
+
+
+class TestADegenerateIntervalSaysSo:
+    """A zero-width bootstrap interval is a fact about the sample, not certainty.
+
+    Interval's own contract reserves estimable=False for "a bootstrap over
+    differences that are all identical, which has no spread to resample", and
+    these are exactly those samples.
+    """
+
+    def test_an_empty_sample_is_not_estimable(self):
+        assert paired_bootstrap_ci([], []).estimable is False
+
+    def test_a_single_pair_is_not_estimable(self):
+        assert paired_bootstrap_ci([0.0], [1.0]).estimable is False
+
+    def test_identical_differences_are_not_estimable(self):
+        assert paired_bootstrap_ci([0.0, 0.0], [1.0, 1.0]).estimable is False
+
+    def test_differences_equal_within_float_noise_are_not_estimable(self):
+        """0.3 - 0.1 and 0.4 - 0.2 differ in the last bit. That is not spread."""
+        interval = paired_bootstrap_ci([0.1, 0.2], [0.3, 0.4])
+        assert interval.estimable is False
+
+    def test_a_sample_with_real_spread_is_still_estimable(self):
+        interval = paired_bootstrap_ci([0.1, 0.9, 0.4], [0.5, 0.2, 0.8])
+        assert interval.estimable is True
+        assert interval.width > 0
+
+    def test_the_empty_comparison_carries_a_non_estimable_interval(self):
+        assert compare_paired_continuous([], []).delta_ci.estimable is False
+
+    def test_a_non_estimable_interval_refuses_to_print_as_precision(self):
+        interval = paired_bootstrap_ci([0.0], [1.0])
+        assert "not estimable" in interval.describe()
+
+
+class TestInconclusiveReadsTheEvidenceNotTheWidth:
+    """A zero-width interval can mean no data, or it can mean total agreement.
+
+    Both produce estimable=False, and they are opposite verdicts, so the
+    signed-rank test decides which one it is.
+    """
+
+    def test_a_single_pair_settles_nothing(self):
+        assert compare_paired_continuous([0.0], [1.0]).inconclusive is True
+
+    def test_two_identical_pairs_settle_nothing(self):
+        assert compare_paired_continuous([0.0, 0.0], [1.0, 1.0]).inconclusive is True
+
+    def test_an_empty_comparison_settles_nothing(self):
+        assert compare_paired_continuous([], []).inconclusive is True
+
+    def test_perfect_consistency_is_evidence_not_the_absence_of_it(self):
+        """Eight pairs that every one move +0.20 is the cleanest signal there is.
+
+        The bootstrap has nothing to resample, so the interval is not
+        estimable, but the signed-rank test reads p = 0.008. Treating a
+        non-estimable interval as automatically inconclusive would throw this
+        away along with the single-pair case.
+        """
+        base = [0.50, 0.52, 0.48, 0.51, 0.49, 0.50, 0.53, 0.47]
+        result = compare_paired_continuous(base, [b + 0.20 for b in base])
+
+        assert result.delta_ci.estimable is False
+        assert result.wilcoxon_p < 0.01
+        assert result.significant_improvement is True
+        assert result.inconclusive is False
+
+    def test_a_consistent_regression_is_also_evidence(self):
+        base = [0.50, 0.52, 0.48, 0.51, 0.49, 0.50, 0.53, 0.47]
+        result = compare_paired_continuous(base, [b - 0.20 for b in base])
+
+        assert result.delta_ci.estimable is False
+        assert result.significant_regression is True
+        assert result.inconclusive is False
+
+    def test_a_straddling_interval_is_still_inconclusive(self):
+        base = [0.5, 0.7, 0.3, 0.6, 0.4, 0.55, 0.45, 0.65]
+        cand = [0.55, 0.65, 0.35, 0.55, 0.45, 0.5, 0.5, 0.6]
+        result = compare_paired_continuous(base, cand)
+        assert result.delta_ci.estimable is True
+        assert result.inconclusive is True
+
+    def test_the_serialised_form_agrees_with_the_property(self):
+        result = compare_paired_continuous([0.0], [1.0])
+        assert result.to_dict()["inconclusive"] is True
+        assert result.to_dict()["delta_ci"]["estimable"] is False

@@ -789,6 +789,13 @@ class BehavioralOutcome:
             "section": self.section,
             "score": round(self.score, 4),
             "passed": self.passed,
+            # Without this the artifact cannot tell a scenario that timed out
+            # apart from one that ran and failed, and anything rebuilding an
+            # outcome from the file gets the True default. That is the exact
+            # confusion the field exists to prevent: a 0.0 that was never
+            # measured, sitting on one side of a paired comparison, invents a
+            # difference out of a timeout.
+            "measured": self.measured,
             "feedback": self.feedback,
             "judge": self.judge,
         }

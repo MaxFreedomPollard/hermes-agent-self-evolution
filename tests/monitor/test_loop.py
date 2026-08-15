@@ -900,3 +900,64 @@ class TestProposedMeansABranchExists:
         from evolution.monitor.loop import _evolve_branches
         assert _evolve_branches(tmp_path) == set()
         assert _evolve_branches(None) == set()
+
+
+class TestNoChangeIsNotRenderedAsAFailure:
+    """The status has been distinct from FAILED since the branch comparison.
+
+    The console line was not: a run that did everything right and found nothing
+    deployable printed "failed ... exit 0", which is red and self-contradictory.
+    """
+
+    def _tool_store(self, store):
+        store.extend(
+            [
+                point(TOOL_SELECTION_ACCURACY, "search_files", 0.4, days_ago=d, samples=80)
+                for d in (30, 20, 10, 1)
+            ]
+        )
+        return store
+
+    def _no_change(self, store, hermes_repo, out):
+        self._tool_store(store)
+        return cycle(
+            store, hermes_repo, out=out,
+            dispatcher=FakeDispatcher(returncode=0),
+            branch_lister=FakeBranches(produces=""),
+        )
+
+    def test_it_is_not_called_a_failure(self, store, hermes_repo, out):
+        self._no_change(store, hermes_repo, out)
+        assert "failed" not in out.file.getvalue()
+
+    def test_it_says_no_change(self, store, hermes_repo, out):
+        self._no_change(store, hermes_repo, out)
+        assert "no change" in out.file.getvalue()
+
+    def test_it_never_prints_a_failure_with_exit_zero(self, store, hermes_repo, out):
+        self._no_change(store, hermes_repo, out)
+        assert "exit 0" not in out.file.getvalue()
+
+    def test_the_status_is_still_no_change(self, store, hermes_repo, out):
+        report = self._no_change(store, hermes_repo, out)
+        assert report.dispatches[0].status is DispatchStatus.NO_CHANGE
+        assert report.proposed == []
+
+    def test_a_real_failure_is_still_rendered_as_one(self, store, hermes_repo, out):
+        self._tool_store(store)
+        cycle(
+            store, hermes_repo, out=out,
+            dispatcher=FakeDispatcher(returncode=1),
+            branch_lister=FakeBranches(produces=""),
+        )
+        rendered = out.file.getvalue()
+        assert "failed" in rendered
+        assert "exit 1" in rendered
+
+    def test_a_proposal_is_still_rendered_as_one(self, store, hermes_repo, out):
+        self._tool_store(store)
+        cycle(
+            store, hermes_repo, out=out,
+            branch_lister=FakeBranches("evolve/search_files-20260731_010203"),
+        )
+        assert "proposed" in out.file.getvalue()
