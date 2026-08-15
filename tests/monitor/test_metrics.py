@@ -5,7 +5,9 @@ timestamps. Nothing here reads the wall clock, so a trend that is declining
 today is still declining when this suite runs in a year.
 """
 
+import contextlib
 import json
+import os
 
 import pytest
 
@@ -520,3 +522,217 @@ class TestArchiving:
 
     def test_archiving_an_empty_store_is_safe(self, store):
         assert store.archive_before(T0) == 0
+
+
+class TestNothingUnusableGetsIntoTheHistory:
+    """The store is the loop's only evidence, so it refuses what would spoil it."""
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_a_non_finite_value_is_refused(self, bad):
+        with pytest.raises(ValueError):
+            MetricPoint(
+                metric=SKILL_SUCCESS_RATE, target="arxiv", value=bad, timestamp=T0
+            )
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_a_non_finite_timestamp_is_refused(self, bad):
+        with pytest.raises(ValueError):
+            MetricPoint(
+                metric=SKILL_SUCCESS_RATE, target="arxiv", value=1.0, timestamp=bad
+            )
+
+    def test_a_nan_never_reaches_the_file_as_bare_json(self, store):
+        """json.dumps writes NaN unquoted, which no other JSON reader accepts."""
+        with pytest.raises(ValueError):
+            store.record(SKILL_SUCCESS_RATE, "arxiv", float("nan"), timestamp=T0)
+        assert not store.path.exists() or "NaN" not in store.path.read_text()
+
+    @pytest.mark.parametrize("bad", [1.9, 0.5, -0.5])
+    def test_a_fractional_sample_count_is_refused_not_rounded(self, bad):
+        with pytest.raises(ValueError):
+            MetricPoint(
+                metric=SKILL_SUCCESS_RATE,
+                target="arxiv",
+                value=1.0,
+                timestamp=T0,
+                samples=bad,
+            )
+
+    def test_a_whole_sample_count_still_coerces(self):
+        """4.0 and "4" have always been accepted, and still are."""
+        for given in (4, 4.0, "4"):
+            p = MetricPoint(
+                metric=SKILL_SUCCESS_RATE,
+                target="arxiv",
+                value=1.0,
+                timestamp=T0,
+                samples=given,
+            )
+            assert p.samples == 4 and isinstance(p.samples, int)
+
+    def test_a_fractional_stored_count_is_skipped_not_truncated(self, store):
+        store.path.parent.mkdir(parents=True, exist_ok=True)
+        store.path.write_text(
+            json.dumps(
+                {
+                    "metric": SKILL_SUCCESS_RATE,
+                    "target": "arxiv",
+                    "value": 0.5,
+                    "timestamp": T0,
+                    "samples": 1.9,
+                }
+            )
+            + "\n"
+        )
+        assert store.load() == []
+        assert store.skipped_lines == 1
+
+    @pytest.mark.parametrize("record", ["[1, 2, 3]", "null", '"just a string"', "42"])
+    def test_a_record_that_is_not_an_object_costs_one_line_not_the_history(
+        self, store, record
+    ):
+        """A valid-JSON non-object used to raise AttributeError past load()."""
+        store.extend([point(SKILL_SUCCESS_RATE, "arxiv", 0.9, days_ago=1)])
+        with store.path.open("a", encoding="utf-8") as handle:
+            handle.write(record + "\n")
+        store.extend([point(SKILL_SUCCESS_RATE, "arxiv", 0.8)])
+
+        loaded = store.load()
+        assert [p.value for p in loaded] == [0.9, 0.8]
+        assert store.skipped_lines == 1
+
+
+class TestTheAggregateSaysWhichWindowItCovers:
+    def test_to_dict_carries_both_ends_of_the_window(self):
+        points = [
+            point(SKILL_SUCCESS_RATE, "arxiv", 0.4, days_ago=9),
+            point(SKILL_SUCCESS_RATE, "arxiv", 0.6, days_ago=1),
+        ]
+        blob = summarize(SKILL_SUCCESS_RATE, "arxiv", points).to_dict()
+
+        assert blob["first_timestamp"] == T0 - 9 * DAY
+        assert blob["last_timestamp"] == T0 - 1 * DAY
+
+    def test_to_dict_still_carries_everything_it_used_to(self):
+        blob = summarize(
+            SKILL_SUCCESS_RATE, "arxiv", [point(SKILL_SUCCESS_RATE, "arxiv", 0.6)]
+        ).to_dict()
+        assert set(blob) >= {
+            "metric",
+            "target",
+            "count",
+            "samples",
+            "mean",
+            "weighted_mean",
+            "minimum",
+            "maximum",
+            "total",
+            "last_value",
+            "sources",
+        }
+
+    def test_an_empty_window_serialises_without_timestamps(self):
+        blob = summarize(SKILL_SUCCESS_RATE, "arxiv", []).to_dict()
+        assert blob["first_timestamp"] is None
+        assert blob["last_timestamp"] is None
+
+
+class TestRotationCannotEatAWrite:
+    """archive_before reads, writes elsewhere, then replaces. All three must hold."""
+
+    def test_every_writer_takes_the_lock(self, store, monkeypatch):
+        """A lock only one of the writers respects protects nothing."""
+        import evolution.monitor.metrics as metrics_module
+
+        real = metrics_module._exclusive
+        held = []
+
+        @contextlib.contextmanager
+        def recording(path):
+            held.append(path)
+            with real(path):
+                yield
+
+        monkeypatch.setattr(metrics_module, "_exclusive", recording)
+        store.append(point(SKILL_SUCCESS_RATE, "arxiv", 0.4, days_ago=200))
+        store.extend([point(SKILL_SUCCESS_RATE, "arxiv", 0.6, days_ago=2)])
+        store.archive_before(T0 - 100 * DAY)
+
+        assert held == [store.path, store.path, store.path]
+
+    def test_the_lock_is_held_across_the_whole_rotation(self, store, monkeypatch):
+        """Not just the replace: the snapshot it is built from has to be covered too."""
+        fcntl = pytest.importorskip("fcntl")
+        store.extend(
+            [
+                point(SKILL_SUCCESS_RATE, "arxiv", 0.4, days_ago=200),
+                point(SKILL_SUCCESS_RATE, "arxiv", 0.6, days_ago=2),
+            ]
+        )
+        lock_path = store.path.with_name(store.path.name + ".lock")
+        real_replace = os.replace
+        rival_got_in = []
+
+        def replace_while_a_rival_tries_the_lock(src, dst, *args, **kwargs):
+            with lock_path.open("a+b") as rival:
+                try:
+                    fcntl.flock(rival.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    rival_got_in.append(True)
+                except OSError:
+                    pass
+            return real_replace(src, dst, *args, **kwargs)
+
+        monkeypatch.setattr(os, "replace", replace_while_a_rival_tries_the_lock)
+        store.archive_before(T0 - 100 * DAY)
+
+        assert not rival_got_in, "a second writer could have appended into the snapshot"
+
+    def test_the_writer_lock_is_really_exclusive(self, store):
+        """Two descriptions on one lock file must not both hold it."""
+        from evolution.monitor.metrics import _exclusive
+
+        fcntl = pytest.importorskip("fcntl")
+        store.path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = store.path.with_name(store.path.name + ".lock")
+
+        with _exclusive(store.path):
+            with lock_path.open("a+b") as rival:
+                with pytest.raises(OSError):
+                    fcntl.flock(rival.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_a_rotation_that_died_before_the_replace_does_not_double_the_archive(
+        self, store, monkeypatch
+    ):
+        store.extend(
+            [
+                point(SKILL_SUCCESS_RATE, "arxiv", 0.4, days_ago=200),
+                point(SKILL_SUCCESS_RATE, "arxiv", 0.5, days_ago=150),
+                point(SKILL_SUCCESS_RATE, "arxiv", 0.6, days_ago=2),
+            ]
+        )
+
+        def die(*args, **kwargs):
+            raise OSError("killed between the archive and the replace")
+
+        monkeypatch.setattr(os, "replace", die)
+        with pytest.raises(OSError):
+            store.archive_before(T0 - 100 * DAY)
+        monkeypatch.undo()
+
+        # The retry the operator runs after the crash.
+        assert store.archive_before(T0 - 100 * DAY) == 2
+        archived = store.archive_path.read_text().strip().splitlines()
+        assert len(archived) == 2
+        assert len(store.load()) == 1
+
+    def test_two_identical_observations_both_survive_rotation(self, store):
+        """Deduplicating a retry must not deduplicate real repeated measurements."""
+        twice = [
+            point(SKILL_SUCCESS_RATE, "arxiv", 0.4, days_ago=200),
+            point(SKILL_SUCCESS_RATE, "arxiv", 0.4, days_ago=200),
+        ]
+        store.extend([*twice, point(SKILL_SUCCESS_RATE, "arxiv", 0.6, days_ago=2)])
+
+        assert store.archive_before(T0 - 100 * DAY) == 2
+        archived = store.archive_path.read_text().strip().splitlines()
+        assert len(archived) == 2

@@ -46,14 +46,26 @@ Pure local I/O throughout: no network, no model, no hermes-agent checkout.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import math
 import os
 import tempfile
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Iterable, Optional, Sequence, Union
+from typing import Callable, Iterable, Iterator, Optional, Sequence, Union
+
+try:  # POSIX
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no fcntl
+    fcntl = None
+try:  # Windows
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX has no msvcrt
+    msvcrt = None
 
 from evolution.core.stats import Interval, ols_trend
 
@@ -124,6 +136,58 @@ def _as_set(value: Selector) -> Optional[set[str]]:
     return set(value)
 
 
+@contextlib.contextmanager
+def _exclusive(path: Path) -> Iterator[None]:
+    """Hold an exclusive lock over every writer of *path* for the block.
+
+    Appending one line at a time is safe on its own, but rotation is not: it
+    reads the whole file, writes the survivors somewhere else, and replaces the
+    original. A point appended between that read and that replace would be
+    thrown away by a snapshot taken before it existed. Every writer takes this
+    lock so rotation and appends cannot interleave.
+
+    The lock lives in a sibling ``<name>.lock`` file and is held by the kernel,
+    so it is released even if the process is killed mid-rotation - no stale
+    lock file can wedge the next run. ``fcntl`` covers POSIX and ``msvcrt``
+    covers Windows; on a filesystem that supports neither, the block still runs
+    unserialised rather than failing, because a monitor that cannot write its
+    history is worse than one that races on it.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".lock")
+    try:
+        handle = lock_path.open("a+b")
+    except OSError:
+        yield
+        return
+
+    locked = False
+    try:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            locked = True
+        elif msvcrt is not None:  # pragma: no cover - exercised on Windows
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            locked = True
+    except OSError:
+        locked = False
+
+    try:
+        yield
+    finally:
+        if locked:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                else:  # pragma: no cover - exercised on Windows
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+        handle.close()
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Points
 # ──────────────────────────────────────────────────────────────────────────
@@ -156,7 +220,24 @@ class MetricPoint:
             raise ValueError("MetricPoint.target must be a non-empty name")
         self.value = float(self.value)
         self.timestamp = float(self.timestamp)
-        self.samples = int(self.samples)
+        # float() happily accepts NaN and the infinities, and every one of them
+        # does damage further down. json.dumps writes a NaN as bare ``NaN``,
+        # which no other reader of this JSONL file will accept; one NaN value
+        # drags the mean, minimum and maximum of every window it lands in; and
+        # an infinite timestamp raises inside ``when`` before the point can even
+        # be serialised. A store's job is to refuse this at the door.
+        if not math.isfinite(self.value):
+            raise ValueError("MetricPoint.value must be a finite number")
+        if not math.isfinite(self.timestamp):
+            raise ValueError("MetricPoint.timestamp must be a finite number")
+        # A fractional count is a caller bug and int() would round it away in
+        # silence: int(1.9) is 1, and int(-0.5) is 0, which walks a negative
+        # count straight past the check below. Numeric strings still coerce,
+        # because reading "4" out of a stored record has always worked.
+        counted = int(self.samples)
+        if not isinstance(self.samples, str) and counted != self.samples:
+            raise ValueError("MetricPoint.samples must be a whole number of observations")
+        self.samples = counted
         if self.samples < 0:
             raise ValueError("MetricPoint.samples cannot be negative")
         if self.metadata is None:
@@ -196,6 +277,13 @@ class MetricPoint:
     @classmethod
     def from_dict(cls, blob: dict) -> "MetricPoint":
         """Rebuild from a stored dict, accepting the older 'at' timestamp field."""
+        # A line holding a valid JSON array, scalar or null parses without
+        # complaint and then dies on .get with an AttributeError, which
+        # MetricStore.load does not catch. One such line would abort the whole
+        # read rather than cost a single skipped_lines increment, so the shape
+        # is checked here where the error can be the documented kind.
+        if not isinstance(blob, dict):
+            raise TypeError("a metric record must be a JSON object")
         timestamp = blob.get("timestamp")
         if timestamp is None:
             at = blob.get("at")
@@ -208,7 +296,9 @@ class MetricPoint:
             value=blob.get("value", 0.0),
             timestamp=float(timestamp),
             source=blob.get("source", "unknown"),
-            samples=int(blob.get("samples", 1)),
+            # Passed through raw. int() here would truncate a fractional stored
+            # count before __post_init__ ever got the chance to refuse it.
+            samples=blob.get("samples", 1),
             metadata=dict(blob.get("metadata") or {}),
         )
 
@@ -520,6 +610,11 @@ class Aggregate:
             "minimum": self.minimum,
             "maximum": self.maximum,
             "total": self.total,
+            # Without these two an artifact reader can see what the window said
+            # but not which window it was, so the summary cannot be checked
+            # against the history it came from.
+            "first_timestamp": self.first_timestamp,
+            "last_timestamp": self.last_timestamp,
             "last_value": self.last_value,
             "sources": list(self.sources),
         }
@@ -596,20 +691,22 @@ class MetricStore:
     def append(self, point: MetricPoint) -> MetricPoint:
         """Append one point and return it."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(point.to_json_line() + "\n")
-            handle.flush()
+        with _exclusive(self.path):
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(point.to_json_line() + "\n")
+                handle.flush()
         return point
 
     def extend(self, points: Iterable[MetricPoint]) -> list[MetricPoint]:
         """Append points to the store and return the ones written."""
         written: list[MetricPoint] = []
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as handle:
-            for point in points:
-                handle.write(point.to_json_line() + "\n")
-                written.append(point)
-            handle.flush()
+        with _exclusive(self.path):
+            with self.path.open("a", encoding="utf-8") as handle:
+                for point in points:
+                    handle.write(point.to_json_line() + "\n")
+                    written.append(point)
+                handle.flush()
         return written
 
     def record(
@@ -791,30 +888,56 @@ class MetricStore:
         discards its own evidence is worse than one that grows, so the old
         points are appended to ``<name>.archive.jsonl`` and the live file is
         rewritten atomically with what remains. Returns the number moved.
+
+        The whole rotation runs under the writer lock, because the read here
+        and the replace at the end are far apart and anything appended between
+        them would be replaced away by a snapshot that never contained it. The
+        archive is written before the live file is replaced, so a rotation that
+        dies in between loses nothing - it leaves both copies holding the same
+        points, and the count below makes re-running it safe rather than
+        doubling them.
         """
-        points = self.load()
-        if not points:
-            return 0
+        with _exclusive(self.path):
+            points = self.load()
+            if not points:
+                return 0
 
-        old = [p for p in points if p.timestamp < cutoff]
-        if not old:
-            return 0
-        kept = [p for p in points if p.timestamp >= cutoff]
+            old = [p for p in points if p.timestamp < cutoff]
+            if not old:
+                return 0
+            kept = [p for p in points if p.timestamp >= cutoff]
 
-        self.archive_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.archive_path.open("a", encoding="utf-8") as handle:
-            for point in old:
-                handle.write(point.to_json_line() + "\n")
+            self.archive_path.parent.mkdir(parents=True, exist_ok=True)
+            # Counted, not a set: the same value measured twice at the same
+            # instant is two real observations and both belong in the archive.
+            # What must not happen is a retry archiving a point some earlier,
+            # interrupted attempt already wrote.
+            archived: Counter[str] = Counter()
+            if self.archive_path.exists():
+                with self.archive_path.open("r", encoding="utf-8") as handle:
+                    archived = Counter(
+                        stripped for line in handle if (stripped := line.strip())
+                    )
 
-        fd, tmp_name = tempfile.mkstemp(
-            dir=str(self.path.parent), prefix=self.path.name, suffix=".tmp"
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                for point in kept:
-                    handle.write(point.to_json_line() + "\n")
-            os.replace(tmp_name, self.path)
-        except BaseException:
-            Path(tmp_name).unlink(missing_ok=True)
-            raise
-        return len(old)
+            with self.archive_path.open("a", encoding="utf-8") as handle:
+                for point in old:
+                    line = point.to_json_line()
+                    if archived[line]:
+                        archived[line] -= 1
+                        continue
+                    handle.write(line + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(self.path.parent), prefix=self.path.name, suffix=".tmp"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    for point in kept:
+                        handle.write(point.to_json_line() + "\n")
+                os.replace(tmp_name, self.path)
+            except BaseException:
+                Path(tmp_name).unlink(missing_ok=True)
+                raise
+            return len(old)
