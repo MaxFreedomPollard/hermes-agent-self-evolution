@@ -128,9 +128,11 @@ class TestScoreParsing:
             ('{"score": 0.83}', 0.83),
             ('{"pass_rate": 0.5}', 0.5),
             ('{"accuracy": 1.0}', 1.0),
-            ("running...\n82/100", 0.82),
+            ("running...\nscore: 82/100", 0.82),
             ("final: 76.5%", 0.765),
             ("noise\n{\"score\": 0.4}", 0.4),
+            ("passed 82 / 100", 0.82),
+            ("Accuracy: 76.5 %", 0.765),
         ],
     )
     def test_parses_known_shapes(self, stdout, expected):
@@ -140,7 +142,25 @@ class TestScoreParsing:
         assert parse_score("no score anywhere") is None
 
     def test_zero_denominator_does_not_crash(self):
-        assert parse_score("0/0") is None
+        assert parse_score("score: 0/0") is None
+
+    @pytest.mark.parametrize(
+        "stdout",
+        [
+            "tests/test_tblite.py ......                              [100%]",
+            "collecting tasks\nprocessing 12/20",
+            "elapsed 45/60 seconds",
+            "82/100",
+        ],
+    )
+    def test_a_progress_line_is_not_a_score(self, stdout):
+        """An unlabelled number is a number, not a result the benchmark claimed."""
+        assert parse_score(stdout) is None
+
+    def test_a_trailing_progress_line_cannot_outrank_a_real_result(self):
+        """The scan runs backwards, so the fabricating line is seen first."""
+        stdout = '{"score": 0.42}\nrunning suite ... [100%]'
+        assert parse_score(stdout) == pytest.approx(0.42)
 
 
 class TestGateChain:

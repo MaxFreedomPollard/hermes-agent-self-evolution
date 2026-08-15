@@ -182,6 +182,9 @@ def dirty_paths(repo: Path, files: Sequence[str]) -> list[str]:
     try:
         out = _run(["git", "status", "--porcelain", "--", *files], repo)
     except GitError:
+        # Callers that only want to describe the tree can live with "nothing
+        # known". require_clean_worktree cannot, and asks the question itself
+        # rather than reading this empty list as an all-clear.
         return []
     dirty: list[str] = []
     for line in out.splitlines():
@@ -209,7 +212,34 @@ def require_clean_worktree(
     """
     if allow_dirty:
         return
-    dirty = dirty_paths(repo, files)
+    if not files:
+        return
+    if not (repo / ".git").exists():
+        # Not a checkout at all, so there is no uncommitted work to strand and
+        # no branch to strand it on. build_pull_request refuses on its own
+        # terms later; refusing here would fail a run whose only crime is that
+        # the operator does not keep hermes-agent under git.
+        return
+    try:
+        status = _run(["git", "status", "--porcelain", "--", *files], repo)
+    except GitError as exc:
+        # Failing open here is how the guard stops guarding. A missing git
+        # binary, a timeout or a lock held by another process all land in this
+        # branch, and every one of them leaves the worktree state unknown -
+        # which is the one state where the destructive sequence below must not
+        # run. Refuse instead, and say what to do about it.
+        raise GitError(
+            f"could not read the worktree state of {repo}: {exc}. This run "
+            "would checkout a new branch, commit onto it and switch back, "
+            "which strands any uncommitted work it cannot see. Fix the "
+            "checkout, or pass --allow-dirty to proceed anyway."
+        ) from exc
+
+    dirty = [
+        line[3:].strip()
+        for line in status.splitlines()
+        if len(line) > 3 and not line.startswith("??")
+    ]
     if not dirty:
         return
     raise GitError(
@@ -382,7 +412,11 @@ def build_pull_request(
         diff = ""
         if commit and files:
             _run(["git", "add", "--", *files], repo)
-            diff = _run(["git", "diff", "--cached"], repo)
+            # Scoped to the run's own paths. A bare `git diff --cached` reports
+            # the whole index, so anything the operator had already staged
+            # elsewhere would be quoted into the PR body as if this run had
+            # produced it.
+            diff = _run(["git", "diff", "--cached", "--", *files], repo)
     except Exception:
         _abandon_branch(repo, branch, original)
         raise
@@ -434,7 +468,18 @@ def build_pull_request(
             # on its own, the repo's hooks run for real when a human commits the
             # reviewed result, and a rejecting hook here throws away a paid
             # optimization run to enforce a rule about a branch nobody keeps.
-            _run(["git", "commit", "--no-verify", "-m", commit_message], repo)
+            #
+            # Scoped to *files* for the same reason the diff above is. `git
+            # commit` writes the whole index, so work the operator had staged
+            # anywhere else in the repo would be committed onto this evolve/
+            # branch, and restore() would then leave it off the branch they
+            # were on - gone, from the working tree's point of view.
+            # require_clean_worktree cannot catch that, because it only looks
+            # at the paths this run owns.
+            _run(
+                ["git", "commit", "--no-verify", "-m", commit_message, "--", *files],
+                repo,
+            )
         except Exception:
             _abandon_branch(repo, branch, original)
             raise

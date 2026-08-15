@@ -350,3 +350,66 @@ class TestCommitHooksAreSkipped:
 
         plan = build(evolved)
         assert plan.branch.startswith("evolve/")
+
+
+class TestUnrelatedStagedWorkSurvives:
+    """`git commit` writes the whole index, not just what `git add` staged here.
+
+    Work the operator had staged elsewhere would ride onto the evolve/ branch,
+    and restore() would then leave it off the branch they were standing on.
+    require_clean_worktree cannot see it: it only looks at the run's own paths.
+    """
+
+    @pytest.fixture
+    def with_staged_work(self, repo):
+        (repo / "notes.py").write_text("IMPORTANT = 'my staged work'\n")
+        git(repo, "add", "notes.py")
+        (repo / "tool.py").write_text("DESCRIPTION = 'after'\n")
+        return repo
+
+    def test_the_commit_does_not_absorb_it(self, with_staged_work):
+        plan = build(with_staged_work)
+        committed = subprocess.run(
+            ["git", "show", "--name-only", "--format=", plan.branch],
+            cwd=str(with_staged_work), capture_output=True, text=True, check=True,
+        ).stdout.split()
+        assert committed == ["tool.py"]
+
+    def test_it_is_still_staged_after_the_run_restores(self, with_staged_work):
+        plan = build(with_staged_work)
+        plan.restore()
+        staged = subprocess.run(
+            ["git", "diff", "--cached", "--name-only"],
+            cwd=str(with_staged_work), capture_output=True, text=True, check=True,
+        ).stdout.split()
+        assert "notes.py" in staged
+        assert (with_staged_work / "notes.py").read_text() == "IMPORTANT = 'my staged work'\n"
+
+    def test_the_pr_body_diff_does_not_quote_it(self, with_staged_work):
+        plan = build(with_staged_work)
+        assert "IMPORTANT" not in plan.body
+        assert "DESCRIPTION" in plan.body
+
+
+class TestTheGuardFailsClosed:
+    """An unreadable worktree is the one state where the run must not proceed."""
+
+    def test_an_unreadable_worktree_is_refused_not_assumed_clean(self, repo, monkeypatch):
+        def no_git(*args, **kwargs):
+            raise GitError("git: command not found")
+
+        monkeypatch.setattr("evolution.core.pr_builder._run", no_git)
+        with pytest.raises(GitError, match="could not read the worktree state"):
+            require_clean_worktree(repo, ["tool.py"])
+
+    def test_allow_dirty_still_skips_the_question(self, repo, monkeypatch):
+        def no_git(*args, **kwargs):
+            raise GitError("git: command not found")
+
+        monkeypatch.setattr("evolution.core.pr_builder._run", no_git)
+        require_clean_worktree(repo, ["tool.py"], allow_dirty=True)
+
+    def test_a_checkout_without_git_is_not_an_unreadable_one(self, tmp_path):
+        """Nothing to strand and no branch to strand it on. Not this guard's problem."""
+        (tmp_path / "tool.py").write_text("DESCRIPTION = 'x'\n")
+        require_clean_worktree(tmp_path, ["tool.py"])

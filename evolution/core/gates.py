@@ -262,12 +262,29 @@ def find_benchmark(repo: Path, name: str) -> Optional[Path]:
     return None
 
 
+# A textual score has to name itself as one. Scanning backwards for any
+# percentage or any N/M pair makes the last progress line a runner printed into
+# the result: a trailing "[100%]" reports a perfect benchmark and a "12/20"
+# counter reports 0.6, neither of which the benchmark ever claimed, and
+# run_benchmark_gate then reports PASSED on the strength of it. An unlabelled
+# number now parses as None, which this module already treats as a gate that
+# could not be measured rather than one that passed.
+_RESULT_LABEL = r"(?:score|pass[\s_-]?rate|accuracy|passed|correct|result|final|total)"
+_LABELLED_FRACTION = re.compile(
+    _RESULT_LABEL + r"[^\d\n]{0,24}(\d+)\s*/\s*(\d+)", re.IGNORECASE
+)
+_LABELLED_PERCENT = re.compile(
+    _RESULT_LABEL + r"[^\d\n]{0,24}(\d+(?:\.\d+)?)\s*%", re.IGNORECASE
+)
+
+
 def _parse_benchmark_score(stdout: str) -> Optional[float]:
     """Pull a pass rate out of a benchmark's stdout.
 
     Accepts a JSON object carrying ``score``/``pass_rate``/``accuracy``, or a
-    trailing ``N/M`` or percentage line. Returns None when nothing parses,
-    which the caller treats as a failed gate rather than a zero score.
+    line that labels its ``N/M`` or percentage as a result. Returns None when
+    nothing parses, which the caller treats as a failed gate rather than a zero
+    score.
     """
     for line in reversed(stdout.strip().splitlines()):
         line = line.strip()
@@ -279,10 +296,10 @@ def _parse_benchmark_score(stdout: str) -> Optional[float]:
             for key in ("score", "pass_rate", "accuracy"):
                 if isinstance(blob.get(key), (int, float)):
                     return float(blob[key])
-        m = re.search(r"(\d+)\s*/\s*(\d+)", line)
+        m = _LABELLED_FRACTION.search(line)
         if m and int(m.group(2)) > 0:
             return int(m.group(1)) / int(m.group(2))
-        m = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
+        m = _LABELLED_PERCENT.search(line)
         if m:
             return float(m.group(1)) / 100.0
     return None
