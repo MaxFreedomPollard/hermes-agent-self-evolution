@@ -432,6 +432,24 @@ class TestReport:
     def test_to_dict_is_json_serialisable(self):
         json.dumps(self._report().to_dict())
 
+    def test_serialised_artifact_preserves_unmeasured_outcomes(self):
+        report = BehavioralReport(
+            outcomes=[
+                BehavioralOutcome(
+                    "missing",
+                    "memory_guidance",
+                    "MEMORY_GUIDANCE",
+                    0.0,
+                    False,
+                    measured=False,
+                )
+            ]
+        )
+
+        artifact = json.loads(json.dumps(report.to_dict()))
+
+        assert artifact["outcomes"][0]["measured"] is False
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # batch_runner harness

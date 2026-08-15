@@ -790,6 +790,7 @@ class BehavioralOutcome:
             "score": round(self.score, 4),
             "passed": self.passed,
             "feedback": self.feedback,
+            "measured": self.measured,
             "judge": self.judge,
         }
 
