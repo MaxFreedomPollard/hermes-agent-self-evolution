@@ -439,14 +439,14 @@ class ToolCatalog:
         return entry
 
     def by_toolset(self) -> dict[str, list[ToolEntry]]:
-        """Entries grouped by toolset, name-sorted."""
+        """Entries grouped by toolset. Keys sorted; entries keep catalogue order."""
         grouped: dict[str, list[ToolEntry]] = {}
         for entry in self.entries:
             grouped.setdefault(entry.toolset, []).append(entry)
         return {k: grouped[k] for k in sorted(grouped)}
 
     def by_module(self) -> dict[str, list[ToolEntry]]:
-        """Entries grouped by defining module, name-sorted."""
+        """Entries grouped by defining module. Keys sorted; entries keep catalogue order."""
         grouped: dict[str, list[ToolEntry]] = {}
         for entry in self.entries:
             grouped.setdefault(entry.module, []).append(entry)

@@ -38,8 +38,10 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -56,6 +58,7 @@ from evolution.core.constraints import ConstraintValidator
 from evolution.core.cost import UsageTracker
 from evolution.core.gates import (
     GateChain,
+    GateResult,
     GateStatus,
     run_benchmark_gate,
     run_pytest_gate,
@@ -104,9 +107,12 @@ from evolution.tools.tool_catalog import (
 console = Console()
 
 __all__ = [
+    "EXIT_DEPLOYMENT_INCOMPLETE",
     "ConstraintOutcome",
+    "benchmark_candidate",
     "build_accuracy_checker",
     "collect_rejections",
+    "deployment_incomplete",
     "enforce_constraints",
     "freeze_unselected",
     "pr_target_slug",
@@ -314,6 +320,76 @@ def enforce_constraints(
 # ──────────────────────────────────────────────────────────────────────────
 
 _UNSAFE_IN_A_BRANCH = re.compile(r"[^A-Za-z0-9._]+")
+
+# Restated from Phase 3 rather than imported, so Phase 2 does not depend on a
+# sibling phase for a number. docs/ARCHITECTURE.md documents it as the status
+# for "you asked for this and it did not happen", which is a different claim
+# from "the run failed".
+EXIT_DEPLOYMENT_INCOMPLETE = 3
+
+
+def deployment_incomplete(metrics: object) -> bool:
+    """Whether a deployment step the caller asked for did not happen.
+
+    A GitError on its own is not enough. A checkout that is not a git repo
+    fails to build a branch, but the evolved descriptions are already on disk
+    and failing the run over it would say something untrue about the write. It
+    is the unmet *request* - ``--push`` that did not push, ``--open-pr`` that
+    did not open - that the exit status has to carry.
+    """
+    if not isinstance(metrics, dict):
+        return False
+    deployment = metrics.get("deployment") or {}
+    requested = deployment.get("requested") or {}
+    return bool(
+        (requested.get("push") and not deployment.get("pushed"))
+        or (requested.get("open_pr") and not deployment.get("opened"))
+    )
+
+
+def benchmark_candidate(
+    repo: Path,
+    bundle: dict[str, ToolDescriptions],
+    baseline: GateResult,
+    *,
+    name: str = "tblite",
+    regression_threshold: float = 0.02,
+    fast: bool = True,
+) -> GateResult:
+    """Measure *bundle* against *baseline* on a throwaway copy of *repo*.
+
+    A benchmark can only score what is on disk, and the candidate is not: the
+    write-back happens after this gate, and has to, because this gate is one of
+    the things that decides whether it happens at all. Running both
+    measurements against the unmodified checkout is worse than not running the
+    second one, because it reports PASSED on evidence that describes the
+    baseline twice and can never show a regression.
+
+    Staging into *repo* would fix the measurement and break something more
+    important: a candidate that has not passed its gates would be sitting in
+    the operator's working tree, and any crash in between would leave it there.
+    So the candidate is applied to a copy and the copy is thrown away.
+
+    Returns *baseline* unchanged when there is no benchmark to run, which is
+    every hermes-agent checkout today - copying a repo to measure nothing is a
+    cost with no answer attached.
+    """
+    if baseline.status is GateStatus.UNAVAILABLE:
+        return baseline
+
+    repo = Path(repo)
+    with tempfile.TemporaryDirectory(prefix="hermes-candidate-") as tmp:
+        mirror = Path(tmp) / repo.name
+        # .git is the bulk of a checkout and a benchmark never reads it.
+        shutil.copytree(repo, mirror, ignore=shutil.ignore_patterns(".git"))
+        write_bundle(mirror, bundle)
+        return run_benchmark_gate(
+            mirror,
+            name,
+            baseline=baseline.score,
+            regression_threshold=regression_threshold,
+            fast=fast,
+        )
 
 
 def pr_target_slug(tools: Sequence[str], toolset: Optional[str] = None) -> str:
@@ -829,10 +905,17 @@ def evolve_tool_descriptions(
             allowed=selected.names,
             accuracy=accuracy,
         )
+        # Counted off `failures`, not `messages`. The two carry the same
+        # factual_accuracy entries today, because a finding is only ever raised
+        # for a problem and a problem always reverts - but `messages` is
+        # defined as every check that ran, passing ones included, so a count of
+        # reverts taken from it is only correct by accident and would start
+        # lying the moment a passing factual check wanted to announce itself.
         factual_reverts = sum(
             1
             for outcome in constraint_outcomes
-            if any(m.startswith("factual_accuracy:") for m in outcome.messages)
+            if outcome.reverted
+            and any(m.startswith("factual_accuracy:") for m in outcome.failures)
         )
         console.print(
             "  Factual accuracy: schema-structural checks"
@@ -898,11 +981,15 @@ def evolve_tool_descriptions(
                 f"(candidates must hold within "
                 f"{config.tblite_regression_threshold:.1%})"
             )
+        # Measured on a copy with the candidate applied, not on `repo`. Both
+        # measurements used to run against the unmodified checkout, which made
+        # the gate structurally incapable of failing: it was comparing the
+        # baseline against itself.
         gates.append(
-            lambda: run_benchmark_gate(
+            lambda: benchmark_candidate(
                 repo,
-                "tblite",
-                baseline=tblite_baseline.score,
+                candidate_bundle,
+                tblite_baseline,
                 regression_threshold=config.tblite_regression_threshold,
                 fast=True,
             )
@@ -1129,6 +1216,9 @@ def evolve_tool_descriptions(
         "cost": cost.to_dict(),
         "written": bool(may_write and write_report and write_report.files_written),
         "pull_request": None,
+        # Present on every run like pull_request is, so a reader never has to
+        # tell "deployment did not happen" apart from "the key is missing".
+        "deployment": None,
     }
     metrics_path = output_dir / "metrics.json"
 
@@ -1162,6 +1252,19 @@ def evolve_tool_descriptions(
     else:
         original_ref = _current_git_ref(repo)
         plan: Optional[PullRequestPlan] = None
+        # What deployment actually did, step by step. A branch can be built
+        # locally and still never reach a remote, so "there is a pull_request
+        # record" is not the same claim as "it was pushed" - each step marks
+        # itself only once it has returned, and a GitError leaves the reason
+        # behind in the artifact instead of only on the terminal.
+        deployment = {
+            "requested": {"push": push, "open_pr": open_pr},
+            "status": "pending",
+            "pushed": False,
+            "opened": False,
+            "error": None,
+        }
+        metrics["deployment"] = deployment
         try:
             plan = build_pull_request(
                 repo=repo,
@@ -1207,6 +1310,7 @@ def evolve_tool_descriptions(
 
             if push:
                 plan.push()
+                deployment["pushed"] = True
                 console.print("  Pushed the branch to origin, as --push asked.")
             if open_pr:
                 if not push:
@@ -1215,7 +1319,9 @@ def evolve_tool_descriptions(
                         "pull request for a branch the remote already has.[/yellow]"
                     )
                 plan.open(base=pr_base)
+                deployment["opened"] = True
                 console.print(f"  Opened a pull request against {pr_base}, as --open-pr asked.")
+            deployment["status"] = "ok"
             if not push and not open_pr:
                 console.print(
                     "  Nothing was pushed and no pull request was opened. The branch "
@@ -1225,11 +1331,14 @@ def evolve_tool_descriptions(
             elif not open_pr:
                 console.print("  No pull request was opened.")
         except GitError as exc:
+            deployment["status"] = "failed"
+            deployment["error"] = str(exc)
             console.print(f"  [red]✗ {exc}[/red]")
             console.print(
                 "  The evolved descriptions are still in the run artifacts above."
             )
         finally:
+            save_metrics()
             _restore_checkout(repo, plan, original_ref)
             if plan is not None:
                 console.print(
@@ -1318,7 +1427,7 @@ def main(
     allow_dirty,
 ):
     """Evolve hermes-agent tool descriptions using DSPy + GEPA optimization."""
-    code = evolve_tool_descriptions(
+    result = evolve_tool_descriptions(
         tools=tools,
         toolset=toolset,
         iterations=iterations,
@@ -1337,10 +1446,18 @@ def main(
         pr_base=pr_base,
         allow_dirty=allow_dirty,
     )
-    # evolve() returns a non-zero code when it refuses to start or when a
-    # requested deployment step failed. Swallowing it here made a failed push
-    # look like a clean run to a caller, and Phase 5 reads exactly that exit
-    # status to decide whether an optimization was proposed.
+    # evolve_tool_descriptions returns the metrics it saved, or a bare exit
+    # code when it refused to start at all. Both have to become a status here,
+    # and neither reading is optional: handing the metrics dict itself to
+    # SystemExit printed the whole dict and exited 1 on every successful run,
+    # and swallowing a failed push made it look like a clean one. Phase 5 reads
+    # exactly this status to decide whether an optimization was proposed.
+    if isinstance(result, int):
+        code = result
+    elif deployment_incomplete(result):
+        code = EXIT_DEPLOYMENT_INCOMPLETE
+    else:
+        code = 0
     if code:
         raise SystemExit(code)
 

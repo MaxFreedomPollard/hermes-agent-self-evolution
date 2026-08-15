@@ -10,6 +10,7 @@ is ever pushed.
 
 import json
 import subprocess
+from pathlib import Path
 
 import dspy
 import pytest
@@ -17,16 +18,20 @@ from click.testing import CliRunner
 
 from evolution.core.config import EvolutionConfig
 from evolution.core.cost import CostReport, LMCall
+from evolution.core.gates import GateResult, GateStatus
 from evolution.core.pr_builder import GitError, PullRequestPlan, RejectedCandidate
 from evolution.tools.cross_tool import CrossToolGuard, CrossToolReport
 from evolution.tools.evolve_tool_descriptions import (
+    EXIT_DEPLOYMENT_INCOMPLETE,
     ConstraintOutcome,
+    benchmark_candidate,
     collect_rejections,
     evolve_tool_descriptions,
     main,
     pr_target_slug,
     score_lines,
 )
+from evolution.tools.tool_catalog import load_catalog
 from evolution.tools.selection_eval import (
     ToolSelectionExample,
     ToolSelector,
@@ -904,3 +909,243 @@ class TestCostReportShape:
             "complete",
             "models",
         }
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# The exit status and the metrics both have to match what really happened
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestTheExitStatusMatchesWhatHappened:
+    """Phase 5 reads this status to decide whether an optimization was proposed.
+
+    A run that reports failure after succeeding is as useless to it as one that
+    reports success after a failed push, so both directions are pinned here.
+    """
+
+    def test_a_successful_run_exits_zero(self, git_repo, tmp_path, stubbed):
+        stubbed.setattr(dspy, "GEPA", optimizer(tidy_terminal))
+        result = cli_run(git_repo, tmp_path, ["--write"])
+        assert result.exit_code == 0
+
+    def test_a_successful_run_does_not_print_its_metrics_dict(
+        self, git_repo, tmp_path, stubbed
+    ):
+        """The metrics belong in metrics.json, not dumped on the way out."""
+        stubbed.setattr(dspy, "GEPA", optimizer(tidy_terminal))
+        result = cli_run(git_repo, tmp_path, ["--write"])
+        assert "'elapsed_seconds'" not in result.output
+
+    def test_a_dry_run_exits_zero(self, hermes_repo):
+        result = CliRunner().invoke(
+            main, ["--hermes-repo", str(hermes_repo), "--dry-run"], env={"COLUMNS": "200"}
+        )
+        assert result.exit_code == 0
+
+    def test_a_failed_push_exits_deployment_incomplete(
+        self, git_repo, tmp_path, stubbed
+    ):
+        """No remote is configured, so --push fails for real."""
+        stubbed.setattr(dspy, "GEPA", optimizer(tidy_terminal))
+        result = cli_run(git_repo, tmp_path, ["--write", "--push"])
+        assert result.exit_code == EXIT_DEPLOYMENT_INCOMPLETE
+
+    def test_a_failed_open_exits_deployment_incomplete(
+        self, git_repo, tmp_path, stubbed
+    ):
+        def refuse(self, *args, **kwargs):
+            raise GitError("gh is not installed")
+
+        stubbed.setattr(PullRequestPlan, "open", refuse)
+        stubbed.setattr(dspy, "GEPA", optimizer(tidy_terminal))
+        result = cli_run(git_repo, tmp_path, ["--write", "--open-pr"])
+        assert result.exit_code == EXIT_DEPLOYMENT_INCOMPLETE
+
+    def test_a_checkout_without_git_still_exits_zero(self, hermes_repo, tmp_path, stubbed):
+        """The write succeeded and nothing was asked for. Not a deployment failure."""
+        stubbed.setattr(dspy, "GEPA", optimizer(tidy_terminal))
+        result = cli_run(hermes_repo, tmp_path, ["--write"])
+        assert result.exit_code == 0
+
+    def test_a_failed_push_is_recorded_in_the_saved_metrics(
+        self, git_repo, tmp_path, stubbed
+    ):
+        stubbed.setattr(dspy, "GEPA", optimizer(tidy_terminal))
+        metrics = run(git_repo, tmp_path, write=True, push=True)
+
+        assert metrics["deployment"]["status"] == "failed"
+        assert metrics["deployment"]["pushed"] is False
+        assert metrics["deployment"]["error"]
+
+        saved = json.loads((run_dir(tmp_path) / "metrics.json").read_text())
+        assert saved["deployment"]["status"] == "failed"
+
+    def test_a_local_branch_is_never_recorded_as_pushed(
+        self, git_repo, tmp_path, stubbed
+    ):
+        """Neither flag was passed, so nothing left the machine."""
+        stubbed.setattr(dspy, "GEPA", optimizer(tidy_terminal))
+        metrics = run(git_repo, tmp_path, write=True)
+
+        assert metrics["pull_request"] is not None
+        assert metrics["deployment"]["status"] == "ok"
+        assert metrics["deployment"]["pushed"] is False
+        assert metrics["deployment"]["opened"] is False
+        assert metrics["deployment"]["requested"] == {"push": False, "open_pr": False}
+
+    def test_a_build_that_failed_is_not_recorded_as_ok(
+        self, git_repo, tmp_path, stubbed
+    ):
+        def explode(**kwargs):
+            raise GitError("something went wrong in git")
+
+        stubbed.setattr(
+            "evolution.tools.evolve_tool_descriptions.build_pull_request", explode
+        )
+        stubbed.setattr(dspy, "GEPA", optimizer(tidy_terminal))
+        metrics = run(git_repo, tmp_path, write=True)
+
+        assert metrics["pull_request"] is None
+        assert metrics["deployment"]["status"] == "failed"
+
+    def test_a_run_that_never_deployed_still_has_the_key(
+        self, git_repo, tmp_path, stubbed
+    ):
+        """Same shape as pull_request: always present, None when it did not happen."""
+        stubbed.setattr(dspy, "GEPA", optimizer(tidy_terminal))
+        metrics = run(git_repo, tmp_path, write=False)
+        assert metrics["deployment"] is None
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# The benchmark has to measure the candidate, not the baseline twice
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestTheBenchmarkSeesTheCandidate:
+    """Both TBLite measurements used to run against the unmodified checkout.
+
+    A gate that scores the baseline twice reports PASSED on evidence that
+    cannot contain a regression, which is worse than not running it.
+    """
+
+    def bundle(self, repo):
+        loaded = load_catalog(repo).bundle()
+        loaded["read_file"].description = "EVOLVED read_file description."
+        return loaded
+
+    def test_an_unavailable_benchmark_is_not_worth_copying_a_repo(
+        self, hermes_repo, monkeypatch
+    ):
+        ran = []
+        monkeypatch.setattr(
+            "evolution.tools.evolve_tool_descriptions.run_benchmark_gate",
+            lambda *a, **kw: ran.append(a) or GateResult("tblite", GateStatus.PASSED, "x"),
+        )
+        baseline = GateResult("tblite", GateStatus.UNAVAILABLE, "benchmark not found")
+
+        result = benchmark_candidate(hermes_repo, self.bundle(hermes_repo), baseline)
+
+        assert result is baseline
+        assert ran == []
+
+    def test_the_measured_checkout_carries_the_candidate(
+        self, hermes_repo, monkeypatch
+    ):
+        seen = {}
+
+        def fake_gate(repo, name, **kwargs):
+            seen["repo"] = Path(repo)
+            seen["source"] = (Path(repo) / "tools" / "file_tools.py").read_text()
+            seen["baseline"] = kwargs.get("baseline")
+            return GateResult(name, GateStatus.PASSED, "ok", score=0.9)
+
+        monkeypatch.setattr(
+            "evolution.tools.evolve_tool_descriptions.run_benchmark_gate", fake_gate
+        )
+        baseline = GateResult("tblite", GateStatus.PASSED, "ok", score=0.95)
+
+        benchmark_candidate(hermes_repo, self.bundle(hermes_repo), baseline)
+
+        assert "EVOLVED read_file description." in seen["source"]
+        assert seen["baseline"] == 0.95
+
+    def test_the_operators_checkout_is_never_written_to(
+        self, hermes_repo, monkeypatch
+    ):
+        before = (hermes_repo / "tools" / "file_tools.py").read_text()
+        measured = {}
+
+        def fake_gate(repo, name, **kwargs):
+            measured["repo"] = Path(repo)
+            return GateResult(name, GateStatus.PASSED, "ok", score=0.9)
+
+        monkeypatch.setattr(
+            "evolution.tools.evolve_tool_descriptions.run_benchmark_gate", fake_gate
+        )
+        baseline = GateResult("tblite", GateStatus.PASSED, "ok", score=0.95)
+
+        benchmark_candidate(hermes_repo, self.bundle(hermes_repo), baseline)
+
+        assert measured["repo"] != hermes_repo
+        assert (hermes_repo / "tools" / "file_tools.py").read_text() == before
+
+    def test_the_copy_does_not_outlive_the_measurement(self, hermes_repo, monkeypatch):
+        measured = {}
+
+        def fake_gate(repo, name, **kwargs):
+            measured["repo"] = Path(repo)
+            return GateResult(name, GateStatus.PASSED, "ok", score=0.9)
+
+        monkeypatch.setattr(
+            "evolution.tools.evolve_tool_descriptions.run_benchmark_gate", fake_gate
+        )
+        baseline = GateResult("tblite", GateStatus.PASSED, "ok", score=0.95)
+
+        benchmark_candidate(hermes_repo, self.bundle(hermes_repo), baseline)
+        assert not measured["repo"].exists()
+
+
+class TestFactualRevertsCountsReverts:
+    """`messages` holds every check that ran. Only `failures` refused anything."""
+
+    def outcome(self, **kw):
+        base = dict(
+            target="read_file",
+            kind="tool_description",
+            passed=True,
+            reverted=False,
+            messages=[],
+            failures=[],
+        )
+        base.update(kw)
+        return ConstraintOutcome(**base)
+
+    def count(self, outcomes):
+        return sum(
+            1
+            for o in outcomes
+            if o.reverted and any(m.startswith("factual_accuracy:") for m in o.failures)
+        )
+
+    def test_a_passing_factual_check_is_not_a_revert(self):
+        passed = self.outcome(messages=["factual_accuracy: nothing unsupported"])
+        assert self.count([passed]) == 0
+
+    def test_a_failing_factual_check_is_a_revert(self):
+        failed = self.outcome(
+            passed=False,
+            reverted=True,
+            messages=["size_limit: Size OK", "factual_accuracy: claims recursive"],
+            failures=["factual_accuracy: claims recursive"],
+        )
+        assert self.count([failed]) == 1
+
+    def test_a_budget_revert_is_not_counted_as_a_factual_one(self):
+        budget = self.outcome(
+            passed=False,
+            reverted=True,
+            messages=["size_limit: 812/500 chars"],
+            failures=["size_limit: 812/500 chars"],
+        )
+        assert self.count([budget]) == 0
