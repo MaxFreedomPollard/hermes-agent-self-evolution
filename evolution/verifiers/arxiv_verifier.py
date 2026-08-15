@@ -28,14 +28,12 @@ Task design notes:
     GEPA toward "verify with the API, do not guess".
 """
 
-import json
 import random
 import re
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import click
 from rich.console import Console
@@ -316,7 +314,7 @@ class ArxivVerifier(Verifier):
                 self._tasks.append(example)
                 self._tasks_by_paper.setdefault(paper.arxiv_id, []).append(example)
 
-    def ground_truth_for(self, task_input: str) -> Optional[GroundTruth]:
+    def ground_truth_for(self, task_input: str) -> GroundTruth | None:
         """The authoritative answer for a task, or None if unknown."""
         return self._answers.get(task_input.strip())
 
@@ -503,9 +501,8 @@ def main(do_validate, do_demo, do_build, num_cases, output):
         console.print("Nothing to do. Pass --validate, --demo, or --build.")
         return
 
-    if do_validate:
-        if not validate_seed_papers():
-            raise SystemExit(1)
+    if do_validate and not validate_seed_papers():
+        raise SystemExit(1)
 
     if do_demo:
         run_demo()

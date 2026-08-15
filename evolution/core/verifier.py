@@ -19,7 +19,7 @@ the DSPy metric protocol, including GEPA's feedback-aware form.
 """
 
 import abc
-from typing import Callable, Optional
+from collections.abc import Callable
 
 import dspy
 
@@ -62,7 +62,7 @@ def register_verifier(cls: type[Verifier]) -> type[Verifier]:
     return cls
 
 
-def get_verifier(skill_name: str) -> Optional[Verifier]:
+def get_verifier(skill_name: str) -> Verifier | None:
     """Return a verifier instance for a skill, or None if none exists."""
     from evolution.verifiers import load_builtins
 

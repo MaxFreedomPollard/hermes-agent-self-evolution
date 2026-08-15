@@ -9,14 +9,14 @@ import pytest
 
 from evolution.core.verifier import verifier_metric
 from evolution.verifiers.arxiv_verifier import (
+    ARXIV_ID_RE,
     KIND_AUTHOR,
     KIND_ID,
     KIND_TITLE,
     KIND_YEAR,
-    ARXIV_ID_RE,
-    ArxivVerifier,
     PAPER_BY_ID,
     SEED_PAPERS,
+    ArxivVerifier,
     _conciseness,
     grade_arxiv_id,
     grade_title,
