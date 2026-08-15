@@ -488,12 +488,15 @@ def paired_bootstrap_ci(
         raise ValueError("paired bootstrap needs equal lengths")
     n = len(baseline)
     if n == 0:
-        return Interval(0.0, 0.0, 0.0, confidence)
+        return Interval(0.0, 0.0, 0.0, confidence, estimable=False)
 
     diffs = [c - b for b, c in zip(baseline, candidate)]
     point = sum(diffs) / n
-    if n == 1 or all(d == diffs[0] for d in diffs):
-        return Interval(point, point, point, confidence)
+    if n == 1 or all(
+        math.isclose(d, diffs[0], rel_tol=1e-12, abs_tol=1e-15)
+        for d in diffs
+    ):
+        return Interval(point, point, point, confidence, estimable=False)
 
     rng = random.Random(seed)
     means = []
@@ -673,7 +676,11 @@ class PairedContinuous:
     @property
     def inconclusive(self) -> bool:
         """True when the interval straddles zero: no evidence either way."""
-        return self.direction_conflict or self.delta_ci.contains(0.0)
+        return (
+            not self.delta_ci.estimable
+            or self.direction_conflict
+            or self.delta_ci.contains(0.0)
+        )
 
     def describe(self) -> str:
         """Means, delta, interval, sample size, p-value and effect size."""
@@ -714,7 +721,14 @@ def compare_paired_continuous(
     n = len(baseline)
     if n == 0:
         return PairedContinuous(
-            0, 0.0, 0.0, 0.0, Interval(0.0, 0.0, 0.0, confidence), 1.0, 0.0, alpha
+            0,
+            0.0,
+            0.0,
+            0.0,
+            Interval(0.0, 0.0, 0.0, confidence, estimable=False),
+            1.0,
+            0.0,
+            alpha,
         )
     base_mean = sum(baseline) / n
     cand_mean = sum(candidate) / n

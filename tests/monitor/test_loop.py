@@ -877,6 +877,10 @@ class TestProposedMeansABranchExists:
         assert dispatch.status is DispatchStatus.NO_CHANGE
         assert "no branch" in dispatch.reason
         assert report.proposed == []
+        rendered = out.file.getvalue()
+        assert "no change" in rendered
+        assert "failed" not in rendered
+        assert "exit 0" not in rendered
 
     def test_a_failure_is_still_a_failure(self, store, hermes_repo, out):
         self._tool_store(store)

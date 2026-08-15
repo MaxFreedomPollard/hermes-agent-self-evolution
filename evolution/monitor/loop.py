@@ -854,6 +854,10 @@ def _dispatch_one(
 
     if status is DispatchStatus.PROPOSED:
         out.print(f"  [green]✓ proposed[/green] {entry.target} in {elapsed:.1f}s")
+    elif status is DispatchStatus.NO_CHANGE:
+        out.print(
+            f"  [yellow]○ no change[/yellow] {entry.target}: {dispatch.reason}"
+        )
     else:
         out.print(
             f"  [red]✗ failed[/red] {entry.target}: exit {result.returncode}"

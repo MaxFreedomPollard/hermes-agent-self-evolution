@@ -212,9 +212,10 @@ class TestPairedBinary:
 class TestPairedContinuous:
     def test_detects_a_consistent_shift(self):
         base = [0.50, 0.52, 0.48, 0.51, 0.49, 0.50, 0.53, 0.47]
-        cand = [b + 0.20 for b in base]
+        shifts = [0.16, 0.18, 0.20, 0.22, 0.17, 0.19, 0.21, 0.23]
+        cand = [b + shift for b, shift in zip(base, shifts)]
         r = compare_paired_continuous(base, cand)
-        assert r.delta == pytest.approx(0.20)
+        assert r.delta == pytest.approx(sum(shifts) / len(shifts))
         assert r.significant_improvement
         assert not r.inconclusive
 
@@ -227,6 +228,14 @@ class TestPairedContinuous:
     def test_empty_input_is_safe(self):
         r = compare_paired_continuous([], [])
         assert r.n == 0 and r.delta == 0.0
+        assert r.delta_ci.estimable is False
+        assert r.inconclusive
+        assert paired_bootstrap_ci([], []).estimable is False
+
+    def test_single_pair_has_no_estimable_bootstrap_interval(self):
+        r = compare_paired_continuous([0.2], [0.8])
+        assert r.delta_ci.estimable is False
+        assert r.inconclusive
 
     def test_bootstrap_is_deterministic(self):
         base = [0.1, 0.4, 0.6, 0.2, 0.9, 0.3]
@@ -244,6 +253,10 @@ class TestPairedContinuous:
     def test_constant_difference_has_no_spread(self):
         interval = paired_bootstrap_ci([0.1, 0.2, 0.3], [0.2, 0.3, 0.4])
         assert interval.low == pytest.approx(interval.high)
+        assert interval.estimable is False
+        assert compare_paired_continuous(
+            [0.1, 0.2, 0.3], [0.2, 0.3, 0.4]
+        ).inconclusive
 
 
 class TestWilcoxon:
