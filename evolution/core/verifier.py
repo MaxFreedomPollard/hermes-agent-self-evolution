@@ -98,9 +98,13 @@ def verifier_metric(verifier: Verifier) -> Callable:
         task_input = getattr(gold, "task_input", "") or ""
         output = getattr(pred, "output", "") or ""
         fitness = verifier.score(task_input, output)
+        # Objective verification is an admission boundary: presentation and
+        # procedure feedback may guide reflection, but they cannot compensate
+        # for a factually wrong answer.
+        score = fitness.composite if fitness.correctness > 0 else 0.0
         if pred_name is not None:
-            return dspy.Prediction(score=fitness.composite, feedback=fitness.feedback)
-        return fitness.composite
+            return dspy.Prediction(score=score, feedback=fitness.feedback)
+        return score
 
     metric.__name__ = f"{verifier.skill_name}_verifier_metric"
     return metric

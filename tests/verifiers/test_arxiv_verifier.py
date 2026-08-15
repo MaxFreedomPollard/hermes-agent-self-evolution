@@ -53,6 +53,25 @@ class TestDataset:
         assert len(dataset.val) == 6
         assert len(dataset.holdout) == 6
 
+    def test_papers_are_disjoint_across_splits(self, verifier):
+        dataset = verifier.build_dataset()
+
+        groups = {
+            split: {
+                verifier.ground_truth_for(example.task_input).paper_id
+                for example in getattr(dataset, split)
+            }
+            for split in ("train", "val", "holdout")
+        }
+
+        assert groups["train"].isdisjoint(groups["val"])
+        assert groups["train"].isdisjoint(groups["holdout"])
+        assert groups["val"].isdisjoint(groups["holdout"])
+
+    def test_too_few_cases_is_rejected(self, verifier):
+        with pytest.raises(ValueError, match="at least 3"):
+            verifier.build_dataset(num_cases=2)
+
     def test_every_example_is_gradable(self, verifier):
         dataset = verifier.build_dataset()
         for example in dataset.all_examples:
@@ -88,6 +107,16 @@ class TestIdGrading:
         fitness = verifier.score(task, "That would be arXiv 1706.03799.")
         assert fitness.correctness == pytest.approx(0.0)
         assert "1706.03762" in fitness.feedback
+
+    def test_wrong_but_well_formed_id_has_zero_admission_score(self, verifier):
+        metric = verifier_metric(verifier)
+        task = task_input_for(ATTENTION, KIND_ID)
+        gold = dspy.Example(task_input=task).with_inputs("task_input")
+
+        score = metric(gold, dspy.Prediction(output="That would be arXiv 1706.03799."))
+
+        assert verifier.score(task, "That would be arXiv 1706.03799.").composite > 0
+        assert score == pytest.approx(0.0)
 
     def test_hedging_across_ids_gets_half_credit(self, verifier):
         task = task_input_for(ATTENTION, KIND_ID)

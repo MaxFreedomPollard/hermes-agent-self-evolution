@@ -106,6 +106,7 @@ class GroundTruth:
 
     kind: str
     value: str
+    paper_id: str
 
 
 def task_input_for(paper: Paper, kind: str) -> str:
@@ -280,6 +281,7 @@ class ArxivVerifier(Verifier):
     def __init__(self):
         self._answers: dict[str, GroundTruth] = {}
         self._tasks: list[EvalExample] = []
+        self._tasks_by_paper: dict[str, list[EvalExample]] = {}
         self._generate_tasks()
 
     def _generate_tasks(self) -> None:
@@ -299,31 +301,80 @@ class ArxivVerifier(Verifier):
                     value = paper.first_author
                 else:
                     value = str(paper.year)
-                self._answers[task] = GroundTruth(kind=kind, value=value)
-                self._tasks.append(EvalExample(
+                self._answers[task] = GroundTruth(
+                    kind=kind,
+                    value=value,
+                    paper_id=paper.arxiv_id,
+                )
+                example = EvalExample(
                     task_input=task,
                     expected_behavior=_rubric_for(paper, kind),
                     difficulty=_DIFFICULTY[kind],
                     category=kind,
                     source="verifier",
-                ))
+                )
+                self._tasks.append(example)
+                self._tasks_by_paper.setdefault(paper.arxiv_id, []).append(example)
 
     def ground_truth_for(self, task_input: str) -> Optional[GroundTruth]:
         """The authoritative answer for a task, or None if unknown."""
         return self._answers.get(task_input.strip())
 
     def build_dataset(self, num_cases: int = 24, seed: int = 13) -> EvalDataset:
-        """Deterministic sample of verifiable tasks, split 50/25/25."""
-        tasks = list(self._tasks)
-        random.Random(seed).shuffle(tasks)
-        tasks = tasks[:num_cases]
+        """Build a deterministic 50/25/25 split without paper leakage.
 
-        n_train = max(1, int(len(tasks) * 0.5))
-        n_val = max(1, int(len(tasks) * 0.25))
+        Each paper is assigned to exactly one split before task kinds are
+        sampled. Otherwise an ID lookup for a paper can train the optimizer
+        while a title or author lookup for the same paper appears to be an
+        independent validation or holdout example.
+        """
+        if num_cases < 3:
+            raise ValueError("num_cases must be at least 3 for train/val/holdout")
+
+        rng = random.Random(seed)
+        paper_ids = list(self._tasks_by_paper)
+        rng.shuffle(paper_ids)
+
+        n_papers = len(paper_ids)
+        n_train_papers = max(1, int(n_papers * 0.5))
+        n_val_papers = max(1, int(n_papers * 0.25))
+        grouped_ids = (
+            paper_ids[:n_train_papers],
+            paper_ids[n_train_papers:n_train_papers + n_val_papers],
+            paper_ids[n_train_papers + n_val_papers:],
+        )
+
+        pools: list[list[EvalExample]] = []
+        for ids in grouped_ids:
+            pool = [task for paper_id in ids for task in self._tasks_by_paper[paper_id]]
+            rng.shuffle(pool)
+            pools.append(pool)
+
+        total = min(num_cases, len(self._tasks))
+        target = [
+            max(1, int(total * 0.5)),
+            max(1, int(total * 0.25)),
+        ]
+        target.append(total - sum(target))
+        counts = [min(wanted, len(pool)) for wanted, pool in zip(target, pools)]
+
+        remaining = total - sum(counts)
+        while remaining:
+            progressed = False
+            for index, pool in enumerate(pools):
+                if counts[index] < len(pool):
+                    counts[index] += 1
+                    remaining -= 1
+                    progressed = True
+                    if not remaining:
+                        break
+            if not progressed:
+                break
+
         return EvalDataset(
-            train=tasks[:n_train],
-            val=tasks[n_train:n_train + n_val],
-            holdout=tasks[n_train + n_val:],
+            train=pools[0][:counts[0]],
+            val=pools[1][:counts[1]],
+            holdout=pools[2][:counts[2]],
         )
 
     def score(self, task_input: str, output: str) -> FitnessScore:
