@@ -236,7 +236,17 @@ def wilson_interval(successes: int, n: int, confidence: float = 0.95) -> Interva
     denom = 1.0 + z * z / n
     centre = (p + z * z / (2 * n)) / denom
     half = (z / denom) * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
-    return Interval(p, max(0.0, centre - half), min(1.0, centre + half), confidence)
+    # At the boundaries the answer is known exactly: with no successes the rate
+    # could be zero, and with no failures it could be one. Leaving that to
+    # ``centre -/+ half`` only lands on it when the arithmetic happens to
+    # cancel. It often does not: at n = 10 the lower bound comes back as
+    # 2.8e-17, so ``contains(0.0)`` is False for a sample of ten misses, and 43
+    # of the first 200 sample sizes miss zero this way while 60 miss one. The
+    # clamps below cannot fire on a non-boundary count, where centre -/+ half
+    # is strictly inside (0, 1).
+    low = 0.0 if successes <= 0 else max(0.0, centre - half)
+    high = 1.0 if successes >= n else min(1.0, centre + half)
+    return Interval(p, low, high, confidence)
 
 
 # ──────────────────────────────────────────────────────────────────────────

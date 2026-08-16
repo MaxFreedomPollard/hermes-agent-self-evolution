@@ -122,6 +122,31 @@ class TestWilson:
         interval = wilson_interval(0, 0)
         assert (interval.low, interval.high) == (0.0, 1.0)
 
+    def test_boundary_counts_hit_the_boundary_at_every_n(self):
+        """The bound must be exactly 0 or 1, not merely near it.
+
+        Checking a single n only samples the floating-point luck of that n.
+        ``wilson_interval(0, 12).low`` is exactly 0.0, but ``(0, 10)`` lands on
+        2.8e-17, which is a different answer to ``contains(0.0)`` for an eval
+        set of a perfectly ordinary size.
+        """
+        for n in range(1, 201):
+            assert wilson_interval(0, n).low == 0.0, f"n={n}"
+            assert wilson_interval(n, n).high == 1.0, f"n={n}"
+
+    def test_boundary_intervals_contain_the_boundary(self):
+        """The property the exactness is for: 0 misses can still be a 0% rate."""
+        for n in (10, 13, 34, 47):
+            assert wilson_interval(0, n).contains(0.0), f"n={n}"
+            assert wilson_interval(n, n).contains(1.0), f"n={n}"
+
+    def test_interior_counts_stay_strictly_inside(self):
+        """The clamps must not drag a real interval onto the boundary."""
+        for n in range(2, 60):
+            for successes in range(1, n):
+                interval = wilson_interval(successes, n)
+                assert 0.0 < interval.low <= interval.high < 1.0, f"{successes}/{n}"
+
 
 class TestPower:
     def test_ten_examples_cannot_detect_less_than_fifty_points(self):
