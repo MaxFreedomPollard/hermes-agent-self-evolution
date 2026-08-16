@@ -369,11 +369,35 @@ class ArxivVerifier(Verifier):
             if not progressed:
                 break
 
-        return EvalDataset(
+        dataset = EvalDataset(
             train=pools[0][:counts[0]],
             val=pools[1][:counts[1]],
             holdout=pools[2][:counts[2]],
         )
+        self._assert_disjoint_papers(dataset)
+        return dataset
+
+    def _assert_disjoint_papers(self, dataset: EvalDataset) -> None:
+        """Fail loudly if any paper reached more than one split.
+
+        The grouping above makes leakage structurally impossible, which is
+        exactly why this check is cheap and worth keeping: a later change to
+        the sampling would otherwise reintroduce it silently, and a leaked
+        holdout reports a score the run has not earned.
+        """
+        groups = {
+            name: {
+                self._answers[example.task_input].paper_id
+                for example in getattr(dataset, name)
+            }
+            for name in ("train", "val", "holdout")
+        }
+        for left, right in (("train", "val"), ("train", "holdout"), ("val", "holdout")):
+            shared = groups[left] & groups[right]
+            if shared:
+                raise AssertionError(
+                    f"paper leakage between {left} and {right}: {sorted(shared)}"
+                )
 
     def score(self, task_input: str, output: str) -> FitnessScore:
         truth = self.ground_truth_for(task_input)
