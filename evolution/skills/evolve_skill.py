@@ -18,6 +18,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from evolution.core.admission import AdmissionVerdict, evaluate_admission
 from evolution.core.config import EvolutionConfig, resolve_hermes_agent_path
 from evolution.core.dataset_builder import SyntheticDatasetBuilder, EvalDataset, GoldenDatasetLoader
 from evolution.core.external_importers import build_dataset_from_external
@@ -32,6 +33,42 @@ from evolution.skills.skill_module import (
 )
 
 console = Console()
+
+
+def _is_correct(verifier, example, prediction) -> bool:
+    """Whether the objective verifier judged this answer fully correct.
+
+    The declared threshold is full correctness. Partial credit exists for
+    hedging across candidates and for paraphrased titles, and it is the right
+    signal for reflection, but an admission gate on ground truth should count
+    an example as solved only when the fact was actually right.
+    """
+    fitness = verifier.score(
+        getattr(example, "task_input", "") or "",
+        getattr(prediction, "output", "") or "",
+    )
+    return fitness.correctness >= 1.0
+
+
+def _admission_verdict(
+    baseline_scores,
+    evolved_scores,
+    *,
+    baseline_correct=None,
+    candidate_correct=None,
+) -> AdmissionVerdict:
+    """Apply the declared paired admission rule to a holdout comparison.
+
+    A single decision point, so the run reports the rule it actually used.
+    Whether the deployable artifact changed is a separate gate that this
+    command does not yet check, so it is left unasserted rather than assumed.
+    """
+    return evaluate_admission(
+        baseline_scores,
+        evolved_scores,
+        baseline_correct=baseline_correct,
+        candidate_correct=candidate_correct,
+    )
 
 
 def evolve(
@@ -238,6 +275,11 @@ def evolve(
 
     baseline_scores = []
     evolved_scores = []
+    # Objective correctness per example, kept alongside the scores so the
+    # admission gate can use McNemar's exact test rather than a threshold
+    # invented for the occasion. Only a verifier can supply it.
+    baseline_correct = [] if verifier is not None else None
+    evolved_correct = [] if verifier is not None else None
     for ex in holdout_examples:
         # Score baseline
         with dspy.context(lm=lm):
@@ -249,9 +291,20 @@ def evolve(
             evolved_score = metric_fn(ex, evolved_pred)
             evolved_scores.append(evolved_score)
 
+        if verifier is not None:
+            baseline_correct.append(_is_correct(verifier, ex, baseline_pred))
+            evolved_correct.append(_is_correct(verifier, ex, evolved_pred))
+
     avg_baseline = sum(baseline_scores) / max(1, len(baseline_scores))
     avg_evolved = sum(evolved_scores) / max(1, len(evolved_scores))
     improvement = avg_evolved - avg_baseline
+
+    verdict = _admission_verdict(
+        baseline_scores,
+        evolved_scores,
+        baseline_correct=baseline_correct,
+        candidate_correct=evolved_correct,
+    )
 
     # ── 9. Report results ───────────────────────────────────────────────
     table = Table(title="Evolution Results")
@@ -273,11 +326,24 @@ def evolve(
         f"{len(evolved_body):,} chars",
         f"{len(evolved_body) - len(skill['body']):+,} chars",
     )
+    table.add_row(
+        "Admission",
+        "",
+        "admitted" if verdict.admitted else "refused",
+        f"p={verdict.p_improvement:.3f} at alpha {verdict.alpha}",
+    )
     table.add_row("Time", "", f"{elapsed:.1f}s", "")
     table.add_row("Iterations", "", str(iterations), "")
 
     console.print()
     console.print(table)
+
+    # The mean delta above is descriptive; this is the decision, and the power
+    # line says what this many examples could ever have resolved.
+    console.print(f"\n  {verdict.describe()}")
+    console.print(
+        f"  [{'yellow' if verdict.underpowered else 'dim'}]{verdict.power_note}[/]"
+    )
 
     # ── 10. Save output ─────────────────────────────────────────────────
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -300,6 +366,10 @@ def evolve(
         "baseline_score": avg_baseline,
         "evolved_score": avg_evolved,
         "improvement": improvement,
+        # `improvement` is the descriptive mean delta. `admitted` is the
+        # decision, and it requires paired evidence rather than a sign.
+        "admitted": verdict.admitted,
+        "admission": verdict.to_dict(),
         "baseline_size": len(skill["body"]),
         "evolved_size": len(evolved_body),
         "train_examples": len(dataset.train),
@@ -313,9 +383,17 @@ def evolve(
 
     console.print(f"\n  Output saved to {output_dir}/")
 
-    if improvement > 0:
+    if verdict.admitted:
         console.print(f"\n[bold green]✓ Evolution improved skill by {improvement:+.3f} ({improvement/max(0.001, avg_baseline)*100:+.1f}%)[/bold green]")
+        console.print(f"  {verdict.reason}")
         console.print(f"  Review the diff: diff {output_dir}/baseline_skill.md {output_dir}/evolved_skill.md")
+    elif improvement > 0:
+        # The mean moved the right way but the paired test cannot separate it
+        # from noise. Reporting "did not improve" would misstate that, so name
+        # the real reason and the sample size behind it.
+        console.print(f"\n[yellow]⚠ Not admitted: {verdict.reason}[/yellow]")
+        console.print(f"  {verdict.power_note}")
+        console.print("  Try: a larger holdout, more iterations, or a different optimizer model")
     else:
         console.print(f"\n[yellow]⚠ Evolution did not improve skill (change: {improvement:+.3f})[/yellow]")
         console.print("  Try: more iterations, better eval dataset, or different optimizer model")
