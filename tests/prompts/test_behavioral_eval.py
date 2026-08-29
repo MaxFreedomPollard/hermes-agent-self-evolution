@@ -27,6 +27,7 @@ from evolution.prompts.behavioral_eval import (
     BehavioralScenario,
     BehavioralSuite,
     DirectPromptHarness,
+    HarnessFailure,
     ScenarioGenerator,
     SectionBehaviorModule,
     build_scenarios,
@@ -455,9 +456,9 @@ class TestBatchRunnerHarness:
         harness = BatchRunnerHarness(hermes_repo=batch_repo)
         scenarios = build_scenarios(categories=["memory_guidance"])[:3]
         path = harness.build_dataset(scenarios, tmp_path / "ds" / "eval.jsonl")
-        lines = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines()]
+        lines = [json.loads(row) for row in path.read_text(encoding="utf-8").splitlines()]
         assert len(lines) == 3
-        assert [l["prompt"] for l in lines] == [s.prompt for s in scenarios]
+        assert [row["prompt"] for row in lines] == [s.prompt for s in scenarios]
         assert lines[0]["scenario_id"] == scenarios[0].scenario_id
         assert lines[0]["section_under_test"] == "MEMORY_GUIDANCE"
 
@@ -548,6 +549,62 @@ class TestBatchRunnerHarness:
     def test_run_without_a_runner_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             BatchRunnerHarness(hermes_repo=tmp_path).run([], "prompt", "run")
+
+    def test_a_crashed_runner_with_no_output_names_its_exit_code(
+        self, batch_repo, monkeypatch
+    ):
+        """A runner that dies before answering must not become a silent
+        all-unmeasured run whose cause only surfaces later as an unpaired
+        holdout."""
+        monkeypatch.setattr(
+            be.subprocess,
+            "run",
+            lambda cmd, **kw: types.SimpleNamespace(returncode=3, stdout="", stderr=""),
+        )
+        harness = BatchRunnerHarness(hermes_repo=batch_repo)
+        scenario = BehavioralScenario(
+            prompt="Remember I use tabs.",
+            section_under_test="MEMORY_GUIDANCE",
+            expected_behavior="Saves it.",
+            category="memory_guidance",
+        )
+        with pytest.raises(HarnessFailure, match="exited 3"):
+            harness.run([scenario], "EVOLVED", "hase-crash")
+
+    def test_a_nonzero_exit_with_partial_output_keeps_the_transcripts(
+        self, batch_repo, monkeypatch
+    ):
+        """Partial answers before the crash still count; the unanswered
+        scenarios come back unmeasured through the normal path."""
+
+        def fake_run(cmd, **kwargs):
+            out = batch_repo / "data" / "hase-partial"
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "batch_0.jsonl").write_text(
+                json.dumps(
+                    {
+                        "conversations": [
+                            {"from": "human", "value": "Remember I use tabs."},
+                            {"from": "gpt", "value": "Saved."},
+                        ],
+                        "completed": True,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+
+        monkeypatch.setattr(be.subprocess, "run", fake_run)
+        harness = BatchRunnerHarness(hermes_repo=batch_repo)
+        scenario = BehavioralScenario(
+            prompt="Remember I use tabs.",
+            section_under_test="MEMORY_GUIDANCE",
+            expected_behavior="Saves it.",
+            category="memory_guidance",
+        )
+        transcripts = harness.run([scenario], "EVOLVED", "hase-partial")
+        assert len(transcripts) == 1
 
     def test_parse_results_reads_response_and_tools(self, batch_repo):
         out = batch_repo / "data" / "run1"
@@ -644,7 +701,10 @@ class TestSectionModule:
 
     def test_module_reflects_an_optimizer_rewrite(self):
         module = SectionBehaviorModule("Original text.", "MEMORY_GUIDANCE")
-        predictor = module.predictor.predict
+        # Through named_predictors(), the same path section_text reads the
+        # live signature back through, so the test exercises the real access
+        # route rather than the module's internal attribute layout.
+        _, predictor = next(iter(module.named_predictors()))
         predictor.signature = predictor.signature.with_instructions(
             build_section_instructions("MEMORY_GUIDANCE", "Evolved text.")
         )

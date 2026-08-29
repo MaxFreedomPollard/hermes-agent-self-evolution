@@ -620,7 +620,11 @@ class TestBuildCodePullRequest:
         rows = code_score_lines(baseline, outcome)
         benchmark_row = [r for r in rows if r.split == "swe-bench"][0]
         assert "\\|" in benchmark_row.detail
-        assert benchmark_row.row().count("|") == 6
+        # Six structural pipes (five cells, closed) plus the escaped one in
+        # the cell text. An unescaped pipe would raise the count and add a
+        # phantom column.
+        assert benchmark_row.row().count("|") == 7
+        assert benchmark_row.row().endswith(" |")
 
 
 # ──────────────────────────────────────────────────────────────────────────

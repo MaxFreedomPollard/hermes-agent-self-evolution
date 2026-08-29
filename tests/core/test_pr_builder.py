@@ -92,12 +92,24 @@ class TestBranch:
 
     def test_the_timestamp_is_supplied_not_read_from_the_clock(self, evolved):
         """Two runs with the same timestamp produce the same branch name."""
-        plan = build(evolved)
-        plan.restore()
-        assert "20260731_010203" in plan.branch
+        first = build(evolved)
+        first.discard()
+        # discard() checked the original ref back out, which reset tool.py;
+        # re-evolve it so the second run has the same change to commit.
+        (evolved / "tool.py").write_text("DESCRIPTION = 'after'\n")
+        second = build(evolved)
+        second.discard()
+        assert first.branch == second.branch == "evolve/read_file-20260731_010203"
 
 
 class TestBody:
+    def test_a_score_row_always_has_five_cells(self):
+        """The detail cell exists even when empty, matching the table header."""
+        with_detail = ScoreLine("val", 1.0, 1.0, detail="4 examples").row()
+        without_detail = ScoreLine("train", 0.5, 0.75).row()
+        assert with_detail == "| val | 1.000 | 1.000 | +0.000 | 4 examples |"
+        assert without_detail == "| train | 0.500 | 0.750 | +0.250 |  |"
+
     def test_carries_every_split_plan_asks_for(self, evolved):
         plan = build(
             evolved,

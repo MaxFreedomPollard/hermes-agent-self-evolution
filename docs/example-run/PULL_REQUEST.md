@@ -4,8 +4,8 @@ Evolved `all-tools` with Phase 2 (tool descriptions).
 
 | Split | Before | After | Change | Notes |
 |---|---:|---:|---:|---|
-| val | 1.000 | 1.000 | +0.000 | 4 examples, 16.7% chance across 6 options
-| holdout | 1.000 | 1.000 | +0.000 | 8 examples, never optimized against
+| val | 1.000 | 1.000 | +0.000 | 4 examples, 16.7% chance across 6 options |
+| holdout | 1.000 | 1.000 | +0.000 | 8 examples, never optimized against |
 
 ## Evidence
 

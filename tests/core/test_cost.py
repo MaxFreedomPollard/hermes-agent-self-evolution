@@ -119,7 +119,10 @@ class TestUsageTracker:
             del history[:]           # DSPy dropped the history mid-run
             history.append(entry())
         assert usage.report.truncated
-        assert usage.report.n_calls >= 0
+        # Exactly the one entry appended after the wipe: an eviction must not
+        # erase what did happen, and a lower bound is still not `complete`.
+        assert usage.report.n_calls == 1
+        assert not usage.report.complete
 
     def test_stop_can_be_called_directly(self, history):
         tracker = UsageTracker()

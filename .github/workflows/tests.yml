@@ -7,7 +7,10 @@ name: tests
 
 on:
   push:
-    branches: [main]
+    # evolve/** is what pr_builder creates: every branch this pipeline
+    # proposes gets a run before a human looks at the PR. feat/** and fix/**
+    # cover contributor branches, here and on forks.
+    branches: [main, "feat/**", "fix/**", "evolve/**"]
   pull_request:
   workflow_dispatch:
 
@@ -29,6 +32,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The pytest and CLI steps below execute repository code; none of it
+          # needs an authenticated git, so none of it gets one.
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:

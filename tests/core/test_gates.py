@@ -236,7 +236,7 @@ class TestEmptySelectionIsNotAFailure:
         assert not result.blocking
         assert "no tests matched" in result.message
 
-    def test_it_still_is_not_a_pass(self, passing_repo):
+    def test_permissive_tolerates_it_but_strict_blocks_it(self, passing_repo):
         result = run_pytest_gate(
             passing_repo, subset=["tests/", "-k", "nope"], python=sys.executable
         )

@@ -938,6 +938,13 @@ class TestNoChangeIsNotRenderedAsAFailure:
         self._no_change(store, hermes_repo, out)
         assert "exit 0" not in out.file.getvalue()
 
+    def test_the_cycle_status_is_no_change_not_no_targets(self, store, hermes_repo, out):
+        """A dispatched-and-declined cycle is not the same as an empty one."""
+        report = self._no_change(store, hermes_repo, out)
+        assert report.status is CycleStatus.NO_CHANGE
+        assert "Nothing to do" not in out.file.getvalue()
+        assert "found nothing deployable" in out.file.getvalue()
+
     def test_the_status_is_still_no_change(self, store, hermes_repo, out):
         report = self._no_change(store, hermes_repo, out)
         assert report.dispatches[0].status is DispatchStatus.NO_CHANGE

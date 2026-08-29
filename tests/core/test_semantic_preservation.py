@@ -39,7 +39,7 @@ class TestDriftIsCaught:
 
     def test_a_genuine_topic_change_is_rejected(self):
         validator = ConstraintValidator(EvolutionConfig())
-        results = validator.validate_all(SEND_EMAIL, "tool", baseline_text=READ_FILE)
+        results = validator.validate_all(SEND_EMAIL, "tool_description", baseline_text=READ_FILE)
         semantic = [r for r in results if r.constraint_name == "semantic_preservation"]
         assert semantic and not semantic[0].passed
         assert "Topic drift" in semantic[0].message
@@ -53,7 +53,7 @@ class TestDeletingIsNotDrifting:
 
     def test_the_validator_accepts_the_dedupe(self):
         validator = ConstraintValidator(EvolutionConfig())
-        results = validator.validate_all(DEDUPED, "tool", baseline_text=BLOATED)
+        results = validator.validate_all(DEDUPED, "tool_description", baseline_text=BLOATED)
         semantic = [r for r in results if r.constraint_name == "semantic_preservation"]
         assert semantic and semantic[0].passed
 
@@ -75,15 +75,30 @@ class TestConfiguration:
     def test_threshold_zero_disables_the_check(self):
         config = EvolutionConfig(min_semantic_similarity=0.0)
         validator = ConstraintValidator(config)
-        results = validator.validate_all(SEND_EMAIL, "tool", baseline_text=READ_FILE)
+        results = validator.validate_all(SEND_EMAIL, "tool_description", baseline_text=READ_FILE)
         semantic = [r for r in results if r.constraint_name == "semantic_preservation"]
         assert semantic and semantic[0].passed
         assert "disabled" in semantic[0].message
 
     def test_no_baseline_means_no_semantic_check(self):
         validator = ConstraintValidator(EvolutionConfig())
-        results = validator.validate_all(READ_FILE, "tool")
+        results = validator.validate_all(READ_FILE, "tool_description")
         assert not [r for r in results if r.constraint_name == "semantic_preservation"]
+
+    def test_an_unmeasurable_baseline_passes_but_says_so(self):
+        """A baseline of stopwords gives the measure nothing to compare.
+
+        The check must not block - it cannot measure - but reporting "Topic
+        preserved" over a comparison that never ran would tell a reviewer a
+        constraint held when it only abstained.
+        """
+        validator = ConstraintValidator(EvolutionConfig())
+        results = validator.validate_all(
+            READ_FILE, "tool_description", baseline_text="do it to a")
+        semantic = [r for r in results if r.constraint_name == "semantic_preservation"]
+        assert semantic and semantic[0].passed
+        assert "Not measurable" in semantic[0].message
+        assert "preserved" not in semantic[0].message
 
     @pytest.mark.parametrize("empty", ["", "   ", "a an the"])
     def test_empty_or_stopword_only_text_does_not_crash(self, empty):

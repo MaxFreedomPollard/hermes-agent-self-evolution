@@ -9,6 +9,7 @@ is ever pushed.
 """
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -278,7 +279,11 @@ def cli_run(repo, tmp_path, extra):
     """Invoke the CLI in a scratch cwd so ./output never lands in the project."""
     runner = CliRunner()
     dataset = str(build_dataset(tmp_path / "ds"))
-    with runner.isolated_filesystem():
+    scratch = tmp_path / "cli-cwd"
+    scratch.mkdir(exist_ok=True)
+    previous = os.getcwd()
+    os.chdir(scratch)
+    try:
         return runner.invoke(
             main,
             [
@@ -289,6 +294,8 @@ def cli_run(repo, tmp_path, extra):
             ],
             env={"COLUMNS": "200"},
         )
+    finally:
+        os.chdir(previous)
 
 
 # ──────────────────────────────────────────────────────────────────────────

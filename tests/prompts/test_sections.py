@@ -7,6 +7,8 @@ PLATFORM_HINTS, and neighbouring constants that a write must never disturb.
 """
 
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -524,7 +526,12 @@ class TestActiveSessionDetection:
         assert "live pid" in report.summary
 
     def test_dead_pid_file_is_ignored(self, tmp_path):
-        (tmp_path / "run.pid").write_text("999999", encoding="utf-8")
+        # A pid that is certainly dead: one from a child already waited on.
+        # A literal like 999999 is a live-able pid on Linux, where pid_max
+        # defaults to 4194304, so it can exist on a busy CI machine.
+        child = subprocess.Popen([sys.executable, "-c", ""])
+        child.wait()
+        (tmp_path / "run.pid").write_text(str(child.pid), encoding="utf-8")
         report = detect_active_session(hermes_home=tmp_path, env={})
         assert not report.active
 

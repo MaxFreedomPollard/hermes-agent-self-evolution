@@ -610,10 +610,14 @@ class TestEvolveToolCode:
             evolver=FakeEvolver(FIXED, other_fix),
             output_root=out_root,
         )
-        metrics = json.loads(next(out_root.rglob("metrics.json")).read_text())
+        metrics_path = next(out_root.rglob("metrics.json"))
+        metrics = json.loads(metrics_path.read_text())
         assert [c["fitness"]["accepted"] for c in metrics["candidates"]] == [True, True]
-        winner_source = (out_root / metrics["winner"]).with_suffix(".py")
-        assert not winner_source.exists() or winner_source.read_text()
+        # The winner's saved source sits beside metrics.json and must be the
+        # variant scored under that label, not the other one layered on top.
+        winner_source = metrics_path.parent / f"{metrics['winner']}.py"
+        sources = {"c01": FIXED, "c02": other_fix}
+        assert winner_source.read_text() == sources[metrics["winner"]]
 
     def test_the_branch_is_restored_even_when_a_candidate_explodes(
         self, repo, repro, tmp_path
