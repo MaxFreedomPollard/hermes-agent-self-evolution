@@ -122,6 +122,7 @@ from evolution.code.sandbox import (
     SandboxError,
     SandboxUnavailable,
     bounded_candidate_path,
+    command_read_roots,
     executable_read_roots,
     require_enforcer,
 )
@@ -410,7 +411,7 @@ class ExternalEvolver:
         # No sandbox was provided: build one for this call, fail closed when
         # the machine cannot enforce it, and leave nothing behind but the
         # workdir artifacts.
-        roots = executable_read_roots(self.cmd[0]) if self.cmd else []
+        roots = command_read_roots(self.cmd)
         ephemeral = CodeSandbox(
             self.repo,
             workdir=self.workdir,
@@ -1284,13 +1285,8 @@ def evolve_tool_code(
             # The clone is cut at the baseline commit and the target file is
             # overwritten with the working-tree source, so an allow_dirty run
             # evaluates what the operator actually has, not what HEAD says.
-            read_roots: list[Path] = []
-            for executable in (
-                evolver_argv[0] if evolver_argv else None,
-                python or "python",
-            ):
-                if executable:
-                    read_roots.extend(executable_read_roots(executable))
+            read_roots: list[Path] = list(command_read_roots(evolver_argv or []))
+            read_roots.extend(executable_read_roots(python or "python"))
             try:
                 run_sandbox = CodeSandbox(
                     Path(repo),

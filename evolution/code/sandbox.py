@@ -70,6 +70,7 @@ __all__ = [
     "SeatbeltEnforcer",
     "available_enforcer",
     "bounded_candidate_path",
+    "command_read_roots",
     "executable_read_roots",
     "require_enforcer",
     "sandbox_environment",
@@ -650,6 +651,30 @@ def executable_read_roots(executable: str) -> list[Path]:
     roots = [directory]
     if directory.name == "bin":
         roots.append(directory.parent)
+    return roots
+
+
+def command_read_roots(argv: Sequence[str]) -> list[Path]:
+    """The directories a sandboxed child must read to run *argv* - all of it.
+
+    The executable's roots, and the parent directory of every later argument
+    that names something on disk, because an evolver command is routinely an
+    interpreter plus a script (``python /path/to/evolver.py``) or carries a
+    config file by path, and a wrapper that makes the binary visible while
+    hiding the script it was told to run refuses work the operator asked
+    for. Arguments that name nothing on disk are flags and are skipped.
+    """
+    if not argv:
+        return []
+    roots = executable_read_roots(argv[0])
+    for token in argv[1:]:
+        candidate = Path(token).expanduser()
+        try:
+            exists = candidate.exists()
+        except OSError:
+            exists = False
+        if exists:
+            roots.append(Path(os.path.realpath(candidate)).parent)
     return roots
 
 

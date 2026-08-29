@@ -356,6 +356,18 @@ class TestCandidatePathsAreBounded:
         if directory.name == "bin":
             assert directory.parent in roots
 
+    def test_command_read_roots_cover_the_whole_command_line(self, tmp_path):
+        script = tmp_path / "scripts" / "evolver.py"
+        script.parent.mkdir()
+        script.write_text("print('hi')\n")
+        roots = sbx.command_read_roots(
+            [sys.executable, str(script), "--flag", "not-a-path"]
+        )
+        assert Path(os.path.realpath(sys.executable)).parent in roots
+        assert Path(os.path.realpath(script.parent)) in roots
+        # Flags that name nothing on disk contribute nothing.
+        assert all("not-a-path" not in str(r) for r in roots)
+
     def test_bubblewrap_binds_every_read_root_back(self, tmp_path):
         """The tmpfs over /tmp and home would otherwise hide an evolver or
         interpreter living there; the argv must mount each read root back,
@@ -659,6 +671,25 @@ class TestTheKernelHoldsTheBoundary:
         finally:
             for target in targets:
                 target.unlink(missing_ok=True)
+
+    def test_an_evolver_script_outside_the_workdir_still_runs(
+        self, repo, tmp_path
+    ):
+        """The operator's command must work from wherever it lives.
+
+        ``--evolver-cmd`` is routinely an interpreter plus a script, and the
+        script can sit anywhere - including under a directory the sandbox
+        mounts a tmpfs over. The command's own paths are bound back
+        read-only, so the run the operator asked for is not refused by the
+        boundary that exists to protect it.
+        """
+        elsewhere = tmp_path / "elsewhere"
+        cmd = make_stub(elsewhere, EMIT_CANDIDATE)
+        workdir = tmp_path / "work"
+        evolver = ExternalEvolver(cmd, repo=repo, workdir=workdir)
+        candidates = evolver.propose(make_job())
+        assert len(candidates) == 1
+        assert candidates[0].source.endswith("# mutated\n")
 
     def test_the_network_is_unreachable(self, repo, tmp_path):
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
