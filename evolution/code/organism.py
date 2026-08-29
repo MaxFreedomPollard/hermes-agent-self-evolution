@@ -251,12 +251,18 @@ class CodeOrganism:
         self._original_ref, self._original_was_detached = self._current_ref()
         self._branch = self._requested_branch or self._generate_branch_name()
 
-        self._git(["checkout", "-b", self._branch])
-
+        # Everything worth recording is read before the checkout: `checkout -b`
+        # changes neither HEAD's commit nor the worktree, so the values are
+        # identical, and reading them first leaves nothing between creating the
+        # branch and flipping _open. The moment the operator is on the new
+        # branch, close() owns the way back - a probe that raised in that gap
+        # used to strand them there with close() refusing to run.
         self._baseline_sha = self._git(["rev-parse", "HEAD"]).stdout.strip()
         self._baseline_source = self.current_source()
         self._dirty_snapshot = self._baseline_source if dirty else None
         self._mutations = []
+
+        self._git(["checkout", "-b", self._branch])
         self._open = True
         return self
 
@@ -454,17 +460,12 @@ class CodeOrganism:
 
     def _identity_args(self) -> list[str]:
         """Supply an author only when the repo has none configured."""
-        probe = subprocess.run(
-            [self.git_binary, "config", "--get", "user.email"],
-            capture_output=True,
-            text=True,
-            cwd=str(self.repo),
-            # Reading one config key cannot legitimately take long, but a git
-            # that blocks on an index lock or a credential helper would hang
-            # the whole run with no output. Every other git call here is
-            # bounded; this one was the exception.
-            timeout=30,
-        )
+        # Through the bounded wrapper like every other git call, so a git that
+        # blocks on an index lock or a credential helper becomes a GitError
+        # with a message instead of a raw subprocess exception the callers do
+        # not handle. No recursion: _git prepends identity args only for
+        # `commit`, and this probe runs `config`.
+        probe = self._git(["config", "--get", "user.email"], check=False)
         if probe.returncode == 0 and probe.stdout.strip():
             return []
         return [

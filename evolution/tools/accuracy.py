@@ -139,6 +139,20 @@ _CAPABILITY_CLAIMS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     ("concurrency", ("concurren", "parallel", "workers", "jobs"), "a concurrency level"),
 )
 
+# Compiled once: the claims and verbs are module constants, so building the
+# pattern per call in the check loop was pure rework.
+_CAPABILITY_PATTERNS: tuple[tuple[re.Pattern, tuple[str, ...], str], ...] = tuple(
+    (
+        re.compile(
+            rf"{_CAPABILITY_VERBS}\b[^.;\n]{{0,60}}?\b{re.escape(phrase)}\b",
+            re.IGNORECASE,
+        ),
+        keywords,
+        human,
+    )
+    for phrase, keywords, human in _CAPABILITY_CLAIMS
+)
+
 _NO_ARGUMENTS = re.compile(
     r"\b(?:takes|requires|needs|accepts)\s+no\s+(?:arguments|parameters|args|params)\b",
     re.IGNORECASE,
@@ -691,11 +705,7 @@ class FactualAccuracyChecker:
         """Promises the caller can supply something with nowhere to put it."""
         findings: list[AccuracyFinding] = []
         params = " ".join(facts.params).casefold()
-        for phrase, keywords, human in _CAPABILITY_CLAIMS:
-            pattern = re.compile(
-                rf"{_CAPABILITY_VERBS}\b[^.;\n]{{0,60}}?\b{re.escape(phrase)}\b",
-                re.IGNORECASE,
-            )
+        for pattern, keywords, human in _CAPABILITY_PATTERNS:
             match = pattern.search(text or "")
             if not match:
                 continue
@@ -779,6 +789,9 @@ class FactualAccuracyChecker:
         baseline = baseline or {}
         permitted = set(allowed) if allowed is not None else None
         self.entailment_ran = False
+        # Reset alongside entailment_ran: a reason left over from an earlier
+        # bundle would be reported as this bundle's skip, which it is not.
+        self.skipped_reason = ""
         report = AccuracyReport()
 
         for tool_name in sorted(candidate):

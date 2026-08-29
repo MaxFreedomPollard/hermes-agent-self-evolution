@@ -1036,6 +1036,11 @@ def staged_prompt_write(
     So the file is written, the gates run, and the original is restored in a
     ``finally``. A copy of the original is left at *backup_path* first, so a
     process killed mid-gate can still be recovered by hand.
+
+    The restore writes the captured original back verbatim. Anything that
+    edits ``prompt_builder.py`` while the block is open - a gate, a tool
+    under test, a parallel process - is overwritten when it closes. The block
+    owns the file for its whole duration; that is the contract, not a hazard.
     """
     if not enabled or not updates:
         yield None

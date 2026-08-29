@@ -206,6 +206,20 @@ class ConstraintValidator:
                 message="Semantic preservation disabled (threshold 0)",
             )
 
+        if not _content_terms(baseline):
+            # The vocabulary measure sees nothing here: the baseline reduces to
+            # stopwords, short tokens or non-Latin text. semantic_similarity
+            # would return 1.0 or 0.0 by definition rather than by comparison,
+            # and "Topic preserved" over a comparison that never ran is exactly
+            # the kind of claim this pipeline refuses elsewhere. Passing is
+            # still right - a check that cannot measure must not block - but
+            # the message says what actually happened.
+            return ConstraintResult(
+                passed=True,
+                constraint_name="semantic_preservation",
+                message="Not measurable: the baseline has no content terms to preserve",
+            )
+
         similarity = semantic_similarity(baseline, text)
         if similarity >= threshold:
             return ConstraintResult(

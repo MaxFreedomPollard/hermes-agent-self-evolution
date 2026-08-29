@@ -706,6 +706,11 @@ def _descriptors_for_source(source: str, module: str) -> dict[str, ToolDescripto
     in a throwaway directory is what lets a sequence of edits to one file stay
     span-exact without touching the real repo, and it is what makes ``dry_run``
     able to verify a full multi-edit rewrite it never commits.
+
+    The re-parse per edit is the contract, not overhead to hoist: every span
+    is only valid against the exact text it was parsed from. The directory
+    around it costs a millisecond or two against a parse several times that,
+    inside a run whose optimizer step is measured in minutes.
     """
     with tempfile.TemporaryDirectory(prefix="hase-stage-") as tmp:
         staged_tools = Path(tmp) / "tools"

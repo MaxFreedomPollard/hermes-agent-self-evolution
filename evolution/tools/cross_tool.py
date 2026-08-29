@@ -192,8 +192,11 @@ class ToolRate:
             "correct": self.correct,
             "rate": round(self.rate, 4),
             # Serialised so a reader can recompute every p-value in this report
-            # from the artifact alone, without rerunning the evaluation.
+            # from the artifact alone, without rerunning the evaluation. That
+            # takes both halves: the outcomes, and the keys align_outcomes
+            # pairs them by when two runs are not in the same order.
             "outcomes": [int(flag) for flag in self.outcomes],
+            "example_keys": list(self.example_keys),
         }
 
 
@@ -632,6 +635,9 @@ class ToolComparison(_PairedEvidence):
             "n_paired": self.paired.n if self.paired else 0,
             "regressed": self.regressed,
             "improved": self.improved,
+            # ToolRegression serialises this too; dropping it here lost the
+            # misroute detail for every tool that did not regress.
+            "stolen_by": dict(self.stolen_by),
         }
         blob.update(self._stats_dict())
         return blob

@@ -301,7 +301,12 @@ def discover_prompt_sections(
     if not path.is_file():
         return []
 
-    source = path.read_text(encoding="utf-8")
+    # Same contract as tool discovery: a file this function cannot read is a
+    # file with no discoverable sections, not a crash in the middle of a scan.
+    try:
+        source = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
     try:
         tree = ast.parse(source, filename=str(path))
     except SyntaxError:

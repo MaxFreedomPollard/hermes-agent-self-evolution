@@ -119,6 +119,7 @@ def status(hermes_repo: Optional[str]) -> None:
     from evolution.core.artifact_io import discover_prompt_sections, discover_tool_schemas
     from evolution.core.config import resolve_hermes_agent_path
     from evolution.core.gates import KNOWN_BENCHMARKS, find_benchmark
+    from evolution.tools.tool_catalog import DEFAULT_MAX_TOOL_DESC
 
     console.print("\n[bold cyan]Hermes Agent Self-Evolution[/bold cyan] - status\n")
 
@@ -160,11 +161,11 @@ def status(hermes_repo: Optional[str]) -> None:
     )
     console.print(table)
 
-    over = [t for t in tools if len(t.description) > 500]
+    over = [t for t in tools if len(t.description) > DEFAULT_MAX_TOOL_DESC]
     if over:
         console.print(
             f"\n  [yellow]⚠ {len(over)} tool description(s) already exceed the "
-            f"500-char budget before any evolution:[/yellow]"
+            f"{DEFAULT_MAX_TOOL_DESC}-char budget before any evolution:[/yellow]"
         )
         for t in sorted(over, key=lambda x: -len(x.description))[:5]:
             console.print(f"    {t.tool_name}: {len(t.description)} chars")

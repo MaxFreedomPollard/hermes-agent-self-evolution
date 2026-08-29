@@ -1267,6 +1267,15 @@ class HarnessTimeout(RuntimeError):
     """batch_runner did not finish in time, so nothing was measured."""
 
 
+class HarnessFailure(RuntimeError):
+    """batch_runner exited non-zero and produced nothing to score.
+
+    Distinct from :class:`HarnessTimeout` because the operator's next move is
+    different: a timeout wants a longer budget or fewer scenarios, a crash
+    wants the runner's own error read (a missing API key, a bad flag).
+    """
+
+
 @dataclass
 class BatchRunnerHarness:
     """Run scenarios through hermes-agent's batch_runner as a subprocess.
@@ -1407,7 +1416,7 @@ class BatchRunnerHarness:
             sample_count=len(scenarios),
         )
         try:
-            subprocess.run(
+            completed = subprocess.run(
                 cmd,
                 cwd=str(self.hermes_repo),
                 timeout=self.timeout,
@@ -1424,6 +1433,16 @@ class BatchRunnerHarness:
             ) from exc
 
         transcripts = self.parse_results(run_name)
+        if completed.returncode != 0 and not transcripts:
+            # Discarding the exit status here lost the cause: every scenario
+            # came back unmeasured and the failure only surfaced much later as
+            # an unpaired holdout. A crashed runner and a runner that answered
+            # none of the prompts are different problems, and only the exit
+            # code tells them apart.
+            raise HarnessFailure(
+                f"batch_runner exited {completed.returncode} and produced no "
+                f"transcripts for {run_name}; its own output has the cause"
+            )
         return _match_transcripts(scenarios, transcripts)
 
 

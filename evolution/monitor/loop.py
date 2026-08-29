@@ -176,6 +176,11 @@ class CycleStatus(str, Enum):
     PROPOSED = "proposed"
     SKIPPED = "skipped"
     FAILED = "failed"
+    # Targets were ranked, dispatched, and every phase ran cleanly without
+    # producing a branch. Distinct from NO_TARGETS, where nothing was ranked
+    # at all: "the phases rejected every candidate" and "there was nothing to
+    # try" call for different operator responses.
+    NO_CHANGE = "no_change"
     NO_TARGETS = "no_targets"
     DRY_RUN = "dry_run"
 
@@ -731,6 +736,8 @@ def run_cycle(
         report.status = CycleStatus.FAILED
     elif report.skipped:
         report.status = CycleStatus.SKIPPED
+    elif report.dispatches:
+        report.status = CycleStatus.NO_CHANGE
     else:
         report.status = CycleStatus.NO_TARGETS
 
@@ -918,6 +925,11 @@ def _print_footer(report: CycleReport, out: Console) -> None:
         out.print("  [yellow]Cycle skipped. No optimization was attempted.[/yellow]")
     elif report.status is CycleStatus.FAILED:
         out.print("  [red]✗ every dispatched optimization failed.[/red]")
+    elif report.status is CycleStatus.NO_CHANGE:
+        out.print(
+            "  [yellow]Every dispatched phase ran cleanly and found nothing "
+            "deployable. No proposal this cycle.[/yellow]"
+        )
     else:
         out.print("  Nothing to do this cycle.")
 

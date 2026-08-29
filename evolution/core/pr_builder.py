@@ -25,8 +25,10 @@ can assert on the name.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence
@@ -78,10 +80,11 @@ class ScoreLine:
 
     def row(self) -> str:
         """This split rendered as one Markdown table row."""
-        detail = f" | {self.detail}" if self.detail else " |"
+        # Always five cells, matching the five-column header: an empty detail
+        # is an empty cell, not a row that stops one pipe short of the table.
         return (
             f"| {self.split} | {self.baseline:.3f} | {self.evolved:.3f} "
-            f"| {self.delta:+.3f}{detail}"
+            f"| {self.delta:+.3f} | {self.detail} |"
         )
 
 
@@ -131,16 +134,31 @@ class PullRequestPlan:
                 "gh is not installed, so the PR cannot be opened from here. "
                 "The branch and PULL_REQUEST.md are ready to use by hand."
             )
-        return _run(
-            [
-                "gh", "pr", "create",
-                "--base", base,
-                "--head", self.branch,
-                "--title", self.title,
-                "--body", self.body,
-            ],
-            self.repo,
-        )
+        # The body embeds the run's diff, and a diff-sized string does not
+        # belong in argv: past the OS argument limit the failure is an opaque
+        # OSError, not a message. gh reads it from a file instead - the one
+        # write_body() already saved, or a temporary one cleaned up after.
+        body_path = self.body_path if self.body_path and self.body_path.is_file() else None
+        scratch: Optional[Path] = None
+        if body_path is None:
+            fd, raw = tempfile.mkstemp(prefix="hase-pr-body-", suffix=".md")
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(self.body)
+            scratch = body_path = Path(raw)
+        try:
+            return _run(
+                [
+                    "gh", "pr", "create",
+                    "--base", base,
+                    "--head", self.branch,
+                    "--title", self.title,
+                    "--body-file", str(body_path),
+                ],
+                self.repo,
+            )
+        finally:
+            if scratch is not None:
+                scratch.unlink(missing_ok=True)
 
     def restore(self) -> None:
         """Return the checkout to the ref it was on before the branch was made."""

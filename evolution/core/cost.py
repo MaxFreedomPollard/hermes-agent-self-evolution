@@ -23,6 +23,7 @@ than useless:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
 
@@ -34,6 +35,21 @@ __all__ = [
 ]
 
 
+_FALLBACKS_NOTED: set = set()
+
+
+def _note_fallback(message: str) -> None:
+    """Log a degraded-capability path once, not once per call.
+
+    The fallbacks below are silent by design - a run without cost accounting
+    still works - but silent and invisible are different things. One debug
+    line marks the moment a DSPy upgrade moved the log out from under us.
+    """
+    if message not in _FALLBACKS_NOTED:
+        _FALLBACKS_NOTED.add(message)
+        logging.getLogger(__name__).debug(message)
+
+
 def _history() -> list:
     """The live DSPy call log, or an empty list if DSPy moves it."""
     try:
@@ -41,6 +57,10 @@ def _history() -> list:
 
         return GLOBAL_HISTORY
     except Exception:  # pragma: no cover - depends on the installed dspy
+        _note_fallback(
+            "dspy no longer exposes clients.base_lm.GLOBAL_HISTORY; "
+            "cost reporting will show no calls"
+        )
         return []
 
 
@@ -52,6 +72,10 @@ def _max_history_size() -> int:
         size = getattr(base_lm, "MAX_HISTORY_SIZE", 0)
         return int(size) if isinstance(size, int) else 0
     except Exception:  # pragma: no cover
+        _note_fallback(
+            "dspy no longer exposes clients.base_lm.MAX_HISTORY_SIZE; "
+            "truncation detection is off"
+        )
         return 0
 
 

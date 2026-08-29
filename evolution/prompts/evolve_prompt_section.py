@@ -1425,11 +1425,15 @@ def evolve(
     if len(deployable) > 1:
         raw = [o.holdout.overall.wilcoxon_p for o in deployable]
         adjusted = holm_adjust(raw)
-        survivors = []
+        # Not named `survivors`: that list still means "passed the constraints
+        # and the gate ladder", and the write-back report walks it to announce
+        # which of those never became deployable. Rebinding it here would
+        # silence that announcement whenever more than one section got this far.
+        corrected: list = []
         for outcome, raw_p, adj_p in zip(list(deployable), raw, adjusted):
             outcome.adjusted_p = adj_p
             if adj_p < HOLDOUT_ALPHA:
-                survivors.append(outcome)
+                corrected.append(outcome)
                 continue
             outcome.accepted = False
             outcome.reason = (
@@ -1440,12 +1444,12 @@ def evolve(
                 f"  [yellow]○ {outcome.name}: dropped by the "
                 f"multiple-comparison correction ({outcome.reason})[/yellow]"
             )
-        if len(survivors) != len(deployable):
+        if len(corrected) != len(deployable):
             console.print(
                 f"  [dim]Holm correction over {len(raw)} sections: "
-                f"{len(survivors)} of {len(raw)} survive at alpha={HOLDOUT_ALPHA}[/dim]"
+                f"{len(corrected)} of {len(raw)} survive at alpha={HOLDOUT_ALPHA}[/dim]"
             )
-        deployable = survivors
+        deployable = corrected
 
     # Everything that could call a model has run.
     cost_meter.close()
