@@ -73,6 +73,9 @@ __all__ = [
     "DEFAULT_BENCHMARKS",
     "DEFAULT_SCHEDULE",
     "API_KEY_ENV_VARS",
+    "PHASE_ENV_PASSTHROUGH",
+    "PHASE_ENV_PREFIXES",
+    "phase_environment",
     "PhaseEntry",
     "PHASE_DISPATCH",
     "LoopConfig",
@@ -109,6 +112,69 @@ API_KEY_ENV_VARS: tuple[str, ...] = (
     "ANTHROPIC_API_KEY",
     "OPENROUTER_API_KEY",
 )
+
+# What a dispatched phase inherits from this process's environment - and the
+# complete list of it. The monitor used to hand its children a full copy of
+# os.environ, which forwarded every token and secret in the operator's shell
+# to a subprocess that ultimately drives contributor-influenced code; a
+# scheduled loop is exactly the process most likely to be running in a shell
+# full of credentials it never needed. Phases get what a phase needs: the
+# interpreter and its search paths, locale and TLS basics, the model keys and
+# endpoints DSPy reads, the evolver override, and the repo pointer. A phase
+# that needs one more variable gets it added here by name, with the reason.
+PHASE_ENV_PASSTHROUGH: tuple[str, ...] = (
+    "PATH",
+    "HOME",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "LANG",
+    "TZ",
+    "TERM",
+    "VIRTUAL_ENV",
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "PYTHONUNBUFFERED",
+    "PYTHONDONTWRITEBYTECODE",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "OPENAI_BASE_URL",
+    "OPENAI_API_BASE",
+    "ANTHROPIC_BASE_URL",
+    "OPENROUTER_BASE_URL",
+    "DARWINIAN_EVOLVER_CMD",
+    "HERMES_AGENT_REPO",
+    *API_KEY_ENV_VARS,
+)
+
+# Locale variables come as a family (LC_ALL, LC_CTYPE, LC_MESSAGES, ...);
+# matching the prefix keeps the list above finite without dropping any.
+PHASE_ENV_PREFIXES: tuple[str, ...] = ("LC_",)
+
+
+def phase_environment(source: Optional[dict] = None) -> dict:
+    """The allowlisted child environment for a dispatched phase.
+
+    Built by naming what crosses, never by copying what happens to be there.
+    """
+    parent = os.environ if source is None else source
+    env = {
+        name: value
+        for name, value in parent.items()
+        if name in PHASE_ENV_PASSTHROUGH
+        or any(name.startswith(prefix) for prefix in PHASE_ENV_PREFIXES)
+    }
+    return env
 
 
 @dataclass(frozen=True)
@@ -646,7 +712,9 @@ def run_cycle(
     out = out or console
     started = time.time()
     cycle_now = store.now() if now is None else now
-    environment = dict(os.environ if env is None else env)
+    # Allowlisted, not copied: a dispatched phase gets the variables a phase
+    # needs and nothing else from this process's shell. See PHASE_ENV_PASSTHROUGH.
+    environment = phase_environment(env)
 
     report = CycleReport(
         started_at=cycle_now,

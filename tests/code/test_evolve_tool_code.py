@@ -22,6 +22,7 @@ from click.testing import CliRunner
 from evolution.code import evolve_tool_code as mod
 from evolution.code.evolve_tool_code import (
     MUTATION_CONSTRAINTS,
+    UNSANDBOXED,
     Candidate,
     EvolverError,
     EvolverJob,
@@ -315,7 +316,7 @@ class TestExternalEvolver:
             '(out / "candidates" / "001.py").write_text(job["source"] + "# one\\n")\n'
             '(out / "candidates" / "002.py").write_text(job["source"] + "# two\\n")\n',
         )
-        evolver = ExternalEvolver(cmd, repo=tmp_path, workdir=tmp_path / "work")
+        evolver = ExternalEvolver(cmd, repo=tmp_path, workdir=tmp_path / "work", sandbox=UNSANDBOXED)
         candidates = evolver.propose(make_job())
 
         assert [c.label for c in candidates] == ["c01", "c02"]
@@ -329,7 +330,7 @@ class TestExternalEvolver:
             '    json.dumps({"source": job["source"] + "# jsonl\\n", "notes": "why"}) + "\\n"\n'
             ")\n",
         )
-        evolver = ExternalEvolver(cmd, repo=tmp_path, workdir=tmp_path / "work")
+        evolver = ExternalEvolver(cmd, repo=tmp_path, workdir=tmp_path / "work", sandbox=UNSANDBOXED)
         candidates = evolver.propose(make_job())
 
         assert len(candidates) == 1
@@ -340,7 +341,7 @@ class TestExternalEvolver:
             tmp_path,
             'print(json.dumps({"source": job["source"] + "# stdout\\n"}))\n',
         )
-        evolver = ExternalEvolver(cmd, repo=tmp_path, workdir=tmp_path / "work")
+        evolver = ExternalEvolver(cmd, repo=tmp_path, workdir=tmp_path / "work", sandbox=UNSANDBOXED)
         candidates = evolver.propose(make_job())
 
         assert len(candidates) == 1
@@ -352,7 +353,7 @@ class TestExternalEvolver:
             tmp_path,
             'print(json.dumps({"path": str(pathlib.Path(args.output).parent.parent / "elsewhere.py")}))\n',
         )
-        evolver = ExternalEvolver(cmd, repo=tmp_path, workdir=tmp_path / "work")
+        evolver = ExternalEvolver(cmd, repo=tmp_path, workdir=tmp_path / "work", sandbox=UNSANDBOXED)
         assert evolver.propose(make_job())[0].source == "# from a path\n"
 
     def test_the_job_file_carries_the_contract(self, tmp_path):
@@ -360,7 +361,7 @@ class TestExternalEvolver:
             tmp_path,
             'print(json.dumps({"source": job["objective"] + "\\n" + str(job["iterations"])}))\n',
         )
-        evolver = ExternalEvolver(cmd, repo=tmp_path, workdir=tmp_path / "work")
+        evolver = ExternalEvolver(cmd, repo=tmp_path, workdir=tmp_path / "work", sandbox=UNSANDBOXED)
         candidate = evolver.propose(make_job())[0]
 
         assert "fix the off-by-one" in candidate.source
@@ -371,7 +372,7 @@ class TestExternalEvolver:
 
     def test_no_candidates_is_an_error(self, tmp_path):
         cmd = make_stub(tmp_path, 'sys.stderr.write("nothing to do\\n")\nsys.exit(1)\n')
-        evolver = ExternalEvolver(cmd, repo=tmp_path, workdir=tmp_path / "work")
+        evolver = ExternalEvolver(cmd, repo=tmp_path, workdir=tmp_path / "work", sandbox=UNSANDBOXED)
         with pytest.raises(EvolverError, match="produced no candidates"):
             evolver.propose(make_job())
 
@@ -380,22 +381,20 @@ class TestExternalEvolver:
             tmp_path,
             'print(json.dumps({"source": "# partial\\n"}))\nsys.exit(1)\n',
         )
-        evolver = ExternalEvolver(cmd, repo=tmp_path, workdir=tmp_path / "work")
+        evolver = ExternalEvolver(cmd, repo=tmp_path, workdir=tmp_path / "work", sandbox=UNSANDBOXED)
         assert len(evolver.propose(make_job())) == 1
         assert evolver.last_returncode == 1
 
     def test_a_missing_binary_reports_as_not_installed(self, tmp_path):
         evolver = ExternalEvolver(
-            ["/nonexistent/darwinian-evolver"], repo=tmp_path, workdir=tmp_path / "work"
-        )
+            ["/nonexistent/darwinian-evolver"], repo=tmp_path, workdir=tmp_path / "work", sandbox=UNSANDBOXED)
         with pytest.raises(EvolverNotInstalled, match="could not run"):
             evolver.propose(make_job())
 
     def test_a_hung_evolver_times_out(self, tmp_path):
         cmd = make_stub(tmp_path, "import time\ntime.sleep(30)\n")
         evolver = ExternalEvolver(
-            cmd, repo=tmp_path, workdir=tmp_path / "work", timeout=1
-        )
+            cmd, repo=tmp_path, workdir=tmp_path / "work", timeout=1, sandbox=UNSANDBOXED)
         with pytest.raises(EvolverError, match="timed out"):
             evolver.propose(make_job())
 
@@ -410,7 +409,7 @@ class TestExternalEvolver:
             '(out / "candidates" / "001.py").write_text(job["source"])\n',
         )
         monkeypatch.chdir(tmp_path)
-        evolver = ExternalEvolver(cmd, repo=checkout, workdir=Path("output/run-1"))
+        evolver = ExternalEvolver(cmd, repo=checkout, workdir=Path("output/run-1"), sandbox=UNSANDBOXED)
         assert len(evolver.propose(make_job())) == 1
 
     def test_unparseable_stdout_lines_are_ignored(self, tmp_path):
@@ -419,7 +418,7 @@ class TestExternalEvolver:
             'print("progress: 40%")\nprint("{not json}")\n'
             'print(json.dumps({"source": "# ok\\n"}))\n',
         )
-        evolver = ExternalEvolver(cmd, repo=tmp_path, workdir=tmp_path / "work")
+        evolver = ExternalEvolver(cmd, repo=tmp_path, workdir=tmp_path / "work", sandbox=UNSANDBOXED)
         assert len(evolver.propose(make_job())) == 1
 
 
@@ -511,7 +510,7 @@ class TestEvolveToolCode:
             hermes_repo=str(repo),
             python=sys.executable,
             evolver=evolver,
-            output_root=out_root,
+            output_root=out_root, sandbox=UNSANDBOXED,
         )
 
         assert code == 0
@@ -543,7 +542,7 @@ class TestEvolveToolCode:
             python=sys.executable,
             iterations=4,
             evolver=evolver,
-            output_root=tmp_path / "out",
+            output_root=tmp_path / "out", sandbox=UNSANDBOXED,
         )
         job = evolver.jobs[0]
         assert job.source == BASELINE
@@ -563,7 +562,7 @@ class TestEvolveToolCode:
             hermes_repo=str(repo),
             python=sys.executable,
             evolver=FakeEvolver(UNSAFE, UNGUARDED),
-            output_root=out_root,
+            output_root=out_root, sandbox=UNSANDBOXED,
         )
 
         assert code == 0
@@ -589,7 +588,7 @@ class TestEvolveToolCode:
             hermes_repo=str(repo),
             python=sys.executable,
             evolver=FakeEvolver(cosmetic),
-            output_root=out_root,
+            output_root=out_root, sandbox=UNSANDBOXED,
         )
         metrics = json.loads(next(out_root.rglob("metrics.json")).read_text())
         assert metrics["winner"] is None
@@ -608,7 +607,7 @@ class TestEvolveToolCode:
             hermes_repo=str(repo),
             python=sys.executable,
             evolver=FakeEvolver(FIXED, other_fix),
-            output_root=out_root,
+            output_root=out_root, sandbox=UNSANDBOXED,
         )
         metrics_path = next(out_root.rglob("metrics.json"))
         metrics = json.loads(metrics_path.read_text())
@@ -635,8 +634,8 @@ class TestEvolveToolCode:
                 hermes_repo=str(repo),
                 python=sys.executable,
                 evolver=ExplodingEvolver(),
-                output_root=tmp_path / "out",
-            )
+                output_root=tmp_path / "out", sandbox=UNSANDBOXED,
+        )
         assert current_branch(repo) == original
 
     def test_a_missing_evolver_exits_non_zero_without_touching_the_repo(
@@ -650,7 +649,7 @@ class TestEvolveToolCode:
             repro_script=str(repro),
             hermes_repo=str(repo),
             python=sys.executable,
-            output_root=tmp_path / "out",
+            output_root=tmp_path / "out", sandbox=UNSANDBOXED,
         )
 
         assert code == 2
@@ -664,7 +663,7 @@ class TestEvolveToolCode:
             hermes_repo=str(repo),
             python=sys.executable,
             evolver=BrokenEvolver(),
-            output_root=tmp_path / "out",
+            output_root=tmp_path / "out", sandbox=UNSANDBOXED,
         )
         assert code == 3
 
@@ -675,7 +674,7 @@ class TestEvolveToolCode:
             hermes_repo=str(repo),
             python=sys.executable,
             evolver=MissingEvolver(),
-            output_root=tmp_path / "out",
+            output_root=tmp_path / "out", sandbox=UNSANDBOXED,
         )
         assert code == 2
 
@@ -690,7 +689,7 @@ class TestEvolveToolCode:
             hermes_repo=str(repo),
             evolver_cmd=str(stub),
             dry_run=True,
-            output_root=tmp_path / "out",
+            output_root=tmp_path / "out", sandbox=UNSANDBOXED,
         )
 
         assert code == 0
@@ -703,8 +702,8 @@ class TestEvolveToolCode:
                 tool="ghost_tools",
                 hermes_repo=str(repo),
                 evolver=FakeEvolver(FIXED),
-                output_root=tmp_path / "out",
-            )
+                output_root=tmp_path / "out", sandbox=UNSANDBOXED,
+        )
             == 1
         )
 
@@ -715,8 +714,8 @@ class TestEvolveToolCode:
                 repro_script=str(tmp_path / "ghost.py"),
                 hermes_repo=str(repo),
                 evolver=FakeEvolver(FIXED),
-                output_root=tmp_path / "out",
-            )
+                output_root=tmp_path / "out", sandbox=UNSANDBOXED,
+        )
             == 1
         )
 
@@ -729,8 +728,8 @@ class TestEvolveToolCode:
                 tool="file_tools",
                 hermes_repo=str(plain),
                 evolver=FakeEvolver(FIXED),
-                output_root=tmp_path / "out",
-            )
+                output_root=tmp_path / "out", sandbox=UNSANDBOXED,
+        )
             == 1
         )
 
@@ -748,7 +747,7 @@ class TestEvolveToolCode:
             hermes_repo=str(repo),
             python=sys.executable,
             evolver=FakeEvolver(FIXED),
-            output_root=tmp_path / "out",
+            output_root=tmp_path / "out", sandbox=UNSANDBOXED,
         )
 
         assert code == 1
@@ -768,7 +767,7 @@ class TestEvolveToolCode:
             python=sys.executable,
             strict_gates=True,
             evolver=FakeEvolver(FIXED),
-            output_root=tmp_path / "out",
+            output_root=tmp_path / "out", sandbox=UNSANDBOXED,
         )
         assert code == 1
 
@@ -781,7 +780,7 @@ class TestEvolveToolCode:
             hermes_repo=str(repo),
             python=sys.executable,
             evolver=FakeEvolver(FIXED),
-            output_root=out_root,
+            output_root=out_root, sandbox=UNSANDBOXED,
         )
         assert code == 0
         metrics = json.loads(next(out_root.rglob("metrics.json")).read_text())
@@ -804,7 +803,7 @@ class TestMeasuredEvidence:
             python=sys.executable,
             evolver=FakeEvolver(*sources),
             output_root=out_root,
-            **kwargs,
+            **kwargs, sandbox=UNSANDBOXED,
         )
         metrics = json.loads(next(out_root.rglob("metrics.json")).read_text())
         return code, metrics

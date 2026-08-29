@@ -47,6 +47,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
+      - name: Install the sandbox backend
+        # bubblewrap is what enforces the code-evolution sandbox on Linux, and
+        # installing it here is what makes the adversarial tests in
+        # tests/code/test_sandbox.py run enforced instead of skipping. The
+        # sysctl lifts Ubuntu 24.04's unprivileged-user-namespace restriction
+        # where it applies; where it does not, the probe in sandbox.py decides
+        # honestly and the fail-closed tests bind instead.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          python -c "from evolution.code.sandbox import available_enforcer; e = available_enforcer(); print('sandbox backend:', e.name if e else 'NONE - adversarial tests will skip')"
+
       - name: Run tests
         run: python -m pytest tests/ -q
 
@@ -58,3 +71,29 @@ jobs:
           python -m evolution.prompts.evolve_prompt_section --help
           python -m evolution.code.evolve_tool_code --help
           python -m evolution.monitor.loop --help
+
+  # One macOS run so the Seatbelt enforcer - the other half of the
+  # code-evolution sandbox - is exercised in CI, not only on developer
+  # machines. sandbox-exec ships with the OS, so no install step.
+  pytest-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Confirm the sandbox backend
+        run: python -c "from evolution.code.sandbox import available_enforcer; e = available_enforcer(); print('sandbox backend:', e.name if e else 'NONE - adversarial tests will skip')"
+
+      - name: Run tests
+        run: python -m pytest tests/ -q

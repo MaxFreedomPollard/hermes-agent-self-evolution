@@ -29,7 +29,7 @@ import subprocess
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 __all__ = [
     "GateStatus",
@@ -313,6 +313,7 @@ def run_benchmark_gate(
     fast: bool = True,
     timeout: int = 7200,
     runner: Optional[Sequence[str]] = None,
+    exec_fn: Callable[..., subprocess.CompletedProcess] = subprocess.run,
 ) -> GateResult:
     """Run a benchmark and compare it against *baseline*.
 
@@ -320,6 +321,11 @@ def run_benchmark_gate(
     the current state of every benchmark PLAN.md names. A drop of more than
     *regression_threshold* below the baseline fails the gate; PLAN.md sets
     that tolerance at 2% for TBLite.
+
+    *exec_fn* is how the benchmark process is executed, defaulting to
+    ``subprocess.run``. The code phase passes its sandbox runner here,
+    because a benchmark run with a candidate applied executes that
+    candidate's code.
     """
     import time
 
@@ -345,7 +351,7 @@ def run_benchmark_gate(
 
     started = time.time()
     try:
-        proc = subprocess.run(
+        proc = exec_fn(
             cmd, capture_output=True, text=True, timeout=timeout, cwd=str(repo)
         )
     except subprocess.TimeoutExpired:

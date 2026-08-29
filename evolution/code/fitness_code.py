@@ -330,12 +330,18 @@ class BugReproduction:
 
     ``test_*.py`` files run under pytest; any other ``.py`` file runs as a
     plain script; anything else must be executable and is run directly.
+
+    ``exec_fn`` is how the run is actually executed, defaulting to
+    ``subprocess.run``. The code phase passes the sandbox's runner here,
+    because a reproduction executes the candidate's code and belongs behind
+    the same boundary as the evolver that produced it.
     """
 
     script: Path
     issue: Optional[str] = None
     timeout: int = 300
     python: Optional[str] = None
+    exec_fn: Callable[..., subprocess.CompletedProcess] = subprocess.run
 
     def __post_init__(self) -> None:
         self.script = Path(self.script).expanduser()
@@ -379,7 +385,7 @@ class BugReproduction:
 
         started = time.time()
         try:
-            proc = subprocess.run(
+            proc = self.exec_fn(
                 cmd,
                 capture_output=True,
                 text=True,
@@ -577,9 +583,14 @@ class PerTestPytestRunner:
     unchanged: the exit status decides, exactly as before. An extra reporting
     flag cannot turn a red run green, and nothing here can accept a candidate
     the plain gate would have rejected.
+
+    ``exec_fn`` defaults to ``subprocess.run``; the code phase passes the
+    sandbox's runner, since a suite run with a candidate applied executes
+    that candidate's code.
     """
 
     extra_args: tuple[str, ...] = ("-rA",)
+    exec_fn: Callable[..., subprocess.CompletedProcess] = subprocess.run
 
     def __call__(
         self,
@@ -609,7 +620,7 @@ class PerTestPytestRunner:
         ]
         started = time.time()
         try:
-            proc = subprocess.run(
+            proc = self.exec_fn(
                 cmd, capture_output=True, text=True, timeout=timeout, cwd=str(repo)
             )
         except subprocess.TimeoutExpired:

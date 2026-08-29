@@ -386,6 +386,36 @@ class TestCycle:
 
         assert dispatcher.calls[0]["env"]["HERMES_AGENT_REPO"] == str(hermes_repo)
 
+    def test_the_child_environment_is_an_allowlist_not_a_copy(
+        self, store, hermes_repo, out
+    ):
+        """A phase gets what a phase needs; the shell's secrets stay home.
+
+        The monitor once handed dispatched phases a full copy of its own
+        environment, which forwarded every token in the operator's shell to
+        a subprocess that ultimately drives contributor-influenced code.
+        """
+        store.extend([point(SKILL_SUCCESS_RATE, "arxiv", 0.35, samples=40)])
+        dispatcher = FakeDispatcher()
+        parent = {
+            **KEYED_ENV,
+            "PATH": "/usr/bin",
+            "LC_CTYPE": "UTF-8",
+            "AWS_SECRET_ACCESS_KEY": "not-for-phases",
+            "GITHUB_TOKEN": "ghp_nope",
+            "SSH_AUTH_SOCK": "/tmp/agent.sock",
+        }
+
+        cycle(store, hermes_repo, dispatcher=dispatcher, env=parent, out=out)
+
+        child = dispatcher.calls[0]["env"]
+        assert child["OPENAI_API_KEY"] == KEYED_ENV["OPENAI_API_KEY"]
+        assert child["PATH"] == "/usr/bin"
+        assert child["LC_CTYPE"] == "UTF-8"
+        assert child["HERMES_AGENT_REPO"] == str(hermes_repo)
+        for secret in ("AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "SSH_AUTH_SOCK"):
+            assert secret not in child
+
     def test_a_proposal_is_written_back_into_history(self, store, hermes_repo, out):
         store.extend([point(SKILL_SUCCESS_RATE, "arxiv", 0.35, samples=40)])
 

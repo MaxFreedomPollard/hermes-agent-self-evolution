@@ -25,6 +25,7 @@ from evolution.code.evolve_tool_code import (
     EVOLVER_COST_NOTE,
     PHASE_LABEL,
     REVIEW_NOTE,
+    UNSANDBOXED,
     Candidate,
     CandidateOutcome,
     build_code_pull_request,
@@ -170,8 +171,8 @@ def run_phase_four(repo, out_root, repro=None, sources=(FIXED,), **kwargs):
         evolver=FakeEvolver(*sources),
         output_root=out_root,
         repro_script=str(repro) if repro else None,
-        **kwargs,
-    )
+        **kwargs, sandbox=UNSANDBOXED,
+        )
     metrics_paths = list(Path(out_root).rglob("metrics.json"))
     metrics = json.loads(metrics_paths[0].read_text()) if metrics_paths else None
     bodies = list(Path(out_root).rglob("PULL_REQUEST.md"))
@@ -480,7 +481,7 @@ class TestNothingToDeploy:
             hermes_repo=str(repo),
             evolver_cmd=str(stub),
             dry_run=True,
-            output_root=out_root,
+            output_root=out_root, sandbox=UNSANDBOXED,
         )
         assert code == 0
         assert not out_root.exists()

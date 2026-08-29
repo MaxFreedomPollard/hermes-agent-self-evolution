@@ -78,6 +78,23 @@ the lineage is inspectable, and restores the branch you were on when it exits, i
 after an error. It refuses to start on a dirty worktree unless you pass `--allow-dirty`,
 and it never merges: the output is a branch, a diff, and a PR body for you to review.
 
+Phase 4 is also the only phase that executes code it did not ship with: the external
+evolver binary, and every candidate that binary produces (the test suite, the
+reproduction script and any benchmark all run with the candidate applied). None of that
+executes in your checkout or with your environment. It runs in a disposable clone of the
+repo with no remotes and no credential helper, under an environment built from an
+explicit allowlist (`HOME` and `TMPDIR` point into the sandbox; pass anything extra by
+name with `--sandbox-env NAME`), behind an OS-level sandbox - bubblewrap on Linux,
+sandbox-exec on macOS - that denies the network, hides your home directory, and makes
+everything outside the workspace read-only. Network stays off unless you pass
+`--sandbox-allow-network`, because an evolver that can read its workspace and reach the
+network can exfiltrate what it was shown. Candidate `path` values are honoured only
+inside the run's own directories, in every mode. On a machine with no sandbox backend
+the run refuses to start (exit code 5) rather than degrading silently;
+`--unsandboxed` is the explicit waiver and is the only way to get the old behaviour.
+The monitor's dispatched phases get an allowlisted environment for the same reason -
+what a phase needs, never a copy of your shell.
+
 No phase pushes a branch or opens a pull request unless you ask for it with `--push` or
 `--open-pr`.
 
