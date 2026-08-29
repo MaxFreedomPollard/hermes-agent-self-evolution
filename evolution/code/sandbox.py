@@ -291,11 +291,12 @@ class BubblewrapEnforcer:
     """Linux ``bwrap``: read-only root, hidden home, unshared namespaces.
 
     The whole filesystem is bind-mounted read-only, the invoking user's home
-    directory is replaced with an empty tmpfs (then the interpreter trees
-    that live under it, if any, are bound back read-only), ``/tmp`` and
-    ``/run`` are fresh tmpfs, and only the writable roots are bound
-    read-write. The child gets its own PID, IPC and UTS namespaces always,
-    and its own empty network namespace unless network was granted.
+    directory is replaced with an empty tmpfs, ``/tmp`` and ``/run`` are
+    fresh tmpfs, the read roots (interpreter trees, the evolver command's
+    directory) are bound back read-only wherever they live, and only the
+    writable roots are bound read-write. The child gets its own PID, IPC and
+    UTS namespaces always, and its own empty network namespace unless
+    network was granted.
     """
 
     name = "bubblewrap"
@@ -336,15 +337,15 @@ class BubblewrapEnforcer:
             cmd.append("--unshare-net")
         cmd += ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
                 "--tmpfs", "/tmp", "--tmpfs", "/run", "--tmpfs", str(home)]
-        # Bind order matters: the home tmpfs goes first, then anything under
-        # it that must stay reachable is mounted back over the tmpfs, and the
-        # writable roots go last so they win over every read-only layer.
+        # Bind order matters: the tmpfs mounts go first, then every read root
+        # is mounted back over them read-only, and the writable roots go last
+        # so they win over every read-only layer. All read roots are bound,
+        # not only the ones under home: the interpreter or the evolver command
+        # can just as easily live under /tmp or /run, where the tmpfs would
+        # otherwise hide it - re-binding a path that was already visible is
+        # harmless.
         for root in sorted(
-            {
-                str(Path(os.path.realpath(r)))
-                for r in read_roots
-                if str(Path(os.path.realpath(r))).startswith(f"{home}{os.sep}")
-            }
+            {str(Path(os.path.realpath(r))) for r in read_roots}
         ):
             cmd += ["--ro-bind", root, root]
         for path in writable:

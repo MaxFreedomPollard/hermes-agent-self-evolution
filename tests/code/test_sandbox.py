@@ -356,6 +356,35 @@ class TestCandidatePathsAreBounded:
         if directory.name == "bin":
             assert directory.parent in roots
 
+    def test_bubblewrap_binds_every_read_root_back(self, tmp_path):
+        """The tmpfs over /tmp and home would otherwise hide an evolver or
+        interpreter living there; the argv must mount each read root back,
+        wherever it lives, before the writable binds."""
+        under_tmp = tmp_path / "evolver-lives-here"
+        under_tmp.mkdir()
+        under_home = Path.home() / ".hse-imaginary-venv"
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        argv = sbx.BubblewrapEnforcer().command(
+            ["evolver", "--job", "j"],
+            workspace=workspace,
+            writable=[workspace],
+            read_roots=[under_tmp, under_home],
+            allow_network=False,
+        )
+        joined = " ".join(argv)
+        for root in (under_tmp, under_home):
+            real = str(Path(os.path.realpath(root)))
+            assert f"--ro-bind {real} {real}" in joined
+            # After the tmpfs mounts, so the bind wins over the shadowing.
+            assert joined.index("--tmpfs") < joined.index(f"--ro-bind {real}")
+        # Writable binds come after every read-only layer.
+        real_ws = str(Path(os.path.realpath(workspace)))
+        assert joined.rindex(f"--bind {real_ws} {real_ws}") > joined.index(
+            "--ro-bind /"
+        )
+        assert "--unshare-net" in argv
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Fail closed
