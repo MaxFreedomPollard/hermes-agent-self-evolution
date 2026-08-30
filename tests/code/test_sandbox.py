@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -397,6 +398,60 @@ class TestCandidatePathsAreBounded:
         )
         assert "--unshare-net" in argv
 
+    def test_read_roots_cover_a_symlinked_interpreter_store(self, tmp_path):
+        """uv's layout: the venv python points through a version-alias
+        directory symlink (``store/cpython-3.12 -> cpython-3.12.14``), and
+        the alias's parent must land in the roots - which realpath-based
+        derivation cannot report, because realpath resolves the alias away
+        without recording that its name has to be resolvable too."""
+        tmp_path = Path(os.path.realpath(tmp_path))
+        store = tmp_path / "store"
+        install = store / "cpython-3.12.14"
+        (install / "bin").mkdir(parents=True)
+        binary = install / "bin" / "python3.12"
+        binary.write_text("#!/bin/sh\n")
+        binary.chmod(0o755)
+        (store / "cpython-3.12").symlink_to("cpython-3.12.14")
+        venv_bin = tmp_path / "venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        link = venv_bin / "python"
+        link.symlink_to(store / "cpython-3.12" / "bin" / "python3.12")
+        roots = sbx.executable_read_roots(str(link))
+        assert venv_bin in roots  # the venv link's own parent
+        assert store in roots  # the alias link's parent
+        assert install / "bin" in roots  # the resolved binary's directory
+        assert install in roots  # the prefix above bin/
+
+    def test_bubblewrap_never_rebinds_the_hidden_mounts_themselves(
+        self, tmp_path
+    ):
+        """A symlink chain can name home itself or / as a needed parent (a
+        link sitting directly in the home root); binding those back would
+        unseal the sandbox, so the enforcer refuses them and only roots
+        strictly inside a hidden mount punch through."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        under_home = Path.home() / ".hse-imaginary-venv"
+        argv = sbx.BubblewrapEnforcer().command(
+            ["evolver"],
+            workspace=workspace,
+            writable=[workspace],
+            read_roots=[
+                Path("/"), Path("/tmp"), Path("/run"),
+                Path.home(), under_home,
+            ],
+            allow_network=False,
+        )
+        joined = " ".join(argv)
+        home = str(Path(os.path.realpath(Path.home())))
+        real_under = str(Path(os.path.realpath(under_home)))
+        assert f"--ro-bind {real_under} {real_under}" in joined
+        assert f"--ro-bind {home} {home}" not in joined
+        assert "--ro-bind /tmp /tmp" not in joined
+        assert "--ro-bind /run /run" not in joined
+        # The base root mount stays the only bind of / itself.
+        assert joined.count("--ro-bind / /") == 1
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Fail closed
@@ -690,6 +745,38 @@ class TestTheKernelHoldsTheBoundary:
         candidates = evolver.propose(make_job())
         assert len(candidates) == 1
         assert candidates[0].source.endswith("# mutated\n")
+
+    def test_an_interpreter_reached_through_home_scoped_links_still_runs(
+        self, repo, tmp_path
+    ):
+        """The regression for uv-managed interpreters under the user's home.
+
+        uv reaches an interpreter through a version-alias directory symlink
+        under home (``~/.local/share/uv/python/cpython-3.12-<platform> ->
+        cpython-3.12.14-<platform>``), so the exec path crosses a link name
+        that only exists inside the hidden home. Binding the realpath alone
+        leaves that name unresolvable behind the tmpfs and the evolver dies
+        with execvp ENOENT before it starts; the chain's parents have to be
+        bound back too. This drives the same shape - a directory symlink
+        under the real home in the middle of the interpreter's path -
+        through the real enforcer.
+        """
+        real = Path(os.path.realpath(sys.executable))
+        store = Path.home() / f".hse-uv-like-{os.getpid()}"
+        store.mkdir()
+        try:
+            (store / "real-bin").symlink_to(real.parent)
+            launcher = store / "real-bin" / real.name
+            assert launcher.exists()
+            workdir = tmp_path / "work"
+            cmd = make_stub(workdir, EMIT_CANDIDATE)
+            cmd[0] = str(launcher)
+            evolver = ExternalEvolver(cmd, repo=repo, workdir=workdir)
+            candidates = evolver.propose(make_job())
+            assert len(candidates) == 1
+            assert candidates[0].source.endswith("# mutated\n")
+        finally:
+            shutil.rmtree(store, ignore_errors=True)
 
     def test_the_network_is_unreachable(self, repo, tmp_path):
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

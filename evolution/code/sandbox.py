@@ -57,6 +57,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections import deque
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -345,9 +346,17 @@ class BubblewrapEnforcer:
         # can just as easily live under /tmp or /run, where the tmpfs would
         # otherwise hide it - re-binding a path that was already visible is
         # harmless.
+        never_rebound = {"/", "/tmp", "/run", str(home)}
         for root in sorted(
             {str(Path(os.path.realpath(r))) for r in read_roots}
         ):
+            # A read root may punch through a hidden mount only from strictly
+            # inside it: binding home itself, an ancestor of home, /tmp or
+            # /run wholesale would undo the hiding that defines this sandbox.
+            # A command whose resolution genuinely needs one of those bound
+            # fails closed at exec time instead of running unsealed.
+            if root in never_rebound or str(home).startswith(f"{root}{os.sep}"):
+                continue
             cmd += ["--ro-bind", root, root]
         for path in writable:
             real = str(Path(os.path.realpath(path)))
@@ -456,11 +465,14 @@ class CodeSandbox:
             self.workdir.mkdir(parents=True, exist_ok=True)
 
         # The interpreter running this process is the one tests and stub
-        # commands are launched with, so its trees are always readable.
+        # commands are launched with, so its trees are always readable -
+        # including the parent of every symlink its path resolves through,
+        # which for a uv-managed python includes a version-alias directory
+        # under the invoking user's home.
         interpreter_roots = [
             Path(sys.prefix),
             Path(sys.base_prefix),
-            Path(os.path.realpath(sys.executable)).parent,
+            *executable_read_roots(sys.executable),
         ]
         self.read_roots = tuple(
             Path(os.path.realpath(Path(p).expanduser()))
@@ -637,18 +649,65 @@ class CodeSandbox:
 # ──────────────────────────────────────────────────────────────────────────
 
 
+def _chain_parents(path: Path) -> tuple[Path, list[Path]]:
+    """Follow *path* component by component, the way the kernel does.
+
+    Returns the fully resolved target and the real parent directory of every
+    symlink met on the way - intermediate components included, which is what
+    ``os.path.realpath`` cannot report. The distinction is load-bearing: a
+    uv-managed interpreter is reached through a version-alias directory
+    symlink (``.../uv/python/cpython-3.12-<platform>`` pointing at the
+    ``cpython-3.12.14-<platform>`` install), and a sandbox that binds back
+    only the realpath result leaves the alias name unresolvable behind the
+    tmpfs hiding the home directory it lives under. Resolution stops at the
+    kernel's own 40-link bound; a looping path is returned as far as it got
+    and fails at exec time exactly as it would outside the sandbox.
+    """
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    resolved = Path(path.anchor)
+    parents: list[Path] = []
+    pending = deque(path.parts[1:])
+    hops = 0
+    while pending:
+        part = pending.popleft()
+        if part == ".":
+            continue
+        if part == "..":
+            resolved = resolved.parent
+            continue
+        candidate = resolved / part
+        if os.path.islink(candidate):
+            hops += 1
+            if hops > 40:
+                return candidate, parents
+            parents.append(resolved)
+            target = Path(os.readlink(candidate))
+            if target.is_absolute():
+                resolved = Path(target.anchor)
+                pending.extendleft(reversed(target.parts[1:]))
+            else:
+                pending.extendleft(reversed(target.parts))
+            continue
+        resolved = candidate
+    return resolved, parents
+
+
 def executable_read_roots(executable: str) -> list[Path]:
     """The directories a sandboxed child must read to run *executable*.
 
-    The binary's own directory, and - when that directory is a ``bin/`` -
-    the prefix above it, because a virtualenv or uv-managed interpreter
-    loads its standard library and site-packages from siblings of ``bin``,
-    and a read exception covering only the binary would let it exec and
-    then die on the first import.
+    The real parent of every symlink in the binary's resolution chain -
+    uv's version-alias directory included - then the resolved binary's own
+    directory, and, when that directory is a ``bin/``, the prefix above it,
+    because a virtualenv or uv-managed interpreter loads its standard
+    library and site-packages from siblings of ``bin``, and a read
+    exception covering only the binary would let it exec and then die on
+    the first import.
     """
     found = shutil.which(executable) or executable
-    directory = Path(found).expanduser().resolve().parent
-    roots = [directory]
+    target, roots = _chain_parents(Path(found).expanduser())
+    directory = target.parent
+    roots.append(directory)
     if directory.name == "bin":
         roots.append(directory.parent)
     return roots
@@ -674,7 +733,12 @@ def command_read_roots(argv: Sequence[str]) -> list[Path]:
         except OSError:
             exists = False
         if exists:
-            roots.append(Path(os.path.realpath(candidate)).parent)
+            # Followed through its symlink chain exactly like the
+            # executable: a script reached via a linked directory needs the
+            # link's parent visible too.
+            target, chain = _chain_parents(candidate)
+            roots.extend(chain)
+            roots.append(target.parent)
     return roots
 
 
